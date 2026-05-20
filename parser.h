@@ -3,19 +3,15 @@
 #include <cctype>
 #include "board.h"
 
-// ==========================================
-// Tempo C++: FEN Parser
-// ==========================================
 
-// Helper function to parse a FEN string and populate the Board object
 inline void parse_fen(const std::string& fen, Board& board) {
     board.reset();
     
-    int rank = 7; // Start at rank 8 (top of the board)
-    int file = 0; // Start at file a (left of the board)
+    int rank = 7; 
+    int file = 0; 
 
     for (char c : fen) {
-        // If we hit a space, we are done parsing the board portion of the FEN
+        // If space is hit we are done parsing the board portion of the FEN
         if (c == ' ') break; 
         
         if (c == '/') {
@@ -23,11 +19,10 @@ inline void parse_fen(const std::string& fen, Board& board) {
             file = 0; // Reset to the 'a' file
         } 
         else if (isdigit(c)) {
-            // Numbers in FEN represent empty squares. e.g., '3' means 3 empty squares.
             file += (c - '0'); 
         } 
         else {
-            // It is a piece character (p, n, b, r, q, k)
+            // Piece character
             Color color = isupper(c) ? Color::White : Color::Black;
             Piece piece = Piece::None;
 
