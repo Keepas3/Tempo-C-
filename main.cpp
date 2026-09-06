@@ -2,16 +2,19 @@
 #include <string>
 #include <sstream>
 #include <iomanip>
+#include <filesystem>
 #include "game.h"
 #include "pgn.h"
 #include "db.h"
 #include "analysis.h"
 
+namespace fs = std::filesystem;
+
 const std::string DB_PATH = "tempo_archive.db";
 
 void print_help() {
     std::cout << "Commands:\n"
-                 "  import <file.pgn>   Import games from a PGN file\n"
+                 "  import <file.pgn|folder>  Import games from a PGN file, or every .pgn file in a folder\n"
                  "  list [n]            List the n most recent games (default 20)\n"
                  "  show <id>           Show a game's info and movetext\n"
                  "  review <id>         Replay a game with eval annotations and blunder flags\n"
@@ -21,23 +24,57 @@ void print_help() {
                  "  q / quit            Exit\n\n";
 }
 
-void cmd_import(Archive& archive, const std::string& path) {
+// Imports one PGN file, returning {parsed, added, skipped}. Errors are printed
+// but don't throw, so a bad file doesn't abort a folder import.
+struct ImportCounts { int parsed = 0, added = 0, skipped = 0; };
+
+ImportCounts import_one_file(Archive& archive, const std::string& path) {
+    ImportCounts counts;
     std::vector<Game> games;
     try {
         games = parse_pgn_file(path);
     } catch (const std::exception& e) {
-        std::cout << "[Error] " << e.what() << "\n\n";
+        std::cout << "[Error] " << path << ": " << e.what() << "\n";
+        return counts;
+    }
+
+    counts.parsed = static_cast<int>(games.size());
+    for (const Game& g : games) {
+        int id = archive.insert_game(g);
+        if (id == -1) counts.skipped++; else counts.added++;
+    }
+    return counts;
+}
+
+void cmd_import(Archive& archive, const std::string& path) {
+    if (!fs::exists(path)) {
+        std::cout << "[Error] no such file or folder: " << path << "\n\n";
         return;
     }
 
-    int added = 0, skipped = 0;
-    for (const Game& g : games) {
-        int id = archive.insert_game(g);
-        if (id == -1) skipped++; else added++;
+    ImportCounts total;
+    int files = 0;
+
+    if (fs::is_directory(path)) {
+        for (const fs::directory_entry& entry : fs::directory_iterator(path)) {
+            if (!entry.is_regular_file() || entry.path().extension() != ".pgn") continue;
+            files++;
+            ImportCounts c = import_one_file(archive, entry.path().string());
+            total.parsed += c.parsed;
+            total.added += c.added;
+            total.skipped += c.skipped;
+        }
+        if (files == 0) {
+            std::cout << "[Result] No .pgn files found in " << path << ".\n\n";
+            return;
+        }
+    } else {
+        files = 1;
+        total = import_one_file(archive, path);
     }
 
-    std::cout << "[Result] Parsed " << games.size() << " game(s): "
-              << added << " added, " << skipped << " already in the archive.\n\n";
+    std::cout << "[Result] Scanned " << files << " file(s), parsed " << total.parsed << " game(s): "
+              << total.added << " added, " << total.skipped << " already in the archive.\n\n";
 }
 
 void print_game_table(const std::vector<GameSummary>& games) {
