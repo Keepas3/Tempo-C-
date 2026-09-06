@@ -1,6 +1,7 @@
 #pragma once
 #include "board.h"
 #include "pst.h"
+#include "utils.h"
 
 
 
@@ -9,20 +10,6 @@ const int KNIGHT_VALUE = 300;
 const int BISHOP_VALUE = 320;
 const int ROOK_VALUE = 500;
 const int QUEEN_VALUE = 900;
-
-
-inline int pop_lsb(Bitboard& b) {
-    int index = 0;
-    Bitboard isolated = b & (~b + 1); 
-    b &= b - 1; 
-    
-    
-    while (isolated > 1) {
-        isolated >>= 1;
-        index++;
-    }
-    return index;
-}
 
 inline int evaluate(const Board& board) {
     int score = 0;
@@ -76,3 +63,9 @@ inline int evaluate(const Board& board) {
         
         return (material + positional) * multiplier;
     };
+
+    score += evaluate_color(Color::White, 1);
+    score += evaluate_color(Color::Black, -1);
+
+    return score;
+}

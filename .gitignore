@@ -1,1 +1,7 @@
 .vscode/
+*.exe
+*.o
+*.obj
+*.pdb
+*.ilk
+tempo_archive.db
