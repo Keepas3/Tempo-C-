@@ -18,6 +18,7 @@ struct GameSummary {
     std::string your_color;
     std::string result_display; // "Win" / "Loss" / "Draw" / "?"
     std::string opening;
+    std::string site; // normalized platform label: "Chess.com", "Lichess", or "Unknown"
 };
 
 struct OpeningStat {
@@ -48,18 +49,36 @@ struct Stats {
     std::vector<OpeningStat> top_openings_white; // openings you played as White
     std::vector<OpeningStat> top_openings_black; // openings faced as Black
     std::vector<TimeControlStat> by_time_control;
+    std::string earliest_date, latest_date; // date range covered by the archive, e.g. "2026.07.15" .. "2026.09.05"
 };
+
+// Normalizes a PGN Site tag into a clean platform label. Chess.com's Site
+// tag is already just "Chess.com", but lichess's is a per-game URL (e.g.
+// "https://lichess.org/abcd1234"), so a raw display would be inconsistent
+// between the two sources.
+inline std::string platform_label(const std::string& site) {
+    std::string lower = site;
+    for (char& c : lower) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    if (lower.find("chess.com") != std::string::npos) return "Chess.com";
+    if (lower.find("lichess") != std::string::npos) return "Lichess";
+    return site.empty() ? "Unknown" : site;
+}
 
 // Classifies a PGN TimeControl tag ("180", "180+2", "600+5", etc.) into a
 // rough bucket based on the base time. Empty/unparseable strings are "Unknown".
 inline std::string classify_time_control(const std::string& tc) {
     if (tc.empty()) return "Unknown";
+    // Correspondence/daily controls look like "1/259200" (move count / total
+    // seconds) -- sscanf("%d") on that would read just the leading "1" and
+    // misclassify as Bullet, so catch the "/" form first.
+    if (tc.find('/') != std::string::npos) return "Daily";
+
     int base_seconds = 0;
     if (sscanf(tc.c_str(), "%d", &base_seconds) != 1) return "Unknown";
 
     if (base_seconds < 180) return "Bullet";
     if (base_seconds < 600) return "Blitz";
-    if (base_seconds < 1500) return "Rapid";
+    if (base_seconds < 1800) return "Rapid";
     return "Classical";
 }
 
@@ -143,7 +162,7 @@ public:
 
     std::vector<GameSummary> list_games(int limit) {
         const char* sql =
-            "SELECT id, date, white, black, your_color, result, opening "
+            "SELECT id, date, white, black, your_color, result, opening, site "
             "FROM games ORDER BY id DESC LIMIT ?;";
         sqlite3_stmt* stmt = prepare(sql);
         sqlite3_bind_int(stmt, 1, limit);
@@ -158,6 +177,7 @@ public:
             s.your_color = column_text(stmt, 4);
             std::string result = column_text(stmt, 5);
             s.opening = column_text(stmt, 6);
+            s.site = platform_label(column_text(stmt, 7));
             s.opponent = (s.your_color == "white") ? black : white;
             s.result_display = result_relative_to(result, s.your_color);
             out.push_back(s);
@@ -176,7 +196,7 @@ public:
         }
 
         std::string sql =
-            "SELECT id, date, white, black, your_color, result, opening "
+            "SELECT id, date, white, black, your_color, result, opening, site "
             "FROM games WHERE ";
         sql += looks_like_eco ? "eco LIKE ? || '%'" : "opening LIKE '%' || ? || '%'";
         sql += " ORDER BY id DESC LIMIT ?;";
@@ -195,6 +215,7 @@ public:
             s.your_color = column_text(stmt, 4);
             std::string result = column_text(stmt, 5);
             s.opening = column_text(stmt, 6);
+            s.site = platform_label(column_text(stmt, 7));
             s.opponent = (s.your_color == "white") ? black : white;
             s.result_display = result_relative_to(result, s.your_color);
             out.push_back(s);
@@ -305,6 +326,15 @@ public:
 
     Stats compute_stats() {
         Stats stats;
+
+        {
+            sqlite3_stmt* range_stmt = prepare("SELECT MIN(date), MAX(date) FROM games;");
+            if (sqlite3_step(range_stmt) == SQLITE_ROW) {
+                stats.earliest_date = column_text(range_stmt, 0);
+                stats.latest_date = column_text(range_stmt, 1);
+            }
+            sqlite3_finalize(range_stmt);
+        }
 
         const char* sql = "SELECT your_color, result FROM games WHERE your_color != '';";
         sqlite3_stmt* stmt = prepare(sql);

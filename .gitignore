@@ -7,3 +7,5 @@
 tempo_archive.db
 games/*
 !games/README.md
+__pycache__/
+*.pyc

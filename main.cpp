@@ -11,6 +11,7 @@
 #include "analysis.h"
 #include "archive_files.h"
 #include "fetch.h"
+#include "json.h"
 
 namespace fs = std::filesystem;
 
@@ -97,12 +98,12 @@ void print_game_table(const std::vector<GameSummary>& games) {
     std::cout << std::left
               << std::setw(5) << "ID" << std::setw(12) << "Date"
               << std::setw(20) << "Opponent" << std::setw(7) << "Color"
-              << std::setw(7) << "Result" << "Opening\n";
+              << std::setw(7) << "Result" << std::setw(10) << "Site" << "Opening\n";
     for (const GameSummary& g : games) {
         std::cout << std::left
                   << std::setw(5) << g.id << std::setw(12) << g.date
                   << std::setw(20) << g.opponent << std::setw(7) << g.your_color
-                  << std::setw(7) << g.result_display << g.opening << "\n";
+                  << std::setw(7) << g.result_display << std::setw(10) << g.site << g.opening << "\n";
     }
     std::cout << "\n";
 }
@@ -287,31 +288,46 @@ void cmd_moves(Archive& archive, const std::vector<std::string>& sequence) {
     std::cout << "\n";
 }
 
-void fetch_chesscom_one_month(Archive& archive, const std::string& username, int year, int month) {
-    fs::path tmp = fs::temp_directory_path() / "tempo_fetch_chesscom.pgn";
-    std::ostringstream label;
-    label << year << "-" << std::setfill('0') << std::setw(2) << month;
+// Fetch results are captured in this struct (rather than printed directly)
+// so both the REPL's human-readable output and the --json mode can share
+// the exact same fetch+import logic.
+struct FetchResult {
+    std::string source;
+    bool ok = true;
+    std::string error;
+    ImportCounts counts;
+};
 
-    std::cout << "Fetching chess.com games for " << username << " (" << label.str() << ")...\n";
+FetchResult fetch_chesscom_one_month_result(Archive& archive, const std::string& username, int year, int month) {
+    FetchResult r;
+    std::ostringstream label;
+    label << "chess.com " << year << "-" << std::setfill('0') << std::setw(2) << month;
+    r.source = label.str();
+
+    fs::path tmp = fs::temp_directory_path() / "tempo_fetch_chesscom.pgn";
     if (!fetch_chesscom_month(username, year, month, tmp.string())) {
-        std::cout << "[Error] chess.com fetch failed for " << label.str()
-                   << " (check the username and your network connection)\n\n";
+        r.ok = false;
+        r.error = "fetch failed for " + r.source + " (check the username and your network connection)";
         std::error_code ec;
         fs::remove(tmp, ec);
-        return;
+        return r;
     }
 
-    ImportCounts c = import_one_file(archive, tmp.string());
+    r.counts = import_one_file(archive, tmp.string());
     std::error_code ec;
     fs::remove(tmp, ec);
-    std::cout << "[Result] chess.com " << label.str() << ": parsed " << c.parsed << " game(s), "
-              << c.added << " added, " << c.skipped << " already in the archive.\n\n";
+    return r;
 }
 
-void cmd_fetch_chesscom(Archive& archive, const std::string& username, int year, int month) {
+std::vector<FetchResult> fetch_chesscom_results(Archive& archive, const std::string& username, int year, int month) {
+    std::vector<FetchResult> results;
     if (!is_valid_username(username)) {
-        std::cout << "[Error] invalid username: " << username << "\n\n";
-        return;
+        FetchResult r;
+        r.ok = false;
+        r.source = "chess.com";
+        r.error = "invalid username: " + username;
+        results.push_back(r);
+        return results;
     }
 
     if (year == -1) {
@@ -322,38 +338,177 @@ void cmd_fetch_chesscom(Archive& archive, const std::string& username, int year,
         int prev_year = (cur_month == 1) ? cur_year - 1 : cur_year;
         int prev_month = (cur_month == 1) ? 12 : cur_month - 1;
 
-        fetch_chesscom_one_month(archive, username, prev_year, prev_month);
-        fetch_chesscom_one_month(archive, username, cur_year, cur_month);
+        results.push_back(fetch_chesscom_one_month_result(archive, username, prev_year, prev_month));
+        results.push_back(fetch_chesscom_one_month_result(archive, username, cur_year, cur_month));
     } else {
-        fetch_chesscom_one_month(archive, username, year, month);
+        results.push_back(fetch_chesscom_one_month_result(archive, username, year, month));
+    }
+    return results;
+}
+
+FetchResult fetch_lichess_result(Archive& archive, const std::string& username, int days) {
+    FetchResult r;
+    std::ostringstream label;
+    label << "lichess (last " << days << " days)";
+    r.source = label.str();
+
+    if (!is_valid_username(username)) {
+        r.ok = false;
+        r.error = "invalid username: " + username;
+        return r;
+    }
+
+    fs::path tmp = fs::temp_directory_path() / "tempo_fetch_lichess.pgn";
+    if (!fetch_lichess_range(username, days, tmp.string())) {
+        r.ok = false;
+        r.error = "fetch failed for " + username + " (check the username and your network connection)";
+        std::error_code ec;
+        fs::remove(tmp, ec);
+        return r;
+    }
+
+    r.counts = import_one_file(archive, tmp.string());
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    return r;
+}
+
+void print_fetch_result(const FetchResult& r) {
+    if (!r.ok) {
+        std::cout << "[Error] " << r.error << "\n\n";
+        return;
+    }
+    std::cout << "[Result] " << r.source << ": parsed " << r.counts.parsed << " game(s), "
+              << r.counts.added << " added, " << r.counts.skipped << " already in the archive.\n\n";
+}
+
+void cmd_fetch_chesscom(Archive& archive, const std::string& username, int year, int month) {
+    for (const FetchResult& r : fetch_chesscom_results(archive, username, year, month)) {
+        print_fetch_result(r);
     }
 }
 
 void cmd_fetch_lichess(Archive& archive, const std::string& username, int days) {
-    if (!is_valid_username(username)) {
-        std::cout << "[Error] invalid username: " << username << "\n\n";
-        return;
-    }
-
-    fs::path tmp = fs::temp_directory_path() / "tempo_fetch_lichess.pgn";
-
-    std::cout << "Fetching lichess games for " << username << " (last " << days << " days)...\n";
-    if (!fetch_lichess_range(username, days, tmp.string())) {
-        std::cout << "[Error] lichess fetch failed for " << username
-                   << " (check the username and your network connection)\n\n";
-        std::error_code ec;
-        fs::remove(tmp, ec);
-        return;
-    }
-
-    ImportCounts c = import_one_file(archive, tmp.string());
-    std::error_code ec;
-    fs::remove(tmp, ec);
-    std::cout << "[Result] lichess (last " << days << " days): parsed " << c.parsed << " game(s), "
-              << c.added << " added, " << c.skipped << " already in the archive.\n\n";
+    print_fetch_result(fetch_lichess_result(archive, username, days));
 }
 
-int main() {
+inline std::string to_json(const FetchResult& r) {
+    std::ostringstream o;
+    o << "{\"source\": " << json_str(r.source) << ", \"ok\": " << (r.ok ? "true" : "false");
+    if (!r.ok) {
+        o << ", \"error\": " << json_str(r.error);
+    } else {
+        o << ", \"parsed\": " << r.counts.parsed
+          << ", \"added\": " << r.counts.added
+          << ", \"skipped\": " << r.counts.skipped;
+    }
+    o << "}";
+    return o.str();
+}
+
+inline std::string to_json(const std::vector<FetchResult>& results) {
+    std::ostringstream o;
+    o << "{\"results\": [";
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (i) o << ", ";
+        o << to_json(results[i]);
+    }
+    o << "]}";
+    return o.str();
+}
+
+// Non-interactive JSON output mode for the GUI (or any script): each command
+// prints exactly one line of JSON to stdout and exits, reusing the same
+// Archive methods the REPL commands above already call. Returns the process
+// exit code.
+int run_json_command(Archive& archive, const std::vector<std::string>& args) {
+    if (args.empty()) {
+        std::cout << json_error("usage: tempo.exe --json <command> [args...]") << "\n";
+        return 1;
+    }
+
+    const std::string& cmd = args[0];
+    try {
+        if (cmd == "list") {
+            int limit = 20;
+            if (args.size() > 1) limit = std::stoi(args[1]);
+            std::cout << to_json(archive.list_games(limit)) << "\n";
+        } else if (cmd == "show" || cmd == "review") {
+            if (args.size() < 2) {
+                std::cout << json_error("usage: " + cmd + " <id>") << "\n";
+                return 1;
+            }
+            int id = std::stoi(args[1]);
+            Game g = archive.load_game(id);
+            if (cmd == "review") {
+                std::vector<int> evals = evaluate_game(g);
+                std::ostringstream o;
+                o << "{\"game\": " << to_json(g) << ", \"evals\": [";
+                for (size_t i = 0; i < evals.size(); ++i) {
+                    if (i) o << ", ";
+                    o << evals[i];
+                }
+                o << "]}";
+                std::cout << o.str() << "\n";
+            } else {
+                std::cout << to_json(g) << "\n";
+            }
+        } else if (cmd == "opening") {
+            if (args.size() < 2) {
+                std::cout << json_error("usage: opening <name-or-ECO>") << "\n";
+                return 1;
+            }
+            std::cout << to_json(archive.find_games_by_opening(args[1])) << "\n";
+        } else if (cmd == "moves") {
+            if (args.size() < 2) {
+                std::cout << json_error("usage: moves <san-sequence>") << "\n";
+                return 1;
+            }
+            std::vector<std::string> sequence(args.begin() + 1, args.end());
+            std::cout << to_json(archive.opponent_replies(sequence)) << "\n";
+        } else if (cmd == "stats") {
+            std::cout << to_json(archive.compute_stats()) << "\n";
+        } else if (cmd == "fetch") {
+            if (args.size() < 3) {
+                std::cout << json_error("usage: fetch chesscom <user> [year month] | fetch lichess <user> [days]") << "\n";
+                return 1;
+            }
+            const std::string& site = args[1];
+            const std::string& username = args[2];
+            if (site == "chesscom") {
+                int year = -1, month = -1;
+                if (args.size() >= 5) {
+                    year = std::stoi(args[3]);
+                    month = std::stoi(args[4]);
+                }
+                std::cout << to_json(fetch_chesscom_results(archive, username, year, month)) << "\n";
+            } else if (site == "lichess") {
+                int days = 90;
+                if (args.size() >= 4) days = std::stoi(args[3]);
+                std::vector<FetchResult> results{fetch_lichess_result(archive, username, days)};
+                std::cout << to_json(results) << "\n";
+            } else {
+                std::cout << json_error("unknown fetch site: " + site) << "\n";
+                return 1;
+            }
+        } else {
+            std::cout << json_error("unknown command: " + cmd) << "\n";
+            return 1;
+        }
+    } catch (const std::exception& e) {
+        std::cout << json_error(e.what()) << "\n";
+        return 1;
+    }
+    return 0;
+}
+
+int main(int argc, char* argv[]) {
+    if (argc >= 2 && std::string(argv[1]) == "--json") {
+        Archive archive(DB_PATH);
+        std::vector<std::string> args(argv + 2, argv + argc);
+        return run_json_command(archive, args);
+    }
+
     std::cout << "          Tempo C++ Game Archive          \n\n";
     print_help();
 
