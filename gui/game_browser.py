@@ -28,6 +28,7 @@ class GameBrowser(QTreeWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._items_by_id: dict[int, QTreeWidgetItem] = {}
         self.setHeaderLabels(COLUMNS)
         # Column 0 (the game title) stretches to fill whatever space is left
         # after the fixed-width columns, instead of a fixed width that
@@ -42,6 +43,7 @@ class GameBrowser(QTreeWidget):
 
     def refresh(self) -> None:
         self.clear()
+        self._items_by_id = {}
         tree = db_reader.games_by_year_month()
         for year in sorted(tree, reverse=True):
             year_item = QTreeWidgetItem([str(year) if year else "Unknown date"])
@@ -58,8 +60,24 @@ class GameBrowser(QTreeWidget):
                     game_item.setData(0, GAME_ID_ROLE, game.id)
                     game_item.setToolTip(0, full_label)  # full year on hover
                     month_item.addChild(game_item)
+                    self._items_by_id[game.id] = game_item
             year_item.setExpanded(False)
         self.collapseAll()
+
+    def select_game(self, game_id: int) -> None:
+        """Expands to and highlights the row for `game_id`, e.g. after it was
+        loaded from a chat command or a clicked game link rather than by
+        clicking the row here directly -- keeps the browser in sync with
+        whatever's actually shown on the board."""
+        item = self._items_by_id.get(game_id)
+        if item is None:
+            return
+        parent = item.parent()
+        while parent is not None:
+            parent.setExpanded(True)
+            parent = parent.parent()
+        self.setCurrentItem(item)
+        self.scrollToItem(item)
 
     def _on_item_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
         game_id = item.data(0, GAME_ID_ROLE)

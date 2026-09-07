@@ -50,6 +50,14 @@ def _result_color(result: str) -> str:
     return {"Win": WIN_COLOR, "Loss": LOSS_COLOR, "Draw": DRAW_COLOR}.get(result, MUTED_COLOR)
 
 
+def _game_link(game_id: int, inner_html: str) -> str:
+    """Wraps cell content so clicking it loads that game onto the board (via
+    the "game:<id>" anchor scheme handled in _on_anchor_clicked) -- used for
+    every game reference shown in chat output (/list, /opening, /stats'
+    "Most recent" rows), not just the dedicated /show and browser click."""
+    return f'<a href="game:{game_id}" style="color:inherit; text-decoration:none;">{inner_html}</a>'
+
+
 def _section(title: str) -> str:
     return f'<div style="margin-top:12px;"><b style="color:{HEADER_COLOR}; font-size:11pt;">{_esc(title)}</b></div>'
 
@@ -129,14 +137,19 @@ class CommandPanel(QWidget):
 
     def _on_anchor_clicked(self, url) -> None:
         text = url.toString()
-        if not text.startswith("opening:"):
-            return
-        name = unquote(text[len("opening:"):])
-        if name in self._expanded_openings:
-            self._expanded_openings.discard(name)
-        else:
-            self._expanded_openings.add(name)
-        self._replace_stats_block()
+        if text.startswith("opening:"):
+            name = unquote(text[len("opening:"):])
+            if name in self._expanded_openings:
+                self._expanded_openings.discard(name)
+            else:
+                self._expanded_openings.add(name)
+            self._replace_stats_block()
+        elif text.startswith("game:"):
+            try:
+                game_id = int(text[len("game:"):])
+            except ValueError:
+                return
+            self.game_requested.emit(game_id)
 
     def _print_error(self, message: str) -> None:
         self._print(f'<span style="color:{ERROR_COLOR}">[Error] {_esc(message)}</span>')
@@ -405,12 +418,13 @@ class CommandPanel(QWidget):
                 if recent:
                     recent_lines = []
                     for g in recent:
-                        recent_lines.append(
+                        line = (
                             f'<span style="color:{MUTED_COLOR}">{_esc(g["date"])}</span>  '
                             f'<span style="color:{_result_color(g["result"])}"><b>{_esc(g["result"])}</b></span>  '
                             f'<span style="color:{MUTED_COLOR}">{_esc(g["time_category"])}</span>'
                         )
-                    detail += (f'<div style="margin-top:4px; color:{MUTED_COLOR};">Most recent:</div>'
+                        recent_lines.append(_game_link(g["id"], line))
+                    detail += (f'<div style="margin-top:4px; color:{MUTED_COLOR};">Most recent (click to load):</div>'
                                + "<br>".join(recent_lines))
 
                 rows.append(f'<tr><td colspan="3" style="padding:0 8px 8px 22px; color:{MUTED_COLOR};">{detail}</td></tr>')
@@ -437,15 +451,14 @@ class CommandPanel(QWidget):
     def _format_games(self, games: list[dict]) -> str:
         if not games:
             return f'<span style="color:{MUTED_COLOR}">No games found.</span>'
-        header = f'<b>{len(games)} game(s)</b>'
+        header = f'<b>{len(games)} game(s)</b> <span style="color:{MUTED_COLOR}">(click a row to load it on the board)</span>'
         rows = []
         for g in games:
             result_html = f'<span style="color:{_result_color(g["result"])}"><b>{_esc(g["result"])}</b></span>'
-            rows.append([
-                f'#{g["id"]}', _esc(g["date"]),
-                f'{_esc(g["opponent"])} <span style="color:{MUTED_COLOR}">({_esc(g["your_color"])})</span>',
-                result_html, _esc(g["site"]), _esc(g["opening"]) or '<span style="color:#666">-</span>',
-            ])
+            opponent_html = f'{_esc(g["opponent"])} <span style="color:{MUTED_COLOR}">({_esc(g["your_color"])})</span>'
+            opening_html = _esc(g["opening"]) or '<span style="color:#666">-</span>'
+            cells = [f'#{g["id"]}', _esc(g["date"]), opponent_html, result_html, _esc(g["site"]), opening_html]
+            rows.append([_game_link(g["id"], cell) for cell in cells])
         return header + _table(["#", "Date", "Opponent", "Result", "Site", "Opening"], rows)
 
     def _format_stats(self, s: dict) -> str:

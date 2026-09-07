@@ -166,6 +166,7 @@ class MainWindow(QMainWindow):
             f"#{game_id}  {detail.white} vs {detail.black}  ({detail.date}, {detail.result})  [{detail.site}]"
         )
         self._update_nav_buttons()
+        self.browser.select_game(game_id)  # keep the browser's selection in sync regardless of how the game was loaded
 
     def _update_nav_buttons(self) -> None:
         on_main = self.board.on_mainline
