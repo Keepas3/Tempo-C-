@@ -28,6 +28,8 @@ WIN_COLOR = "#5cb85c"
 LOSS_COLOR = "#e57373"
 DRAW_COLOR = "#b0b0b0"
 ERROR_COLOR = "#e57373"
+DEFAULT_OPENINGS_SHOWN = 5
+DEFAULT_GAMES_SHOWN = 10
 
 WELCOME_TEXT = f'<span style="color:{MUTED_COLOR}">Type <code>/</code> to see commands, or <code>/help</code> any time.</span>'
 
@@ -129,6 +131,19 @@ class CommandPanel(QWidget):
         # Recent-games lookups are fetched lazily (only when a row is first
         # expanded) and cached here so re-collapsing/re-expanding is instant.
         self._opening_games_cache: dict[str, list[dict]] = {}
+        # Long opening lists start truncated (see DEFAULT_OPENINGS_SHOWN);
+        # "white"/"black" here track whether each section has been expanded
+        # to show the rest.
+        self._show_all_openings: dict[str, bool] = {"white": False, "black": False}
+
+        # Last /opening result, truncated by default (see DEFAULT_GAMES_SHOWN)
+        # with a "show more" toggle -- only the most recent /opening call is
+        # interactively toggleable, matching how /stats works (older results
+        # already printed to the log stay as they were rendered).
+        self._opening_results: list[dict] | None = None
+        self._opening_results_show_all = False
+        self._opening_results_start: QTextCursor | None = None
+        self._opening_results_end: QTextCursor | None = None
 
         self._print(WELCOME_TEXT)
 
@@ -150,6 +165,13 @@ class CommandPanel(QWidget):
             except ValueError:
                 return
             self.game_requested.emit(game_id)
+        elif text.startswith("showmore:"):
+            color_key = text[len("showmore:"):]
+            self._show_all_openings[color_key] = not self._show_all_openings.get(color_key, False)
+            self._replace_stats_block()
+        elif text == "showmoregames":
+            self._opening_results_show_all = not self._opening_results_show_all
+            self._replace_opening_results_block()
 
     def _print_error(self, message: str) -> None:
         self._print(f'<span style="color:{ERROR_COLOR}">[Error] {_esc(message)}</span>')
@@ -289,13 +311,22 @@ class CommandPanel(QWidget):
             self._stats_data = tempo_cli.stats()
             self._expanded_openings = set()
             self._opening_games_cache = {}
+            self._show_all_openings = {"white": False, "black": False}
             self._render_stats_block()
+        elif cmd == "clear":
+            self.output.clear()
+            self._stats_start = None
+            self._stats_end = None
+            self._opening_results_start = None
+            self._opening_results_end = None
         elif cmd == "opening":
             if not args:
                 self._print_error("usage: /opening <name-or-ECO>")
                 return
             data = tempo_cli.opening(" ".join(args))
-            self._print(self._format_games(data["games"]))
+            self._opening_results = data["games"]
+            self._opening_results_show_all = False
+            self._render_opening_results_block()
         elif cmd == "moves":
             if not args:
                 self._print_error("usage: /moves <san-sequence>, e.g. /moves e4 e5 Nf3")
@@ -350,40 +381,59 @@ class CommandPanel(QWidget):
 
         self._print(self._format_fetch_results(data["results"]))
 
-    def _render_stats_block(self) -> None:
-        """Inserts the /stats output as a distinct block, remembering the
-        cursor range it occupies so a later expand/collapse click can replace
-        just that block in place instead of re-appending a whole new copy."""
+    def _insert_tracked_block(self, html: str) -> tuple[QTextCursor, QTextCursor]:
+        """Inserts `html` as a distinct block and returns (start, end)
+        cursors bounding exactly that block, so a later click (expand/
+        collapse, show more) can replace just it in place via
+        _replace_tracked_block instead of re-appending a whole new copy."""
         cursor = self.output.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         if not self.output.document().isEmpty():
             cursor.insertBlock()
-        self._stats_start = QTextCursor(cursor)
+        start = QTextCursor(cursor)
         # Without this, a cursor sitting exactly at a future insertion point
         # drifts forward with that insertion by default, so on the next
-        # expand/collapse the "start" marker would have silently slid past
-        # the block it's supposed to bound -- breaking in-place replacement.
-        self._stats_start.setKeepPositionOnInsert(True)
-        cursor.insertHtml(self._format_stats(self._stats_data))
-        self._stats_end = QTextCursor(cursor)
+        # replace the "start" marker would have silently slid past the block
+        # it's supposed to bound -- breaking in-place replacement.
+        start.setKeepPositionOnInsert(True)
+        cursor.insertHtml(html)
+        end = QTextCursor(cursor)
         self.output.setTextCursor(cursor)
         self.output.ensureCursorVisible()
+        return start, end
+
+    def _replace_tracked_block(self, start: QTextCursor, end: QTextCursor, html: str) -> QTextCursor:
+        """Replaces the [start, end) region (from a prior _insert_tracked_block)
+        with `html`, returning the new end cursor to keep tracking with."""
+        # Build the selection from raw integer positions rather than copying
+        # `start` directly: keepPositionOnInsert only pins its position(),
+        # not its anchor(), so after the first insertion at that spot the
+        # copied cursor's anchor silently drifts forward too -- producing a
+        # phantom zero-length selection instead of the real start..end range.
+        cursor = self.output.textCursor()
+        cursor.setPosition(start.position())
+        cursor.setPosition(end.position(), QTextCursor.MoveMode.KeepAnchor)
+        cursor.removeSelectedText()
+        cursor.insertHtml(html)
+        return QTextCursor(cursor)
+
+    def _render_stats_block(self) -> None:
+        self._stats_start, self._stats_end = self._insert_tracked_block(self._format_stats(self._stats_data))
 
     def _replace_stats_block(self) -> None:
         if self._stats_start is None or self._stats_end is None or self._stats_data is None:
             return
-        # Build the selection from raw integer positions rather than copying
-        # self._stats_start directly: keepPositionOnInsert only pins its
-        # position(), not its anchor(), so after the first insertion at that
-        # spot the copied cursor's anchor silently drifts forward too --
-        # producing a phantom zero-length selection instead of the real
-        # start..end range.
-        cursor = self.output.textCursor()
-        cursor.setPosition(self._stats_start.position())
-        cursor.setPosition(self._stats_end.position(), QTextCursor.MoveMode.KeepAnchor)
-        cursor.removeSelectedText()
-        cursor.insertHtml(self._format_stats(self._stats_data))
-        self._stats_end = QTextCursor(cursor)
+        self._stats_end = self._replace_tracked_block(self._stats_start, self._stats_end, self._format_stats(self._stats_data))
+
+    def _render_opening_results_block(self) -> None:
+        html = self._format_games(self._opening_results, truncate=DEFAULT_GAMES_SHOWN, show_all=self._opening_results_show_all)
+        self._opening_results_start, self._opening_results_end = self._insert_tracked_block(html)
+
+    def _replace_opening_results_block(self) -> None:
+        if self._opening_results_start is None or self._opening_results_end is None or self._opening_results is None:
+            return
+        html = self._format_games(self._opening_results, truncate=DEFAULT_GAMES_SHOWN, show_all=self._opening_results_show_all)
+        self._opening_results_end = self._replace_tracked_block(self._opening_results_start, self._opening_results_end, html)
 
     def _recent_games_for(self, name: str) -> list[dict]:
         if name not in self._opening_games_cache:
@@ -393,12 +443,19 @@ class CommandPanel(QWidget):
                 self._opening_games_cache[name] = []
         return self._opening_games_cache[name]
 
-    def _openings_table(self, openings: list[dict]) -> str:
+    def _openings_table(self, openings: list[dict], color_key: str) -> str:
+        # Long lists (plus each row's own optional expansion) can make /stats
+        # very tall, so only a handful show by default -- the rest are one
+        # click away via the "Show N more" row, rather than always dumping
+        # everything and making every /stats call a wall of scrolling.
+        show_all = self._show_all_openings.get(color_key, False)
+        visible = openings if show_all else openings[:DEFAULT_OPENINGS_SHOWN]
+
         head = (f'<tr><th align="left" style="color:{MUTED_COLOR}; border-bottom:1px solid #555; padding:3px 8px 3px 0;">Opening</th>'
                 f'<th align="left" style="color:{MUTED_COLOR}; border-bottom:1px solid #555; padding:3px 8px 3px 0;">Games</th>'
                 f'<th align="left" style="color:{MUTED_COLOR}; border-bottom:1px solid #555; padding:3px 8px 3px 0;">Win rate</th></tr>')
         rows = []
-        for o in openings:
+        for o in visible:
             name = o["opening"]
             expanded = name in self._expanded_openings
             arrow = "&#9662;" if expanded else "&#9656;"  # ▾ / ▸
@@ -424,10 +481,20 @@ class CommandPanel(QWidget):
                             f'<span style="color:{MUTED_COLOR}">{_esc(g["time_category"])}</span>'
                         )
                         recent_lines.append(_game_link(g["id"], line))
-                    detail += (f'<div style="margin-top:4px; color:{MUTED_COLOR};">Most recent (click to load):</div>'
-                               + "<br>".join(recent_lines))
+                    detail += f'<div style="margin-top:4px;">{"<br>".join(recent_lines)}</div>'
 
                 rows.append(f'<tr><td colspan="3" style="padding:0 8px 8px 22px; color:{MUTED_COLOR};">{detail}</td></tr>')
+
+        if len(openings) > DEFAULT_OPENINGS_SHOWN:
+            href = "showmore:" + color_key
+            if show_all:
+                toggle_label = "Show fewer &#9652;"
+            else:
+                remaining = len(openings) - DEFAULT_OPENINGS_SHOWN
+                toggle_label = f"Show {remaining} more opening{'s' if remaining != 1 else ''} &#9662;"
+            toggle_link = f'<a href="{href}" style="color:{HEADER_COLOR}; text-decoration:none;">{toggle_label}</a>'
+            rows.append(f'<tr><td colspan="3" style="padding:6px 8px 2px 0;">{toggle_link}</td></tr>')
+
         return f'<table cellspacing="0" style="width:100%; margin-top:4px;">{head}{"".join(rows)}</table>'
 
     def _format_fetch_results(self, results: list[dict]) -> str:
@@ -448,18 +515,32 @@ class CommandPanel(QWidget):
 
     # --- formatting -------------------------------------------------------
 
-    def _format_games(self, games: list[dict]) -> str:
+    def _format_games(self, games: list[dict], truncate: int | None = None, show_all: bool = False) -> str:
         if not games:
             return f'<span style="color:{MUTED_COLOR}">No games found.</span>'
+
+        visible = games if (truncate is None or show_all) else games[:truncate]
+
         header = f'<b>{len(games)} game(s)</b> <span style="color:{MUTED_COLOR}">(click a row to load it on the board)</span>'
         rows = []
-        for g in games:
+        for g in visible:
             result_html = f'<span style="color:{_result_color(g["result"])}"><b>{_esc(g["result"])}</b></span>'
             opponent_html = f'{_esc(g["opponent"])} <span style="color:{MUTED_COLOR}">({_esc(g["your_color"])})</span>'
             opening_html = _esc(g["opening"]) or '<span style="color:#666">-</span>'
             cells = [f'#{g["id"]}', _esc(g["date"]), opponent_html, result_html, _esc(g["site"]), opening_html]
             rows.append([_game_link(g["id"], cell) for cell in cells])
-        return header + _table(["#", "Date", "Opponent", "Result", "Site", "Opening"], rows)
+        html = header + _table(["#", "Date", "Opponent", "Result", "Site", "Opening"], rows)
+
+        if truncate is not None and len(games) > truncate:
+            if show_all:
+                toggle_label = "Show fewer &#9652;"
+            else:
+                remaining = len(games) - truncate
+                toggle_label = f"Show {remaining} more game{'s' if remaining != 1 else ''} &#9662;"
+            html += (f'<div style="margin-top:6px;">'
+                     f'<a href="showmoregames" style="color:{HEADER_COLOR}; text-decoration:none;">{toggle_label}</a></div>')
+
+        return html
 
     def _format_stats(self, s: dict) -> str:
         total = s["wins"] + s["losses"] + s["draws"]
@@ -490,16 +571,23 @@ class CommandPanel(QWidget):
 
         if s["avg_seconds_per_move"] >= 0:
             parts.append(_section("Time management"))
-            parts.append(_table(["Avg. sec/move", "Moves under 10s"],
-                                 [[f'{s["avg_seconds_per_move"]:.1f}', str(s["time_trouble_moves"])]]))
+            overall_time_row = [["Overall", str(total), f'{s["avg_seconds_per_move"]:.1f}', str(s["time_trouble_moves"])]]
+            by_tc_rows = [
+                [t["category"], str(t["games"]),
+                 f'{t["avg_seconds_per_move"]:.1f}' if t["avg_seconds_per_move"] >= 0 else '<span style="color:{}">n/a</span>'.format(MUTED_COLOR),
+                 str(t["time_trouble_moves"])]
+                for t in s.get("by_time_control", [])
+            ]
+            parts.append(_table(["Time control", "Games", "Avg. sec/move", "Moves under 10s"],
+                                 overall_time_row + by_tc_rows))
 
         if s["top_openings_white"]:
             parts.append(_section("Openings you play (White)"))
-            parts.append(self._openings_table(s["top_openings_white"][:10]))
+            parts.append(self._openings_table(s["top_openings_white"], "white"))
 
         if s["top_openings_black"]:
             parts.append(_section("Openings faced (Black)"))
-            parts.append(self._openings_table(s["top_openings_black"][:10]))
+            parts.append(self._openings_table(s["top_openings_black"], "black"))
 
         return "".join(parts)
 

@@ -28,6 +28,7 @@ class GameRow:
     site: str
     time_label: str       # e.g. "2 min+1", "5 min", "Daily"
     time_category: str    # e.g. "Bullet", "Blitz", "Rapid", "Classical", "Daily", "Unknown"
+    time_seconds: int     # base time in seconds, for numeric sorting (see classify_time_control)
 
     @property
     def opponent(self) -> str:
@@ -61,20 +62,28 @@ def result_relative_to(result: str, your_color: str) -> str:
     return "Win" if you_won else "Loss"
 
 
-def classify_time_control(tc: str) -> tuple[str, str]:
+# Sentinel base-seconds values for categories with no single numeric
+# duration, used only for sorting the Time column: Daily sorts as "longest"
+# (it's the slowest format in practice), Unknown sorts last regardless of
+# direction by living beyond every real value.
+DAILY_SORT_SECONDS = 10**8
+UNKNOWN_SORT_SECONDS = -1
+
+
+def classify_time_control(tc: str) -> tuple[str, str, int]:
     """Mirrors db.h's classify_time_control() bucketing. Returns
-    (time_label, category), e.g. ("5 min", "Blitz"), ("3 min+2", "Blitz"),
-    ("", "Daily")."""
+    (time_label, category, sort_seconds), e.g. ("5 min", "Blitz", 300),
+    ("3 min+2", "Blitz", 180), ("", "Daily", DAILY_SORT_SECONDS)."""
     if not tc:
-        return "", "Unknown"
+        return "", "Unknown", UNKNOWN_SORT_SECONDS
     if "/" in tc:
-        return "", "Daily"
+        return "", "Daily", DAILY_SORT_SECONDS
 
     base_str, _, inc_str = tc.partition("+")
     try:
         base_seconds = int(base_str)
     except ValueError:
-        return "", "Unknown"
+        return "", "Unknown", UNKNOWN_SORT_SECONDS
 
     if base_seconds < 180:
         category = "Bullet"
@@ -92,7 +101,7 @@ def classify_time_control(tc: str) -> tuple[str, str]:
     if inc_str:
         time_label += f"+{inc_str}"
 
-    return time_label, category
+    return time_label, category, base_seconds
 
 
 @dataclass
@@ -139,11 +148,11 @@ def games_by_year_month() -> dict[int, dict[int, list[GameRow]]]:
     tree: dict[int, dict[int, list[GameRow]]] = {}
     for id_, date, white, black, your_color, result, opening, site, time_control in rows:
         year, month = _parse_year_month(date)
-        time_label, time_category = classify_time_control(time_control)
+        time_label, time_category, time_seconds = classify_time_control(time_control)
         game = GameRow(
             id_, date, year, month, white, black, your_color,
             result_relative_to(result, your_color), opening,
-            _platform_label(site), time_label, time_category,
+            _platform_label(site), time_label, time_category, time_seconds,
         )
         tree.setdefault(year, {}).setdefault(month, []).append(game)
     return tree

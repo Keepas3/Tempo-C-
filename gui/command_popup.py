@@ -17,6 +17,7 @@ COMMANDS = [
     ("/moves", "<sequence>", "What was played after a SAN sequence, e.g. /moves e4 e5 Nf3"),
     ("/fetch chesscom", "<user> [year month]", "Fetch games from chess.com"),
     ("/fetch lichess", "<user> [days]", "Fetch games from lichess"),
+    ("/clear", "", "Clear the chat history"),
     ("/help", "", "Show this list"),
 ]
 
