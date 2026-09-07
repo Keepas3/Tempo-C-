@@ -33,6 +33,12 @@ struct TimeControlStat {
     int time_trouble_moves = 0; // moves made with < 10s on the clock
 };
 
+struct NextMoveStat {
+    std::string san;
+    int count = 0;
+    int wins = 0, losses = 0, draws = 0;
+};
+
 struct Stats {
     int wins = 0, losses = 0, draws = 0;
     int wins_white = 0, losses_white = 0, draws_white = 0;
@@ -74,6 +80,19 @@ public:
 
     Archive(const Archive&) = delete;
     Archive& operator=(const Archive&) = delete;
+
+    // Wrap a batch of insert_game() calls in begin_transaction()/commit_transaction()
+    // when inserting many games at once (e.g. a fetched monthly PGN). Without this,
+    // SQLite's default autocommit mode fsyncs after every single INSERT, which turns
+    // a few hundred games (each with dozens of per-move INSERTs) into thousands of
+    // individually-committed statements — seconds of work becoming minutes.
+    void begin_transaction() {
+        exec_or_throw("BEGIN;");
+    }
+
+    void commit_transaction() {
+        exec_or_throw("COMMIT;");
+    }
 
     // Returns the new row id, or -1 if the game was a duplicate (skipped).
     int insert_game(const Game& g) {
@@ -224,6 +243,66 @@ public:
         return g;
     }
 
+    // For every game whose move list has `sequence` as an exact SAN prefix,
+    // tallies the move played at ply == sequence.size() (whoever's turn that
+    // is) into a per-distinct-move bucket, with win/loss/draw counted
+    // relative to your_color. Sorted by frequency descending.
+    std::vector<NextMoveStat> opponent_replies(const std::vector<std::string>& sequence) {
+        std::map<int, std::pair<std::string, std::string>> game_info; // game_id -> (your_color, result)
+        {
+            sqlite3_stmt* stmt = prepare("SELECT id, your_color, result FROM games;");
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                int id = sqlite3_column_int(stmt, 0);
+                game_info[id] = {column_text(stmt, 1), column_text(stmt, 2)};
+            }
+            sqlite3_finalize(stmt);
+        }
+
+        std::map<int, std::map<int, std::string>> moves_by_game; // game_id -> (ply -> san)
+        {
+            sqlite3_stmt* stmt = prepare("SELECT game_id, ply, san FROM moves ORDER BY game_id, ply;");
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                int game_id = sqlite3_column_int(stmt, 0);
+                int ply = sqlite3_column_int(stmt, 1);
+                moves_by_game[game_id][ply] = column_text(stmt, 2);
+            }
+            sqlite3_finalize(stmt);
+        }
+
+        std::vector<NextMoveStat> out;
+        for (auto& [game_id, ply_moves] : moves_by_game) {
+            bool matches = true;
+            for (size_t ply = 0; ply < sequence.size(); ++ply) {
+                auto it = ply_moves.find(static_cast<int>(ply));
+                if (it == ply_moves.end() || it->second != sequence[ply]) { matches = false; break; }
+            }
+            if (!matches) continue;
+
+            auto next_it = ply_moves.find(static_cast<int>(sequence.size()));
+            if (next_it == ply_moves.end()) continue; // game ended exactly at the given sequence
+
+            auto info_it = game_info.find(game_id);
+            std::string color = info_it != game_info.end() ? info_it->second.first : "";
+            std::string result = info_it != game_info.end() ? info_it->second.second : "";
+            std::string outcome = result_relative_to(result, color);
+
+            auto stat_it = std::find_if(out.begin(), out.end(),
+                                         [&](const NextMoveStat& s) { return s.san == next_it->second; });
+            if (stat_it == out.end()) {
+                out.push_back({next_it->second, 0, 0, 0, 0});
+                stat_it = std::prev(out.end());
+            }
+            stat_it->count++;
+            if (outcome == "Win") stat_it->wins++;
+            else if (outcome == "Loss") stat_it->losses++;
+            else if (outcome == "Draw") stat_it->draws++;
+        }
+
+        std::sort(out.begin(), out.end(),
+                  [](const NextMoveStat& a, const NextMoveStat& b) { return a.count > b.count; });
+        return out;
+    }
+
     Stats compute_stats() {
         Stats stats;
 
@@ -349,6 +428,15 @@ private:
         return out;
     }
 
+    void exec_or_throw(const char* sql) {
+        char* err = nullptr;
+        if (sqlite3_exec(db_, sql, nullptr, nullptr, &err) != SQLITE_OK) {
+            std::string msg = err ? err : "unknown error";
+            sqlite3_free(err);
+            throw std::runtime_error(std::string("sqlite exec failed (") + sql + "): " + msg);
+        }
+    }
+
     void init_schema() {
         const char* schema =
             "CREATE TABLE IF NOT EXISTS games ("
@@ -370,12 +458,7 @@ private:
             "  eval_cp INTEGER,"
             "  PRIMARY KEY (game_id, ply)"
             ");";
-        char* err = nullptr;
-        if (sqlite3_exec(db_, schema, nullptr, nullptr, &err) != SQLITE_OK) {
-            std::string msg = err ? err : "unknown error";
-            sqlite3_free(err);
-            throw std::runtime_error("failed to create schema: " + msg);
-        }
+        exec_or_throw(schema);
     }
 
     sqlite3_stmt* prepare(const char* sql) {

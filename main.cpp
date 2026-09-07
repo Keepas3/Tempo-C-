@@ -3,10 +3,14 @@
 #include <sstream>
 #include <iomanip>
 #include <filesystem>
+#include <chrono>
+#include <ctime>
 #include "game.h"
 #include "pgn.h"
 #include "db.h"
 #include "analysis.h"
+#include "archive_files.h"
+#include "fetch.h"
 
 namespace fs = std::filesystem;
 
@@ -20,6 +24,9 @@ void print_help() {
                  "  review <id>         Replay a game with eval annotations and blunder flags\n"
                  "  stats               Show win rate, opening, and time-management stats\n"
                  "  opening <query>     Show win/loss record and games for an opening (name substring or ECO code)\n"
+                 "  moves <sequence>    Show what was played after a SAN move sequence, e.g. 'moves e4 e5 Nf3'\n"
+                 "  fetch chesscom <user> [year month]   Fetch games from chess.com (default: current+previous month)\n"
+                 "  fetch lichess <user> [days]          Fetch games from lichess (default: last 90 days)\n"
                  "  help                Show this help\n"
                  "  q / quit            Exit\n\n";
 }
@@ -39,10 +46,19 @@ ImportCounts import_one_file(Archive& archive, const std::string& path) {
     }
 
     counts.parsed = static_cast<int>(games.size());
+
+    archive.begin_transaction();
     for (const Game& g : games) {
         int id = archive.insert_game(g);
-        if (id == -1) counts.skipped++; else counts.added++;
+        if (id == -1) {
+            counts.skipped++;
+        } else {
+            counts.added++;
+            append_to_master_file(g);
+        }
     }
+    archive.commit_transaction();
+
     return counts;
 }
 
@@ -246,6 +262,97 @@ void cmd_stats(Archive& archive) {
     print_openings("Openings faced (Black)", s.top_openings_black);
 }
 
+void cmd_moves(Archive& archive, const std::vector<std::string>& sequence) {
+    std::vector<NextMoveStat> stats = archive.opponent_replies(sequence);
+
+    std::string prefix_display;
+    for (size_t i = 0; i < sequence.size(); ++i) {
+        if (i % 2 == 0) prefix_display += std::to_string(i / 2 + 1) + ".";
+        prefix_display += sequence[i] + " ";
+    }
+
+    if (stats.empty()) {
+        std::cout << "[Result] No games reached the position after " << prefix_display << "\n\n";
+        return;
+    }
+
+    int total_games = 0;
+    for (const NextMoveStat& s : stats) total_games += s.count;
+
+    std::cout << "After " << prefix_display << "(" << total_games << " game(s) reached this position):\n";
+    for (const NextMoveStat& s : stats) {
+        std::cout << "  " << s.san << ": " << s.count << " game(s)  "
+                  << s.wins << "W " << s.losses << "L " << s.draws << "D\n";
+    }
+    std::cout << "\n";
+}
+
+void fetch_chesscom_one_month(Archive& archive, const std::string& username, int year, int month) {
+    fs::path tmp = fs::temp_directory_path() / "tempo_fetch_chesscom.pgn";
+    std::ostringstream label;
+    label << year << "-" << std::setfill('0') << std::setw(2) << month;
+
+    std::cout << "Fetching chess.com games for " << username << " (" << label.str() << ")...\n";
+    if (!fetch_chesscom_month(username, year, month, tmp.string())) {
+        std::cout << "[Error] chess.com fetch failed for " << label.str()
+                   << " (check the username and your network connection)\n\n";
+        std::error_code ec;
+        fs::remove(tmp, ec);
+        return;
+    }
+
+    ImportCounts c = import_one_file(archive, tmp.string());
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    std::cout << "[Result] chess.com " << label.str() << ": parsed " << c.parsed << " game(s), "
+              << c.added << " added, " << c.skipped << " already in the archive.\n\n";
+}
+
+void cmd_fetch_chesscom(Archive& archive, const std::string& username, int year, int month) {
+    if (!is_valid_username(username)) {
+        std::cout << "[Error] invalid username: " << username << "\n\n";
+        return;
+    }
+
+    if (year == -1) {
+        std::time_t tt = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        std::tm* local_tm = std::localtime(&tt);
+        int cur_year = local_tm->tm_year + 1900;
+        int cur_month = local_tm->tm_mon + 1;
+        int prev_year = (cur_month == 1) ? cur_year - 1 : cur_year;
+        int prev_month = (cur_month == 1) ? 12 : cur_month - 1;
+
+        fetch_chesscom_one_month(archive, username, prev_year, prev_month);
+        fetch_chesscom_one_month(archive, username, cur_year, cur_month);
+    } else {
+        fetch_chesscom_one_month(archive, username, year, month);
+    }
+}
+
+void cmd_fetch_lichess(Archive& archive, const std::string& username, int days) {
+    if (!is_valid_username(username)) {
+        std::cout << "[Error] invalid username: " << username << "\n\n";
+        return;
+    }
+
+    fs::path tmp = fs::temp_directory_path() / "tempo_fetch_lichess.pgn";
+
+    std::cout << "Fetching lichess games for " << username << " (last " << days << " days)...\n";
+    if (!fetch_lichess_range(username, days, tmp.string())) {
+        std::cout << "[Error] lichess fetch failed for " << username
+                   << " (check the username and your network connection)\n\n";
+        std::error_code ec;
+        fs::remove(tmp, ec);
+        return;
+    }
+
+    ImportCounts c = import_one_file(archive, tmp.string());
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    std::cout << "[Result] lichess (last " << days << " days): parsed " << c.parsed << " game(s), "
+              << c.added << " added, " << c.skipped << " already in the archive.\n\n";
+}
+
 int main() {
     std::cout << "          Tempo C++ Game Archive          \n\n";
     print_help();
@@ -298,6 +405,36 @@ int main() {
                 std::cout << "[Error] usage: opening <name-or-ECO>\n\n";
             } else {
                 cmd_opening(archive, query);
+            }
+        } else if (cmd == "moves") {
+            std::vector<std::string> sequence;
+            std::string token;
+            while (iss >> token) sequence.push_back(token);
+            if (sequence.empty()) {
+                std::cout << "[Error] usage: moves <san-sequence>, e.g. moves e4 e5 Nf3\n\n";
+            } else {
+                cmd_moves(archive, sequence);
+            }
+        } else if (cmd == "fetch") {
+            std::string site, username;
+            iss >> site >> username;
+            if (site.empty() || username.empty()) {
+                std::cout << "[Error] usage: fetch chesscom <username> [year month]  |  fetch lichess <username> [days]\n\n";
+            } else if (site == "chesscom") {
+                int year, month;
+                bool has_year = static_cast<bool>(iss >> year);
+                bool has_month = has_year && static_cast<bool>(iss >> month);
+                if (has_year && !has_month) {
+                    std::cout << "[Error] usage: fetch chesscom <username> [year month] (both or neither)\n\n";
+                } else {
+                    cmd_fetch_chesscom(archive, username, has_month ? year : -1, has_month ? month : -1);
+                }
+            } else if (site == "lichess") {
+                int days = 90;
+                iss >> days;
+                cmd_fetch_lichess(archive, username, days);
+            } else {
+                std::cout << "[Error] unknown fetch site '" << site << "' (expected chesscom or lichess)\n\n";
             }
         } else {
             std::cout << "[Error] unknown command '" << cmd << "'. Type 'help' for a list of commands.\n\n";
