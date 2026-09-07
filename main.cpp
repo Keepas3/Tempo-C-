@@ -459,6 +459,14 @@ int run_json_command(Archive& archive, const std::vector<std::string>& args) {
                 return 1;
             }
             std::cout << to_json(archive.find_games_by_opening(args[1])) << "\n";
+        } else if (cmd == "opening_exact") {
+            if (args.size() < 2) {
+                std::cout << json_error("usage: opening_exact <exact-name> [limit]") << "\n";
+                return 1;
+            }
+            int limit = 3;
+            if (args.size() >= 3) limit = std::stoi(args[2]);
+            std::cout << to_json(archive.find_games_by_exact_opening(args[1], limit)) << "\n";
         } else if (cmd == "moves") {
             if (args.size() < 2) {
                 std::cout << json_error("usage: moves <san-sequence>") << "\n";

@@ -50,6 +50,7 @@ inline std::string to_json(const GameSummary& g) {
       << ", \"result\": " << json_str(g.result_display)
       << ", \"opening\": " << json_str(g.opening)
       << ", \"site\": " << json_str(g.site)
+      << ", \"time_category\": " << json_str(g.time_category)
       << "}";
     return o.str();
 }

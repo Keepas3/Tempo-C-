@@ -172,6 +172,22 @@ def load_game(game_id: int) -> GameDetail | None:
         conn.close()
 
 
+def list_opening_names() -> list[tuple[str, int]]:
+    """Every distinct opening name actually present in the archive, with how
+    many games carry it, most-played first. Simple DISTINCT+COUNT -- no
+    opening-matching heuristics involved, so this stays a direct read here
+    rather than going through tempo_cli.py."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT opening, COUNT(*) as n FROM games WHERE opening != '' "
+            "GROUP BY opening ORDER BY n DESC, opening ASC;"
+        ).fetchall()
+        return [(opening, count) for opening, count in rows]
+    finally:
+        conn.close()
+
+
 def _parse_year_month(pgn_date: str) -> tuple[int, int]:
     try:
         year_str, month_str, _day_str = pgn_date.split(".")

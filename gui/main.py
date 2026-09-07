@@ -6,13 +6,14 @@ from __future__ import annotations
 
 import sys
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, Qt
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -97,6 +98,26 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(splitter)
         self.resize(1700, 800)
         splitter.setSizes([320, 620, 620])
+
+        # Left/Right navigate the board like the Prev/Next buttons, from
+        # anywhere in the window -- except while actually typing/editing
+        # text (the command input), where the arrow keys should just move
+        # the text cursor as normal. An application-level filter is used
+        # (rather than overriding keyPressEvent) so this works regardless of
+        # which panel currently has focus -- the browser tree and output
+        # pane would otherwise consume Left/Right themselves for their own
+        # navigation before a window-level handler ever saw the event.
+        QApplication.instance().installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.Type.KeyPress and not isinstance(QApplication.focusWidget(), QLineEdit):
+            if event.key() == Qt.Key.Key_Left:
+                self.board.prev_ply()
+                return True
+            if event.key() == Qt.Key.Key_Right:
+                self.board.next_ply()
+                return True
+        return super().eventFilter(obj, event)
 
     def _build_center_panel(self) -> QWidget:
         self.prev_btn = QPushButton("< Prev")

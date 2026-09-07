@@ -60,6 +60,10 @@ def opening(query: str) -> dict:
     return run("opening", query)
 
 
+def opening_exact(name: str, limit: int = 3) -> dict:
+    return run("opening_exact", name, str(limit))
+
+
 def moves(sequence: list[str]) -> dict:
     return run("moves", *sequence)
 

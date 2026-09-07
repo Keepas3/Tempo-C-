@@ -11,12 +11,16 @@ from __future__ import annotations
 
 import calendar
 import html
+from urllib.parse import quote, unquote
 
-from PySide6.QtCore import Signal
-from PySide6.QtGui import QFont
-from PySide6.QtWidgets import QApplication, QLineEdit, QTextEdit, QVBoxLayout, QWidget
+from PySide6.QtCore import QEvent, QObject, Qt, Signal
+from PySide6.QtGui import QFont, QTextCursor
+from PySide6.QtWidgets import QApplication, QLineEdit, QTextBrowser, QVBoxLayout, QWidget
 
+import db_reader
+import opening_moves
 import tempo_cli
+from command_popup import COMMANDS, CommandPopup, OpeningPopup
 
 HEADER_COLOR = "#7fb3ff"
 MUTED_COLOR = "#888888"
@@ -25,20 +29,17 @@ LOSS_COLOR = "#e57373"
 DRAW_COLOR = "#b0b0b0"
 ERROR_COLOR = "#e57373"
 
-HELP_TEXT = """
-<b style="color:{header}">Commands</b>
-<table cellpadding="3" style="width:100%">
-<tr><td><code>/list [n]</code></td><td>List the n most recent games (default 20)</td></tr>
-<tr><td><code>/show &lt;id&gt;</code></td><td>Show a game's info and load it on the board</td></tr>
-<tr><td><code>/review &lt;id&gt;</code></td><td>Replay a game with eval annotations, loaded on the board</td></tr>
-<tr><td><code>/stats</code></td><td>Win rate, opening, and time-management stats</td></tr>
-<tr><td><code>/opening &lt;query&gt;</code></td><td>Win/loss record for an opening (name substring or ECO code)</td></tr>
-<tr><td><code>/moves &lt;sequence&gt;</code></td><td>What was played after a SAN sequence, e.g. <code>/moves e4 e5 Nf3</code></td></tr>
-<tr><td><code>/fetch chesscom &lt;user&gt; [year month]</code></td><td>Fetch games from chess.com</td></tr>
-<tr><td><code>/fetch lichess &lt;user&gt; [days]</code></td><td>Fetch games from lichess</td></tr>
-<tr><td><code>/help</code></td><td>Show this help</td></tr>
-</table>
-""".format(header=HEADER_COLOR)
+WELCOME_TEXT = f'<span style="color:{MUTED_COLOR}">Type <code>/</code> to see commands, or <code>/help</code> any time.</span>'
+
+HELP_TEXT = (
+    f'<b style="color:{HEADER_COLOR}">Commands</b>'
+    '<table cellpadding="3" style="width:100%">'
+    + "".join(
+        f'<tr><td><code>{html.escape(cmd)} {html.escape(args)}</code></td><td>{html.escape(desc)}</td></tr>'
+        for cmd, args, desc in COMMANDS
+    )
+    + "</table>"
+)
 
 
 def _esc(s) -> str:
@@ -87,26 +88,156 @@ class CommandPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        self.output = QTextEdit()
+        self.output = QTextBrowser()
         self.output.setReadOnly(True)
         self.output.setFont(QFont("Segoe UI", 10))
+        self.output.setOpenLinks(False)  # we handle anchor clicks ourselves (expand/collapse), not real navigation
+        self.output.anchorClicked.connect(self._on_anchor_clicked)
 
         self.input = QLineEdit()
-        self.input.setPlaceholderText("Type /help for commands...")
+        self.input.setPlaceholderText("Type / for commands...")
         self.input.returnPressed.connect(self._on_submit)
+        self.input.installEventFilter(self)
+
+        self.popup = CommandPopup(self.input)
+        self.popup.command_chosen.connect(self._apply_popup_command)
+
+        self.opening_popup = OpeningPopup(self.input)
+        self.opening_popup.command_chosen.connect(self._apply_opening_selection)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.addWidget(self.output, stretch=1)
         layout.addWidget(self.input)
 
-        self._print(HELP_TEXT)
+        self.input.textChanged.connect(self._on_input_changed)
+
+        # Last /stats result and which opening rows are expanded, so a click
+        # can re-render just that block in place (see _replace_stats_block).
+        self._stats_data: dict | None = None
+        self._expanded_openings: set[str] = set()
+        self._stats_start: QTextCursor | None = None
+        self._stats_end: QTextCursor | None = None
+        # Recent-games lookups are fetched lazily (only when a row is first
+        # expanded) and cached here so re-collapsing/re-expanding is instant.
+        self._opening_games_cache: dict[str, list[dict]] = {}
+
+        self._print(WELCOME_TEXT)
 
     def _print(self, html_fragment: str) -> None:
         self.output.append(html_fragment)
 
+    def _on_anchor_clicked(self, url) -> None:
+        text = url.toString()
+        if not text.startswith("opening:"):
+            return
+        name = unquote(text[len("opening:"):])
+        if name in self._expanded_openings:
+            self._expanded_openings.discard(name)
+        else:
+            self._expanded_openings.add(name)
+        self._replace_stats_block()
+
     def _print_error(self, message: str) -> None:
         self._print(f'<span style="color:{ERROR_COLOR}">[Error] {_esc(message)}</span>')
+
+    # --- slash-command / opening-name popups --------------------------------
+
+    def _on_input_changed(self, text: str) -> None:
+        opening_filter = self._opening_query_text(text)
+        if opening_filter is not None:
+            self.popup.hide()
+            self.opening_popup.set_openings(db_reader.list_opening_names())
+            self._show_popup(self.opening_popup, opening_filter)
+            return
+        self.opening_popup.hide()
+
+        if not text.startswith("/") or not self._still_choosing_command(text):
+            self.popup.hide()
+            return
+        self._show_popup(self.popup, text)
+
+    def _show_popup(self, popup, filter_text: str) -> None:
+        popup.setFixedWidth(max(self.input.width(), 260))
+        has_matches = popup.refresh(filter_text)  # also sets the popup's fixed height for the current match count
+        if has_matches:
+            # Anchor above the input (it sits at the bottom of the panel, so
+            # a downward popup would run off the panel or cover the output).
+            top_left = self.input.mapToGlobal(self.input.rect().topLeft())
+            popup.move(top_left.x(), top_left.y() - popup.height())
+            popup.show()
+        else:
+            popup.hide()
+
+    @staticmethod
+    def _opening_query_text(text: str) -> str | None:
+        """Returns the partial opening-name filter text while typing
+        "/opening <name>" (possibly empty, right after "/opening "), or None
+        if `text` isn't in that state."""
+        if not text.lower().startswith("/opening"):
+            return None
+        rest = text[len("/opening"):]
+        if not rest.startswith(" "):
+            return None  # still typing "/opening" itself -- that's the command popup's territory
+        return rest.lstrip(" ")
+
+    def _apply_opening_selection(self, name: str) -> None:
+        self.input.setText(f"/opening {name}")
+        self._on_submit()
+
+    @staticmethod
+    def _still_choosing_command(text: str) -> bool:
+        """True while the typed text could still be extending toward a full
+        command *name* (e.g. "/fe", "/fetch", "/fetch "->"/fetch chesscom").
+        False once a trailing space follows something that's already a
+        complete command name with no longer sibling to keep matching, i.e.
+        the user has moved on to typing that command's arguments."""
+        stripped = text.rstrip(" ")
+        lower = stripped.lower()
+        has_trailing_space = text.endswith(" ")
+        return any(
+            cmd.lower().startswith(lower) and (not has_trailing_space or len(cmd) > len(stripped))
+            for cmd, _args, _desc in COMMANDS
+        )
+
+    def _apply_popup_command(self, command: str) -> None:
+        self.input.setText(command)
+        self.input.setFocus()
+        self.input.setCursorPosition(len(command))
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        # Check the event type/source *before* touching self.popup/opening_popup:
+        # this filter is installed on self.input, and constructing a child
+        # widget parented to it (the popups themselves, in __init__) raises
+        # ChildEvents through here too -- accessing those attributes
+        # unconditionally would run before they're assigned during __init__.
+        if obj is not self.input or event.type() != QEvent.Type.KeyPress:
+            return super().eventFilter(obj, event)
+
+        if self.popup.isVisible():
+            active_popup, apply_fn = self.popup, self._apply_popup_command
+        elif self.opening_popup.isVisible():
+            active_popup, apply_fn = self.opening_popup, self._apply_opening_selection
+        else:
+            active_popup, apply_fn = None, None
+
+        if active_popup is not None:
+            key = event.key()
+            if key == Qt.Key.Key_Down:
+                active_popup.move_selection(1)
+                return True
+            if key == Qt.Key.Key_Up:
+                active_popup.move_selection(-1)
+                return True
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Tab):
+                value = active_popup.choose_current()
+                if value is not None:
+                    apply_fn(value)
+                    return True
+            elif key == Qt.Key.Key_Escape:
+                active_popup.hide()
+                return True
+        return super().eventFilter(obj, event)
 
     def _on_submit(self) -> None:
         line = self.input.text().strip()
@@ -142,7 +273,10 @@ class CommandPanel(QWidget):
             data = tempo_cli.list_games(limit)
             self._print(self._format_games(data["games"]))
         elif cmd == "stats":
-            self._print(self._format_stats(tempo_cli.stats()))
+            self._stats_data = tempo_cli.stats()
+            self._expanded_openings = set()
+            self._opening_games_cache = {}
+            self._render_stats_block()
         elif cmd == "opening":
             if not args:
                 self._print_error("usage: /opening <name-or-ECO>")
@@ -202,6 +336,85 @@ class CommandPanel(QWidget):
             return
 
         self._print(self._format_fetch_results(data["results"]))
+
+    def _render_stats_block(self) -> None:
+        """Inserts the /stats output as a distinct block, remembering the
+        cursor range it occupies so a later expand/collapse click can replace
+        just that block in place instead of re-appending a whole new copy."""
+        cursor = self.output.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        if not self.output.document().isEmpty():
+            cursor.insertBlock()
+        self._stats_start = QTextCursor(cursor)
+        # Without this, a cursor sitting exactly at a future insertion point
+        # drifts forward with that insertion by default, so on the next
+        # expand/collapse the "start" marker would have silently slid past
+        # the block it's supposed to bound -- breaking in-place replacement.
+        self._stats_start.setKeepPositionOnInsert(True)
+        cursor.insertHtml(self._format_stats(self._stats_data))
+        self._stats_end = QTextCursor(cursor)
+        self.output.setTextCursor(cursor)
+        self.output.ensureCursorVisible()
+
+    def _replace_stats_block(self) -> None:
+        if self._stats_start is None or self._stats_end is None or self._stats_data is None:
+            return
+        # Build the selection from raw integer positions rather than copying
+        # self._stats_start directly: keepPositionOnInsert only pins its
+        # position(), not its anchor(), so after the first insertion at that
+        # spot the copied cursor's anchor silently drifts forward too --
+        # producing a phantom zero-length selection instead of the real
+        # start..end range.
+        cursor = self.output.textCursor()
+        cursor.setPosition(self._stats_start.position())
+        cursor.setPosition(self._stats_end.position(), QTextCursor.MoveMode.KeepAnchor)
+        cursor.removeSelectedText()
+        cursor.insertHtml(self._format_stats(self._stats_data))
+        self._stats_end = QTextCursor(cursor)
+
+    def _recent_games_for(self, name: str) -> list[dict]:
+        if name not in self._opening_games_cache:
+            try:
+                self._opening_games_cache[name] = tempo_cli.opening_exact(name, 3)["games"]
+            except tempo_cli.TempoCliError:
+                self._opening_games_cache[name] = []
+        return self._opening_games_cache[name]
+
+    def _openings_table(self, openings: list[dict]) -> str:
+        head = (f'<tr><th align="left" style="color:{MUTED_COLOR}; border-bottom:1px solid #555; padding:3px 8px 3px 0;">Opening</th>'
+                f'<th align="left" style="color:{MUTED_COLOR}; border-bottom:1px solid #555; padding:3px 8px 3px 0;">Games</th>'
+                f'<th align="left" style="color:{MUTED_COLOR}; border-bottom:1px solid #555; padding:3px 8px 3px 0;">Win rate</th></tr>')
+        rows = []
+        for o in openings:
+            name = o["opening"]
+            expanded = name in self._expanded_openings
+            arrow = "&#9662;" if expanded else "&#9656;"  # ▾ / ▸
+            href = "opening:" + quote(name)
+            link = f'<a href="{href}" style="color:inherit; text-decoration:none;">{arrow} {_esc(name)}</a>'
+            rows.append(f'<tr><td style="padding:2px 8px 2px 0;">{link}</td>'
+                        f'<td style="padding:2px 8px 2px 0;">{o["games"]}</td>'
+                        f'<td style="padding:2px 8px 2px 0;">{_win_rate_span(o["wins"], o["games"])}</td></tr>')
+            if expanded:
+                moves = opening_moves.get_moves(name)
+                if moves:
+                    detail = f'<code>{_esc(moves)}</code>'
+                else:
+                    detail = f'<span style="color:{MUTED_COLOR}">move order not found</span>'
+
+                recent = self._recent_games_for(name)
+                if recent:
+                    recent_lines = []
+                    for g in recent:
+                        recent_lines.append(
+                            f'<span style="color:{MUTED_COLOR}">{_esc(g["date"])}</span>  '
+                            f'<span style="color:{_result_color(g["result"])}"><b>{_esc(g["result"])}</b></span>  '
+                            f'<span style="color:{MUTED_COLOR}">{_esc(g["time_category"])}</span>'
+                        )
+                    detail += (f'<div style="margin-top:4px; color:{MUTED_COLOR};">Most recent:</div>'
+                               + "<br>".join(recent_lines))
+
+                rows.append(f'<tr><td colspan="3" style="padding:0 8px 8px 22px; color:{MUTED_COLOR};">{detail}</td></tr>')
+        return f'<table cellspacing="0" style="width:100%; margin-top:4px;">{head}{"".join(rows)}</table>'
 
     def _format_fetch_results(self, results: list[dict]) -> str:
         rows = []
@@ -269,15 +482,11 @@ class CommandPanel(QWidget):
 
         if s["top_openings_white"]:
             parts.append(_section("Openings you play (White)"))
-            rows = [[_esc(o["opening"]), str(o["games"]), _win_rate_span(o["wins"], o["games"])]
-                    for o in s["top_openings_white"][:10]]
-            parts.append(_table(["Opening", "Games", "Win rate"], rows))
+            parts.append(self._openings_table(s["top_openings_white"][:10]))
 
         if s["top_openings_black"]:
             parts.append(_section("Openings faced (Black)"))
-            rows = [[_esc(o["opening"]), str(o["games"]), _win_rate_span(o["wins"], o["games"])]
-                    for o in s["top_openings_black"][:10]]
-            parts.append(_table(["Opening", "Games", "Win rate"], rows))
+            parts.append(self._openings_table(s["top_openings_black"][:10]))
 
         return "".join(parts)
 

@@ -19,6 +19,7 @@ struct GameSummary {
     std::string result_display; // "Win" / "Loss" / "Draw" / "?"
     std::string opening;
     std::string site; // normalized platform label: "Chess.com", "Lichess", or "Unknown"
+    std::string time_category; // "Bullet" / "Blitz" / "Rapid" / "Classical" / "Daily" / "Unknown"
 };
 
 struct OpeningStat {
@@ -162,7 +163,7 @@ public:
 
     std::vector<GameSummary> list_games(int limit) {
         const char* sql =
-            "SELECT id, date, white, black, your_color, result, opening, site "
+            "SELECT id, date, white, black, your_color, result, opening, site, time_control "
             "FROM games ORDER BY id DESC LIMIT ?;";
         sqlite3_stmt* stmt = prepare(sql);
         sqlite3_bind_int(stmt, 1, limit);
@@ -178,6 +179,7 @@ public:
             std::string result = column_text(stmt, 5);
             s.opening = column_text(stmt, 6);
             s.site = platform_label(column_text(stmt, 7));
+            s.time_category = classify_time_control(column_text(stmt, 8));
             s.opponent = (s.your_color == "white") ? black : white;
             s.result_display = result_relative_to(result, s.your_color);
             out.push_back(s);
@@ -196,7 +198,7 @@ public:
         }
 
         std::string sql =
-            "SELECT id, date, white, black, your_color, result, opening, site "
+            "SELECT id, date, white, black, your_color, result, opening, site, time_control "
             "FROM games WHERE ";
         sql += looks_like_eco ? "eco LIKE ? || '%'" : "opening LIKE '%' || ? || '%'";
         sql += " ORDER BY id DESC LIMIT ?;";
@@ -216,6 +218,39 @@ public:
             std::string result = column_text(stmt, 5);
             s.opening = column_text(stmt, 6);
             s.site = platform_label(column_text(stmt, 7));
+            s.time_category = classify_time_control(column_text(stmt, 8));
+            s.opponent = (s.your_color == "white") ? black : white;
+            s.result_display = result_relative_to(result, s.your_color);
+            out.push_back(s);
+        }
+        sqlite3_finalize(stmt);
+        return out;
+    }
+
+    // Exact opening-name match (unlike find_games_by_opening's substring
+    // match), used to list a handful of recent games behind one specific
+    // /stats opening row -- those rows are grouped by exact string equality,
+    // so a substring match would also pull in unrelated sub-variations.
+    std::vector<GameSummary> find_games_by_exact_opening(const std::string& name, int limit = 3) {
+        const char* sql =
+            "SELECT id, date, white, black, your_color, result, opening, site, time_control "
+            "FROM games WHERE opening = ? ORDER BY id DESC LIMIT ?;";
+        sqlite3_stmt* stmt = prepare(sql);
+        bind_text(stmt, 1, name);
+        sqlite3_bind_int(stmt, 2, limit);
+
+        std::vector<GameSummary> out;
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            GameSummary s;
+            s.id = sqlite3_column_int(stmt, 0);
+            s.date = column_text(stmt, 1);
+            std::string white = column_text(stmt, 2);
+            std::string black = column_text(stmt, 3);
+            s.your_color = column_text(stmt, 4);
+            std::string result = column_text(stmt, 5);
+            s.opening = column_text(stmt, 6);
+            s.site = platform_label(column_text(stmt, 7));
+            s.time_category = classify_time_control(column_text(stmt, 8));
             s.opponent = (s.your_color == "white") ? black : white;
             s.result_display = result_relative_to(result, s.your_color);
             out.push_back(s);

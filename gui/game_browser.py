@@ -14,6 +14,15 @@ GAME_ID_ROLE = 1000
 COLUMNS = ["Game", "Time", "Type", "Site", "Result"]
 
 
+def _abbrev_date(date: str) -> str:
+    """"2026.09.05" -> "26.09.05" -- saves horizontal space in the row title;
+    the full year is already shown once on the tree's Year grouping node."""
+    parts = date.split(".")
+    if len(parts) == 3 and len(parts[0]) == 4:
+        return f"{parts[0][2:]}.{parts[1]}.{parts[2]}"
+    return date
+
+
 class GameBrowser(QTreeWidget):
     game_selected = Signal(int)
 
@@ -43,10 +52,11 @@ class GameBrowser(QTreeWidget):
                 month_item = QTreeWidgetItem([f"{month_name} ({len(months[month])})"])
                 year_item.addChild(month_item)
                 for game in months[month]:
-                    label = f"{game.date}  vs {game.opponent}  ({game.your_color})"
+                    label = f"{_abbrev_date(game.date)}  vs {game.opponent}  ({game.your_color})"
+                    full_label = f"{game.date}  vs {game.opponent}  ({game.your_color})"
                     game_item = QTreeWidgetItem([label, game.time_label, game.time_category, game.site, game.result])
                     game_item.setData(0, GAME_ID_ROLE, game.id)
-                    game_item.setToolTip(0, label)  # full text on hover, even if still tight
+                    game_item.setToolTip(0, full_label)  # full year on hover
                     month_item.addChild(game_item)
             year_item.setExpanded(False)
         self.collapseAll()
