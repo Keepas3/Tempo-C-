@@ -11,7 +11,7 @@ import calendar
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QHeaderView, QTreeWidget, QTreeWidgetItem
 
-import db_reader
+from db_reader import DbReader
 
 GAME_ID_ROLE = 1000
 COLUMNS = ["Game", "Time", "Type", "Site", "Result"]
@@ -51,8 +51,9 @@ def _sort_key(column: int, game) -> object:
 class GameBrowser(QTreeWidget):
     game_selected = Signal(int)
 
-    def __init__(self, parent=None):
+    def __init__(self, db: DbReader, parent=None):
         super().__init__(parent)
+        self.db = db
         self._items_by_id: dict[int, QTreeWidgetItem] = {}
         self._tree_data: dict[int, dict[int, list]] = {}
         self._sort_column = 0
@@ -77,7 +78,7 @@ class GameBrowser(QTreeWidget):
         self.refresh()
 
     def refresh(self) -> None:
-        self._tree_data = db_reader.games_by_year_month()
+        self._tree_data = self.db.games_by_year_month()
         self._rebuild(preserve_state=False)
 
     def _on_header_clicked(self, column: int) -> None:

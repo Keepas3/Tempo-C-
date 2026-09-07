@@ -11,7 +11,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DB_PATH = PROJECT_ROOT / "tempo_archive.db"
 
 
 @dataclass
@@ -126,75 +125,79 @@ class GameDetail:
     moves: list[MoveRow] = field(default_factory=list)
 
 
-def _connect() -> sqlite3.Connection:
-    # Read-only: the GUI never writes to the games/moves tables (that's the
-    # CLI's job via import/fetch); "mode=ro" makes that explicit and safe
-    # even if the CLI is writing concurrently.
-    uri = f"file:{DB_PATH.as_posix()}?mode=ro"
-    return sqlite3.connect(uri, uri=True)
+class DbReader:
+    """Bound to one profile's db file -- each profile tab constructs its own
+    instance so multiple profiles' reads never share state."""
 
+    def __init__(self, db_path: Path) -> None:
+        self.db_path = db_path
 
-def games_by_year_month() -> dict[int, dict[int, list[GameRow]]]:
-    """Returns {year: {month: [GameRow, ...]}}, newest first within each month."""
-    conn = _connect()
-    try:
-        rows = conn.execute(
-            "SELECT id, date, white, black, your_color, result, opening, site, time_control "
-            "FROM games ORDER BY date DESC, id DESC;"
-        ).fetchall()
-    finally:
-        conn.close()
+    def _connect(self) -> sqlite3.Connection:
+        # Read-only: the GUI never writes to the games/moves tables (that's
+        # the CLI's job via import/fetch); "mode=ro" makes that explicit and
+        # safe even if the CLI is writing concurrently.
+        uri = f"file:{self.db_path.as_posix()}?mode=ro"
+        return sqlite3.connect(uri, uri=True)
 
-    tree: dict[int, dict[int, list[GameRow]]] = {}
-    for id_, date, white, black, your_color, result, opening, site, time_control in rows:
-        year, month = _parse_year_month(date)
-        time_label, time_category, time_seconds = classify_time_control(time_control)
-        game = GameRow(
-            id_, date, year, month, white, black, your_color,
-            result_relative_to(result, your_color), opening,
-            _platform_label(site), time_label, time_category, time_seconds,
-        )
-        tree.setdefault(year, {}).setdefault(month, []).append(game)
-    return tree
+    def games_by_year_month(self) -> dict[int, dict[int, list[GameRow]]]:
+        """Returns {year: {month: [GameRow, ...]}}, newest first within each month."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, date, white, black, your_color, result, opening, site, time_control "
+                "FROM games ORDER BY date DESC, id DESC;"
+            ).fetchall()
+        finally:
+            conn.close()
 
+        tree: dict[int, dict[int, list[GameRow]]] = {}
+        for id_, date, white, black, your_color, result, opening, site, time_control in rows:
+            year, month = _parse_year_month(date)
+            time_label, time_category, time_seconds = classify_time_control(time_control)
+            game = GameRow(
+                id_, date, year, month, white, black, your_color,
+                result_relative_to(result, your_color), opening,
+                _platform_label(site), time_label, time_category, time_seconds,
+            )
+            tree.setdefault(year, {}).setdefault(month, []).append(game)
+        return tree
 
-def load_game(game_id: int) -> GameDetail | None:
-    conn = _connect()
-    try:
-        row = conn.execute(
-            "SELECT id, event, site, date, white, black, result, eco, opening, time_control, your_color "
-            "FROM games WHERE id = ?;",
-            (game_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        detail = GameDetail(*row)
-        detail.site = _platform_label(detail.site)
+    def load_game(self, game_id: int) -> GameDetail | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT id, event, site, date, white, black, result, eco, opening, time_control, your_color "
+                "FROM games WHERE id = ?;",
+                (game_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            detail = GameDetail(*row)
+            detail.site = _platform_label(detail.site)
 
-        move_rows = conn.execute(
-            "SELECT san, clock_seconds FROM moves WHERE game_id = ? ORDER BY ply;",
-            (game_id,),
-        ).fetchall()
-        detail.moves = [MoveRow(san, clock) for san, clock in move_rows]
-        return detail
-    finally:
-        conn.close()
+            move_rows = conn.execute(
+                "SELECT san, clock_seconds FROM moves WHERE game_id = ? ORDER BY ply;",
+                (game_id,),
+            ).fetchall()
+            detail.moves = [MoveRow(san, clock) for san, clock in move_rows]
+            return detail
+        finally:
+            conn.close()
 
-
-def list_opening_names() -> list[tuple[str, int]]:
-    """Every distinct opening name actually present in the archive, with how
-    many games carry it, most-played first. Simple DISTINCT+COUNT -- no
-    opening-matching heuristics involved, so this stays a direct read here
-    rather than going through tempo_cli.py."""
-    conn = _connect()
-    try:
-        rows = conn.execute(
-            "SELECT opening, COUNT(*) as n FROM games WHERE opening != '' "
-            "GROUP BY opening ORDER BY n DESC, opening ASC;"
-        ).fetchall()
-        return [(opening, count) for opening, count in rows]
-    finally:
-        conn.close()
+    def list_opening_names(self) -> list[tuple[str, int]]:
+        """Every distinct opening name actually present in the archive, with
+        how many games carry it, most-played first. Simple DISTINCT+COUNT --
+        no opening-matching heuristics involved, so this stays a direct read
+        here rather than going through tempo_cli.py."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT opening, COUNT(*) as n FROM games WHERE opening != '' "
+                "GROUP BY opening ORDER BY n DESC, opening ASC;"
+            ).fetchall()
+            return [(opening, count) for opening, count in rows]
+        finally:
+            conn.close()
 
 
 def _parse_year_month(pgn_date: str) -> tuple[int, int]:

@@ -116,7 +116,8 @@ inline void tokenize_movetext(const std::string& text, std::vector<MoveRecord>& 
     }
 }
 
-inline std::string derive_your_color(const std::map<std::string, std::string>& tags) {
+inline std::string derive_your_color(const std::map<std::string, std::string>& tags,
+                                      const std::string& your_username = YOUR_USERNAME) {
     auto white_it = tags.find("White");
     auto black_it = tags.find("Black");
 
@@ -128,15 +129,16 @@ inline std::string derive_your_color(const std::map<std::string, std::string>& t
         return true;
     };
 
-    if (white_it != tags.end() && ieq(white_it->second, YOUR_USERNAME)) return "white";
-    if (black_it != tags.end() && ieq(black_it->second, YOUR_USERNAME)) return "black";
+    if (white_it != tags.end() && ieq(white_it->second, your_username)) return "white";
+    if (black_it != tags.end() && ieq(black_it->second, your_username)) return "black";
     return "";
 }
 
 // Builds a Game from accumulated tags + raw movetext, validating every SAN
 // token against the legal move list as it replays from the start position.
 // Throws std::runtime_error (with the offending token) on the first illegal move.
-inline Game finalize_game(const std::map<std::string, std::string>& tags, const std::string& movetext) {
+inline Game finalize_game(const std::map<std::string, std::string>& tags, const std::string& movetext,
+                           const std::string& your_username = YOUR_USERNAME) {
     Game game;
     auto get = [&](const char* key) {
         auto it = tags.find(key);
@@ -154,7 +156,7 @@ inline Game finalize_game(const std::map<std::string, std::string>& tags, const 
         game.opening = lookup_eco_name(game.eco); // fallback for exports (e.g. chess.com) with no Opening tag
     }
     game.time_control = get("TimeControl");
-    game.your_color = derive_your_color(tags);
+    game.your_color = derive_your_color(tags, your_username);
 
     std::vector<MoveRecord> tokens;
     tokenize_movetext(movetext, tokens);
@@ -188,7 +190,7 @@ inline Game finalize_game(const std::map<std::string, std::string>& tags, const 
 // Parses a (possibly multi-game) PGN file. Games with an illegal/unparseable
 // move are skipped (a warning is printed to stderr) rather than aborting the
 // whole import.
-inline std::vector<Game> parse_pgn_file(const std::string& path) {
+inline std::vector<Game> parse_pgn_file(const std::string& path, const std::string& your_username = YOUR_USERNAME) {
     std::ifstream file(path);
     if (!file) {
         throw std::runtime_error("could not open PGN file: " + path);
@@ -201,7 +203,7 @@ inline std::vector<Game> parse_pgn_file(const std::string& path) {
     auto flush_game = [&]() {
         if (tags.empty() && movetext.empty()) return;
         try {
-            games.push_back(pgn_detail::finalize_game(tags, movetext));
+            games.push_back(pgn_detail::finalize_game(tags, movetext, your_username));
         } catch (const std::exception& e) {
             std::cerr << "[Warning] Skipping game: " << e.what() << "\n";
         }

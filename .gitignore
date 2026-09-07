@@ -7,5 +7,7 @@
 tempo_archive.db
 games/*
 !games/README.md
+profiles/
+gui/data/profiles.json
 __pycache__/
 *.pyc

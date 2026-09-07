@@ -15,7 +15,9 @@
 
 namespace fs = std::filesystem;
 
-const std::string DB_PATH = "tempo_archive.db";
+std::string DB_PATH = "tempo_archive.db";
+std::string CURRENT_USERNAME = YOUR_USERNAME;
+std::string GAMES_DIR = "games";
 
 void print_help() {
     std::cout << "Commands:\n"
@@ -40,7 +42,7 @@ ImportCounts import_one_file(Archive& archive, const std::string& path) {
     ImportCounts counts;
     std::vector<Game> games;
     try {
-        games = parse_pgn_file(path);
+        games = parse_pgn_file(path, CURRENT_USERNAME);
     } catch (const std::exception& e) {
         std::cout << "[Error] " << path << ": " << e.what() << "\n";
         return counts;
@@ -55,7 +57,7 @@ ImportCounts import_one_file(Archive& archive, const std::string& path) {
             counts.skipped++;
         } else {
             counts.added++;
-            append_to_master_file(g);
+            append_to_master_file(g, GAMES_DIR);
         }
     }
     archive.commit_transaction();
@@ -527,10 +529,29 @@ int run_json_command(Archive& archive, const std::vector<std::string>& args) {
 }
 
 int main(int argc, char* argv[]) {
-    if (argc >= 2 && std::string(argv[1]) == "--json") {
+    // Extract --db <path> / --user <name> anywhere in the arg list (before or
+    // after --json) so one shared binary can serve multiple profiles, each
+    // pointed at its own db file/username. Left unset, behavior is byte-
+    // identical to before these flags existed.
+    std::vector<std::string> args(argv + 1, argv + argc);
+    for (size_t i = 0; i < args.size(); ) {
+        if (args[i] == "--db" && i + 1 < args.size()) {
+            DB_PATH = args[i + 1];
+            args.erase(args.begin() + i, args.begin() + i + 2);
+        } else if (args[i] == "--user" && i + 1 < args.size()) {
+            CURRENT_USERNAME = args[i + 1];
+            args.erase(args.begin() + i, args.begin() + i + 2);
+        } else {
+            ++i;
+        }
+    }
+    fs::path db_parent = fs::path(DB_PATH).parent_path();
+    GAMES_DIR = db_parent.empty() ? "games" : (db_parent / "games").string();
+
+    if (!args.empty() && args[0] == "--json") {
         Archive archive(DB_PATH);
-        std::vector<std::string> args(argv + 2, argv + argc);
-        return run_json_command(archive, args);
+        std::vector<std::string> json_args(args.begin() + 1, args.end());
+        return run_json_command(archive, json_args);
     }
 
     std::cout << "          Tempo C++ Game Archive          \n\n";

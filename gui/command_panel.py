@@ -15,12 +15,13 @@ from urllib.parse import quote, unquote
 
 from PySide6.QtCore import QEvent, QObject, Qt, Signal
 from PySide6.QtGui import QFont, QTextCursor
-from PySide6.QtWidgets import QApplication, QLineEdit, QTextBrowser, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QLineEdit, QTextBrowser, QVBoxLayout, QWidget
 
-import db_reader
 import opening_moves
-import tempo_cli
 from command_popup import COMMANDS, CommandPopup, GameTypePopup, OpeningPopup
+from db_reader import DbReader
+from fetch_worker import FetchWorker
+from tempo_cli import TempoCli, TempoCliError
 
 HEADER_COLOR = "#7fb3ff"
 MUTED_COLOR = "#888888"
@@ -95,8 +96,10 @@ class CommandPanel(QWidget):
     # Emitted after a fetch adds at least one new game, so the browser can refresh.
     archive_updated = Signal()
 
-    def __init__(self, parent=None):
+    def __init__(self, db: DbReader, cli: TempoCli, parent=None):
         super().__init__(parent)
+        self.db = db
+        self.cli = cli
 
         self.output = QTextBrowser()
         self.output.setReadOnly(True)
@@ -193,7 +196,7 @@ class CommandPanel(QWidget):
         opening_filter = self._opening_query_text(text)
         if opening_filter is not None:
             self.popup.hide()
-            self.opening_popup.set_openings(db_reader.list_opening_names())
+            self.opening_popup.set_openings(self.db.list_opening_names())
             self._show_popup(self.opening_popup, opening_filter)
             return
         self.opening_popup.hide()
@@ -336,7 +339,7 @@ class CommandPanel(QWidget):
 
         try:
             self._dispatch(cmd, args)
-        except tempo_cli.TempoCliError as e:
+        except TempoCliError as e:
             self._print_error(str(e))
         except Exception as e:  # defensive: never let a bad command kill the GUI
             self._print_error(str(e))
@@ -346,10 +349,10 @@ class CommandPanel(QWidget):
             self._print(HELP_TEXT)
         elif cmd == "list":
             limit = int(args[0]) if args else 20
-            data = tempo_cli.list_games(limit)
+            data = self.cli.list_games(limit)
             self._print(self._format_games(data["games"]))
         elif cmd == "stats":
-            self._stats_data = tempo_cli.stats(*args)
+            self._stats_data = self.cli.stats(*args)
             self._stats_filter = list(args)
             self._expanded_openings = set()
             self._opening_games_cache = {}
@@ -366,7 +369,7 @@ class CommandPanel(QWidget):
             if not args:
                 self._print_error("usage: /opening <name-or-ECO>")
                 return
-            data = tempo_cli.opening(" ".join(args))
+            data = self.cli.opening(" ".join(args))
             self._opening_results = data["games"]
             self._opening_results_show_all = False
             self._render_opening_results_block()
@@ -374,14 +377,14 @@ class CommandPanel(QWidget):
             if not args:
                 self._print_error("usage: /moves <san-sequence>, e.g. /moves e4 e5 Nf3")
                 return
-            data = tempo_cli.moves(args)
+            data = self.cli.moves(args)
             self._print(self._format_replies(data["replies"]))
         elif cmd == "show":
             if not args:
                 self._print_error("usage: /show <id>")
                 return
             game_id = int(args[0])
-            data = tempo_cli.show(game_id)
+            data = self.cli.show(game_id)
             self._print(self._format_game_header(data))
             self.game_requested.emit(game_id)
         elif cmd == "review":
@@ -389,7 +392,7 @@ class CommandPanel(QWidget):
                 self._print_error("usage: /review <id>")
                 return
             game_id = int(args[0])
-            data = tempo_cli.review(game_id)
+            data = self.cli.review(game_id)
             self._print(self._format_review(data))
             self.game_requested.emit(game_id)
         elif cmd == "fetch":
@@ -403,25 +406,33 @@ class CommandPanel(QWidget):
             return
         site, username = args[0], args[1]
 
-        self._print(f'<span style="color:{MUTED_COLOR}">Fetching from {_esc(site)} for {_esc(username)}... '
-                    f'(this can take a few seconds)</span>')
-        QApplication.processEvents()  # paint the message above before the blocking network call
-
         if site == "chesscom":
             if len(args) == 4:
-                data = tempo_cli.fetch_chesscom(username, int(args[2]), int(args[3]))
+                year, month = int(args[2]), int(args[3])
+                fetch_fn = lambda: self.cli.fetch_chesscom(username, year, month)
             elif len(args) == 2:
-                data = tempo_cli.fetch_chesscom(username)
+                fetch_fn = lambda: self.cli.fetch_chesscom(username)
             else:
                 self._print_error("usage: /fetch chesscom <user> [year month] (both or neither)")
                 return
         elif site == "lichess":
             days = int(args[2]) if len(args) >= 3 else 90
-            data = tempo_cli.fetch_lichess(username, days)
+            fetch_fn = lambda: self.cli.fetch_lichess(username, days)
         else:
             self._print_error(f"unknown fetch site '{site}' (expected chesscom or lichess)")
             return
 
+        self._print(f'<span style="color:{MUTED_COLOR}">Fetching from {_esc(site)} for {_esc(username)}... '
+                    f'(this can take a few seconds)</span>')
+
+        # Run off the GUI thread -- with multiple profile tabs live at once,
+        # a blocking fetch here would freeze every tab, not just this one.
+        self._fetch_worker = FetchWorker(fetch_fn)
+        self._fetch_worker.succeeded.connect(self._on_fetch_succeeded)
+        self._fetch_worker.failed.connect(self._print_error)
+        self._fetch_worker.start()
+
+    def _on_fetch_succeeded(self, data: dict) -> None:
         self._print(self._format_fetch_results(data["results"]))
 
     def _insert_tracked_block(self, html: str) -> tuple[QTextCursor, QTextCursor]:
@@ -491,8 +502,8 @@ class CommandPanel(QWidget):
     def _recent_games_for(self, name: str) -> list[dict]:
         if name not in self._opening_games_cache:
             try:
-                self._opening_games_cache[name] = tempo_cli.opening_exact(name, 3)["games"]
-            except tempo_cli.TempoCliError:
+                self._opening_games_cache[name] = self.cli.opening_exact(name, 3)["games"]
+            except TempoCliError:
                 self._opening_games_cache[name] = []
         return self._opening_games_cache[name]
 
