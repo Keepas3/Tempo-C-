@@ -68,6 +68,10 @@ class GameBrowser(QTreeWidget):
         self.setColumnWidth(3, 80)
         self.setColumnWidth(4, 60)
         self.header().setSortIndicatorShown(True)
+        # Without this, sectionClicked never fires -- clicking a header does
+        # nothing (the header just looks clickable because of the sort
+        # indicator styling, but clicks aren't actually routed anywhere).
+        self.header().setSectionsClickable(True)
         self.header().sectionClicked.connect(self._on_header_clicked)
         self.itemClicked.connect(self._on_item_clicked)
         self.refresh()

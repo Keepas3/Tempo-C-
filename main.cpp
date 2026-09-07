@@ -211,9 +211,15 @@ void cmd_review(Archive& archive, int id) {
     std::cout << "\n";
 }
 
-void cmd_stats(Archive& archive) {
-    Stats s = archive.compute_stats();
+void cmd_stats(Archive& archive, const std::vector<std::string>& category_filter) {
+    Stats s = archive.compute_stats(category_filter);
     int total = s.wins + s.losses + s.draws;
+
+    if (!category_filter.empty()) {
+        std::cout << "Filtered to:";
+        for (const std::string& c : category_filter) std::cout << " " << c;
+        std::cout << "\n";
+    }
 
     std::cout << "Overall: " << s.wins << "W " << s.losses << "L " << s.draws << "D";
     if (total > 0) {
@@ -475,7 +481,17 @@ int run_json_command(Archive& archive, const std::vector<std::string>& args) {
             std::vector<std::string> sequence(args.begin() + 1, args.end());
             std::cout << to_json(archive.opponent_replies(sequence)) << "\n";
         } else if (cmd == "stats") {
-            std::cout << to_json(archive.compute_stats()) << "\n";
+            std::vector<std::string> category_filter;
+            for (size_t i = 1; i < args.size(); ++i) {
+                std::string category = normalize_time_category(args[i]);
+                if (category.empty()) {
+                    std::cout << json_error("unknown game type: " + args[i] +
+                                             " (expected bullet, blitz, rapid, classical, or daily)") << "\n";
+                    return 1;
+                }
+                category_filter.push_back(category);
+            }
+            std::cout << to_json(archive.compute_stats(category_filter)) << "\n";
         } else if (cmd == "fetch") {
             if (args.size() < 3) {
                 std::cout << json_error("usage: fetch chesscom <user> [year month] | fetch lichess <user> [days]") << "\n";
@@ -557,7 +573,20 @@ int main(int argc, char* argv[]) {
             if (iss >> id) cmd_review(archive, id);
             else std::cout << "[Error] usage: review <id>\n\n";
         } else if (cmd == "stats") {
-            cmd_stats(archive);
+            std::vector<std::string> category_filter;
+            std::string token;
+            bool bad_category = false;
+            while (iss >> token) {
+                std::string category = normalize_time_category(token);
+                if (category.empty()) {
+                    std::cout << "[Error] unknown game type '" << token
+                              << "' (expected bullet, blitz, rapid, classical, or daily)\n\n";
+                    bad_category = true;
+                    break;
+                }
+                category_filter.push_back(category);
+            }
+            if (!bad_category) cmd_stats(archive, category_filter);
         } else if (cmd == "opening") {
             std::string query;
             std::getline(iss, query);

@@ -20,7 +20,7 @@ from PySide6.QtWidgets import QApplication, QLineEdit, QTextBrowser, QVBoxLayout
 import db_reader
 import opening_moves
 import tempo_cli
-from command_popup import COMMANDS, CommandPopup, OpeningPopup
+from command_popup import COMMANDS, CommandPopup, GameTypePopup, OpeningPopup
 
 HEADER_COLOR = "#7fb3ff"
 MUTED_COLOR = "#888888"
@@ -115,6 +115,9 @@ class CommandPanel(QWidget):
         self.opening_popup = OpeningPopup(self.input)
         self.opening_popup.command_chosen.connect(self._apply_opening_selection)
 
+        self.game_type_popup = GameTypePopup(self.input)
+        self.game_type_popup.command_chosen.connect(self._sync_stats_input_from_popup)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.addWidget(self.output, stretch=1)
@@ -125,6 +128,7 @@ class CommandPanel(QWidget):
         # Last /stats result and which opening rows are expanded, so a click
         # can re-render just that block in place (see _replace_stats_block).
         self._stats_data: dict | None = None
+        self._stats_filter: list[str] = []
         self._expanded_openings: set[str] = set()
         self._stats_start: QTextCursor | None = None
         self._stats_end: QTextCursor | None = None
@@ -179,6 +183,13 @@ class CommandPanel(QWidget):
     # --- slash-command / opening-name popups --------------------------------
 
     def _on_input_changed(self, text: str) -> None:
+        if self._stats_query_text(text) is not None:
+            self.popup.hide()
+            self.opening_popup.hide()
+            self._show_popup(self.game_type_popup, "")
+            return
+        self.game_type_popup.hide()
+
         opening_filter = self._opening_query_text(text)
         if opening_filter is not None:
             self.popup.hide()
@@ -191,6 +202,30 @@ class CommandPanel(QWidget):
             self.popup.hide()
             return
         self._show_popup(self.popup, text)
+
+    @staticmethod
+    def _stats_query_text(text: str) -> str | None:
+        """Returns "" while typing "/stats <type...>" (the game-type popup
+        doesn't filter by what's typed -- it's a fixed multi-select list),
+        or None if `text` isn't in that state."""
+        if not text.lower().startswith("/stats"):
+            return None
+        rest = text[len("/stats"):]
+        if not rest.startswith(" "):
+            return None  # still typing "/stats" itself -- that's the command popup's territory
+        return ""
+
+    def _sync_stats_input_from_popup(self) -> None:
+        """Keeps the input text in sync with the game-type popup's current
+        checkbox selection after every click, so plain Enter submits with
+        whatever's checked -- and so the selection is visible/editable as
+        normal text, not hidden state only the popup knows about."""
+        types = self.game_type_popup.selected_lower()
+        text = "/stats " + " ".join(types) if types else "/stats "
+        self.input.blockSignals(True)
+        self.input.setText(text)
+        self.input.setCursorPosition(len(text))
+        self.input.blockSignals(False)
 
     def _show_popup(self, popup, filter_text: str) -> None:
         popup.setFixedWidth(max(self.input.width(), 260))
@@ -253,6 +288,11 @@ class CommandPanel(QWidget):
             active_popup, apply_fn = self.popup, self._apply_popup_command
         elif self.opening_popup.isVisible():
             active_popup, apply_fn = self.opening_popup, self._apply_opening_selection
+        elif self.game_type_popup.isVisible():
+            # No apply_fn: selection happens via clicks (checkboxes), not
+            # Enter, so Enter should fall through to a normal submit instead
+            # of "choosing" whatever row happens to be highlighted.
+            active_popup, apply_fn = self.game_type_popup, None
         else:
             active_popup, apply_fn = None, None
 
@@ -264,7 +304,7 @@ class CommandPanel(QWidget):
             if key == Qt.Key.Key_Up:
                 active_popup.move_selection(-1)
                 return True
-            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Tab):
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Tab) and apply_fn is not None:
                 value = active_popup.choose_current()
                 if value is not None:
                     apply_fn(value)
@@ -277,6 +317,7 @@ class CommandPanel(QWidget):
     def _on_submit(self) -> None:
         line = self.input.text().strip()
         self.input.clear()
+        self.game_type_popup.hide()  # doesn't self-hide on Enter like the other popups (see eventFilter)
         if not line:
             return
 
@@ -308,10 +349,12 @@ class CommandPanel(QWidget):
             data = tempo_cli.list_games(limit)
             self._print(self._format_games(data["games"]))
         elif cmd == "stats":
-            self._stats_data = tempo_cli.stats()
+            self._stats_data = tempo_cli.stats(*args)
+            self._stats_filter = list(args)
             self._expanded_openings = set()
             self._opening_games_cache = {}
             self._show_all_openings = {"white": False, "black": False}
+            self.game_type_popup.reset()  # next time the dropdown opens, start with nothing checked
             self._render_stats_block()
         elif cmd == "clear":
             self.output.clear()
@@ -405,6 +448,14 @@ class CommandPanel(QWidget):
     def _replace_tracked_block(self, start: QTextCursor, end: QTextCursor, html: str) -> QTextCursor:
         """Replaces the [start, end) region (from a prior _insert_tracked_block)
         with `html`, returning the new end cursor to keep tracking with."""
+        # Editing the document (even via a cursor that isn't the widget's
+        # "active" one) can make QTextBrowser auto-scroll -- observed
+        # jumping all the way to the top on a toggle click. Capture and
+        # restore the scrollbar position explicitly rather than relying on
+        # cursor-follow behavior, so expanding/collapsing a row stays put.
+        scrollbar = self.output.verticalScrollBar()
+        scroll_pos = scrollbar.value()
+
         # Build the selection from raw integer positions rather than copying
         # `start` directly: keepPositionOnInsert only pins its position(),
         # not its anchor(), so after the first insertion at that spot the
@@ -415,6 +466,8 @@ class CommandPanel(QWidget):
         cursor.setPosition(end.position(), QTextCursor.MoveMode.KeepAnchor)
         cursor.removeSelectedText()
         cursor.insertHtml(html)
+
+        scrollbar.setValue(scroll_pos)
         return QTextCursor(cursor)
 
     def _render_stats_block(self) -> None:
@@ -545,6 +598,10 @@ class CommandPanel(QWidget):
     def _format_stats(self, s: dict) -> str:
         total = s["wins"] + s["losses"] + s["draws"]
         parts = []
+
+        if self._stats_filter:
+            types = ", ".join(t.capitalize() for t in self._stats_filter)
+            parts.append(f'<div style="color:{HEADER_COLOR}">Filtered to: {_esc(types)}</div>')
 
         if s.get("earliest_date") and s.get("latest_date"):
             span = f"{_month_year(s['earliest_date'])} &ndash; {_month_year(s['latest_date'])}"

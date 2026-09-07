@@ -12,7 +12,7 @@ COMMANDS = [
     ("/list", "[n]", "List the n most recent games (default 20)"),
     ("/show", "<id>", "Show a game's info and load it on the board"),
     ("/review", "<id>", "Replay a game with eval annotations, loaded on the board"),
-    ("/stats", "", "Win rate, opening, and time-management stats"),
+    ("/stats", "[type...]", "Win rate, opening, and time-management stats (optionally filtered by game type)"),
     ("/opening", "<query>", "Win/loss record for an opening (name substring or ECO code)"),
     ("/moves", "<sequence>", "What was played after a SAN sequence, e.g. /moves e4 e5 Nf3"),
     ("/fetch chesscom", "<user> [year month]", "Fetch games from chess.com"),
@@ -20,6 +20,8 @@ COMMANDS = [
     ("/clear", "", "Clear the chat history"),
     ("/help", "", "Show this list"),
 ]
+
+GAME_TYPES = ["Bullet", "Blitz", "Rapid", "Classical", "Daily"]
 
 ITEM_VERTICAL_PADDING = 10  # matches the 4px+4px item padding below plus a little breathing room
 MAX_VISIBLE_ROWS = 7
@@ -125,3 +127,54 @@ class OpeningPopup(_BasePopup):
         labels = [f"{name}  ({count} game{'s' if count != 1 else ''})" for name, count in matches]
         data = [name for name, _count in matches]
         return self._set_rows(labels, data, lines_per_item=1)
+
+
+class GameTypePopup(_BasePopup):
+    """Multi-select list of time-control categories for /stats <type...>.
+    Clicking toggles a checkmark and keeps the popup open (unlike the other
+    popups, which close on selection) -- command_chosen fires after every
+    toggle so the caller can resync the input text with the current
+    selection. Enter is handled specially by the caller too: for this popup
+    it submits the command rather than "choosing" a highlighted row, since
+    selection already happens via clicks, not Enter."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._selected: set[str] = set()
+
+    def refresh(self, _filter_text: str = "") -> bool:
+        # Fixed list of 5 -- no substring filtering, always show all.
+        labels = [self._label_for(t) for t in GAME_TYPES]
+        return self._set_rows(labels, list(GAME_TYPES), lines_per_item=1)
+
+    def selected_lower(self) -> list[str]:
+        return [t.lower() for t in GAME_TYPES if t in self._selected]
+
+    def reset(self) -> None:
+        self._selected = set()
+
+    @staticmethod
+    def _label_for_selected(game_type: str, selected: bool) -> str:
+        # Actual Unicode box-drawing characters, not HTML entities: this text
+        # goes into a plain QListWidgetItem, which (unlike the HTML output
+        # pane elsewhere in the app) doesn't render markup/entities at all.
+        mark = "☑" if selected else "☐"  # checked / unchecked box
+        return f"{mark} {game_type}"
+
+    def _label_for(self, game_type: str) -> str:
+        return self._label_for_selected(game_type, game_type in self._selected)
+
+    def _on_item_clicked(self, item: QListWidgetItem) -> None:
+        value = item.data(DATA_ROLE)
+        if value in self._selected:
+            self._selected.discard(value)
+        else:
+            self._selected.add(value)
+        # Update the clicked item's own text in place rather than calling
+        # refresh() (clear() + rebuild every row): doing that synchronously
+        # from inside an itemClicked handler is a Qt reentrancy hazard --
+        # clearing the list while it's still finishing this very click can
+        # make Qt re-fire itemClicked against the rebuilt list, silently
+        # toggling the selection right back off.
+        item.setText(self._label_for_selected(value, value in self._selected))
+        self.command_chosen.emit(value)  # deliberately doesn't hide()

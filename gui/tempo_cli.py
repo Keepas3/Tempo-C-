@@ -52,8 +52,8 @@ def run(*args: str, timeout: int = 30) -> dict:
     return data
 
 
-def stats() -> dict:
-    return run("stats")
+def stats(*category_filter: str) -> dict:
+    return run("stats", *category_filter)
 
 
 def opening(query: str) -> dict:

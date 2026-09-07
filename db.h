@@ -83,6 +83,19 @@ inline std::string classify_time_control(const std::string& tc) {
     return "Classical";
 }
 
+// Maps a user-typed game-type name (any case) to its canonical category
+// string, or "" if unrecognized. Used for /stats <type...> filtering.
+inline std::string normalize_time_category(const std::string& input) {
+    std::string lower = input;
+    for (char& c : lower) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    if (lower == "bullet") return "Bullet";
+    if (lower == "blitz") return "Blitz";
+    if (lower == "rapid") return "Rapid";
+    if (lower == "classical") return "Classical";
+    if (lower == "daily") return "Daily";
+    return "";
+}
+
 class Archive {
 public:
     explicit Archive(const std::string& path) {
@@ -359,52 +372,39 @@ public:
         return out;
     }
 
-    Stats compute_stats() {
+    // `category_filter` restricts every figure to games whose time control
+    // classifies into one of the given categories (e.g. {"Blitz", "Rapid"});
+    // an empty filter means no restriction (all games), matching the
+    // previous unfiltered behavior exactly.
+    Stats compute_stats(const std::vector<std::string>& category_filter = {}) {
         Stats stats;
 
         {
-            sqlite3_stmt* range_stmt = prepare("SELECT MIN(date), MAX(date) FROM games;");
-            if (sqlite3_step(range_stmt) == SQLITE_ROW) {
-                stats.earliest_date = column_text(range_stmt, 0);
-                stats.latest_date = column_text(range_stmt, 1);
+            sqlite3_stmt* stmt = prepare("SELECT date, your_color, result, time_control FROM games WHERE your_color != '';");
+            std::string earliest, latest;
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                std::string date = column_text(stmt, 0);
+                std::string color = column_text(stmt, 1);
+                std::string result = column_text(stmt, 2);
+                std::string tc = column_text(stmt, 3);
+                if (!category_matches(tc, category_filter)) continue;
+
+                if (earliest.empty() || date < earliest) earliest = date;
+                if (latest.empty() || date > latest) latest = date;
+
+                std::string outcome = result_relative_to(result, color);
+                if (outcome == "Win") { stats.wins++; if (color == "white") stats.wins_white++; else stats.wins_black++; }
+                else if (outcome == "Loss") { stats.losses++; if (color == "white") stats.losses_white++; else stats.losses_black++; }
+                else if (outcome == "Draw") { stats.draws++; if (color == "white") stats.draws_white++; else stats.draws_black++; }
             }
-            sqlite3_finalize(range_stmt);
+            sqlite3_finalize(stmt);
+            stats.earliest_date = earliest;
+            stats.latest_date = latest;
         }
 
-        const char* sql = "SELECT your_color, result FROM games WHERE your_color != '';";
-        sqlite3_stmt* stmt = prepare(sql);
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
-            std::string color = column_text(stmt, 0);
-            std::string result = column_text(stmt, 1);
-            std::string outcome = result_relative_to(result, color);
-
-            if (outcome == "Win") { stats.wins++; if (color == "white") stats.wins_white++; else stats.wins_black++; }
-            else if (outcome == "Loss") { stats.losses++; if (color == "white") stats.losses_white++; else stats.losses_black++; }
-            else if (outcome == "Draw") { stats.draws++; if (color == "white") stats.draws_white++; else stats.draws_black++; }
-        }
-        sqlite3_finalize(stmt);
-
-        const char* avg_sql =
-            "SELECT AVG(clock_prev - clock_seconds) FROM ("
-            "  SELECT clock_seconds, LAG(clock_seconds) OVER (PARTITION BY game_id ORDER BY ply) AS clock_prev "
-            "  FROM moves WHERE clock_seconds IS NOT NULL"
-            ") WHERE clock_prev IS NOT NULL AND clock_prev >= clock_seconds;";
-        sqlite3_stmt* avg_stmt = prepare(avg_sql);
-        if (sqlite3_step(avg_stmt) == SQLITE_ROW && sqlite3_column_type(avg_stmt, 0) != SQLITE_NULL) {
-            stats.avg_seconds_per_move = sqlite3_column_double(avg_stmt, 0);
-        }
-        sqlite3_finalize(avg_stmt);
-
-        const char* trouble_sql = "SELECT COUNT(*) FROM moves WHERE clock_seconds IS NOT NULL AND clock_seconds < 10;";
-        sqlite3_stmt* trouble_stmt = prepare(trouble_sql);
-        if (sqlite3_step(trouble_stmt) == SQLITE_ROW) {
-            stats.time_trouble_moves = sqlite3_column_int(trouble_stmt, 0);
-        }
-        sqlite3_finalize(trouble_stmt);
-
-        stats.top_openings_white = aggregate_openings("white");
-        stats.top_openings_black = aggregate_openings("black");
-        stats.by_time_control = aggregate_time_control();
+        stats.top_openings_white = aggregate_openings("white", category_filter);
+        stats.top_openings_black = aggregate_openings("black", category_filter);
+        stats.by_time_control = aggregate_time_control(category_filter, stats.avg_seconds_per_move, stats.time_trouble_moves);
 
         return stats;
     }
@@ -412,9 +412,20 @@ public:
 private:
     sqlite3* db_ = nullptr;
 
-    std::vector<OpeningStat> aggregate_openings(const std::string& color) {
+    // True if `time_control`'s category is in `filter`, or `filter` is empty
+    // (meaning "no restriction" -- everything matches).
+    bool category_matches(const std::string& time_control, const std::vector<std::string>& filter) {
+        if (filter.empty()) return true;
+        std::string category = classify_time_control(time_control);
+        for (const std::string& f : filter) {
+            if (f == category) return true;
+        }
+        return false;
+    }
+
+    std::vector<OpeningStat> aggregate_openings(const std::string& color, const std::vector<std::string>& category_filter) {
         const char* sql =
-            "SELECT opening, result FROM games WHERE opening != '' AND your_color = ?;";
+            "SELECT opening, result, time_control FROM games WHERE opening != '' AND your_color = ?;";
         sqlite3_stmt* stmt = prepare(sql);
         bind_text(stmt, 1, color);
 
@@ -422,6 +433,8 @@ private:
         while (sqlite3_step(stmt) == SQLITE_ROW) {
             std::string opening = column_text(stmt, 0);
             std::string result = column_text(stmt, 1);
+            std::string tc = column_text(stmt, 2);
+            if (!category_matches(tc, category_filter)) continue;
             std::string outcome = result_relative_to(result, color);
 
             auto it = std::find_if(out.begin(), out.end(),
@@ -440,7 +453,13 @@ private:
         return out;
     }
 
-    std::vector<TimeControlStat> aggregate_time_control() {
+    // Also fills `out_avg_seconds_per_move`/`out_time_trouble_moves` with the
+    // OVERALL figures across just the allowed categories (or everything, if
+    // `category_filter` is empty) -- derived from the same per-category sums
+    // computed here rather than a second query.
+    std::vector<TimeControlStat> aggregate_time_control(const std::vector<std::string>& category_filter,
+                                                          double& out_avg_seconds_per_move,
+                                                          int& out_time_trouble_moves) {
         // Per-move clock deltas joined with each game's time_control, so each
         // delta can be bucketed by category before averaging.
         const char* sql =
@@ -458,6 +477,7 @@ private:
             std::string tc = column_text(stmt, 0);
             int delta = sqlite3_column_int(stmt, 1);
             int clock_seconds = sqlite3_column_int(stmt, 2);
+            if (!category_matches(tc, category_filter)) continue;
             std::string category = classify_time_control(tc);
 
             auto& agg = delta_sum_count[category];
@@ -472,11 +492,15 @@ private:
         sqlite3_stmt* games_stmt = prepare(games_sql);
         std::map<std::string, int> games_count;
         while (sqlite3_step(games_stmt) == SQLITE_ROW) {
-            games_count[classify_time_control(column_text(games_stmt, 0))]++;
+            std::string tc = column_text(games_stmt, 0);
+            if (!category_matches(tc, category_filter)) continue;
+            games_count[classify_time_control(tc)]++;
         }
         sqlite3_finalize(games_stmt);
 
         std::vector<TimeControlStat> out;
+        long long overall_sum = 0, overall_count = 0;
+        int overall_trouble = 0;
         for (auto& [category, count] : games_count) {
             TimeControlStat s;
             s.category = category;
@@ -484,12 +508,18 @@ private:
             auto it = delta_sum_count.find(category);
             if (it != delta_sum_count.end() && it->second.second > 0) {
                 s.avg_seconds_per_move = static_cast<double>(it->second.first) / it->second.second;
+                overall_sum += it->second.first;
+                overall_count += it->second.second;
             }
             s.time_trouble_moves = trouble_count.count(category) ? trouble_count[category] : 0;
+            overall_trouble += s.time_trouble_moves;
             out.push_back(s);
         }
         std::sort(out.begin(), out.end(),
                   [](const TimeControlStat& a, const TimeControlStat& b) { return a.games > b.games; });
+
+        out_avg_seconds_per_move = overall_count > 0 ? static_cast<double>(overall_sum) / overall_count : -1.0;
+        out_time_trouble_moves = overall_trouble;
         return out;
     }
 
