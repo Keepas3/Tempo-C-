@@ -123,6 +123,17 @@ class CommandPanel(QWidget):
         self.cache = cache
         self.engine = engine
         self._review_worker: EngineBatchWorker | None = None
+        self._review_progress: QProgressDialog | None = None
+        # Workers that have been asked to cancel but haven't emitted
+        # QThread's built-in `finished` signal yet -- kept referenced here
+        # until they actually stop, so overwriting self._review_worker with
+        # a newer one never orphans a still-running QThread. Destroying a
+        # QThread wrapper while its underlying OS thread is still alive is
+        # a Qt fatal error (hard-aborts the whole process, not a catchable
+        # Python exception) -- this is exactly what used to happen if you
+        # selected a second game's review while the first was still
+        # analyzing.
+        self._retiring_review_workers: list[EngineBatchWorker] = []
 
         self.output = QTextBrowser()
         self.output.setReadOnly(True)
@@ -543,6 +554,40 @@ class CommandPanel(QWidget):
         except TempoCliError as e:
             self._print_error(str(e))
 
+    def _cancel_active_review(self) -> None:
+        """Cancels any in-flight batch review before starting a new one, and
+        closes its progress dialog immediately (rather than leaving two
+        dialogs on screen). The old worker's thread may take a moment to
+        actually stop -- see _retire_review_worker for how its QThread
+        wrapper is kept alive (not orphaned) until it genuinely does."""
+        if self._review_worker is not None:
+            if self._review_worker.isRunning():
+                self._review_worker.request_cancel()
+            self._review_worker = None
+        if self._review_progress is not None:
+            self._review_progress.close()
+            self._review_progress = None
+
+    def _retire_review_worker(self, worker: EngineBatchWorker) -> None:
+        """Connected to QThread's built-in `finished` signal (emitted once
+        run() actually returns, however it exited) -- only now is it safe to
+        drop the last Python reference to `worker`."""
+        if worker in self._retiring_review_workers:
+            self._retiring_review_workers.remove(worker)
+        worker.deleteLater()
+
+    def cleanup(self) -> None:
+        """Cancels and waits (briefly) for any in-flight/retiring review
+        workers to actually stop -- called from ProfileView.cleanup() on
+        app exit. Unlike normal interactive use, blocking briefly here is
+        fine (and necessary): letting the process exit while a QThread is
+        still running is the same fatal-abort hazard _cancel_active_review
+        guards against during ordinary use."""
+        self._cancel_active_review()
+        for worker in list(self._retiring_review_workers):
+            worker.request_cancel()
+            worker.wait(2000)
+
     def _run_review(self, game_id: int) -> None:
         """Renders /review for `game_id`: instant if Stockfish isn't set
         up (today's basic evaluator, unchanged) or if a matching analysis
@@ -563,6 +608,8 @@ class CommandPanel(QWidget):
             payload = build_stockfish_review_payload(detail, cache_rows, version, BATCH_DEPTH)
             self._print(self._format_review(payload, game_id))
             return
+
+        self._cancel_active_review()
 
         missing = self.cache.get_missing_plies(game_id, total_plies, ENGINE_ID, version, BATCH_SETTING_KEY)
         sans = [m.san for m in detail.moves]
@@ -607,6 +654,9 @@ class CommandPanel(QWidget):
         worker.succeeded.connect(on_succeeded)
         worker.cancelled.connect(on_cancelled)
         worker.failed.connect(on_failed)
+        worker.finished.connect(lambda w=worker: self._retire_review_worker(w))
+        self._retiring_review_workers.append(worker)
+        self._review_progress = progress
         self._review_worker = worker
         worker.start()
         progress.show()

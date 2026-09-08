@@ -36,16 +36,6 @@ from game_browser import GameBrowser
 from profiles import ProfileRecord
 from tempo_cli import TempoCli
 
-# How long to wait after the board stops changing before firing a live-eval
-# request -- rapid clicking/navigation shouldn't launch an engine call per
-# click (see the busy/pending guard in _run_live_eval for the other half of
-# this: unlike the live-query filter, overlapping calls on the same engine
-# subprocess aren't safe, so a debounce alone isn't enough here).
-LIVE_EVAL_DEBOUNCE_MS = 300
-# After this many consecutive engine failures, live eval turns itself off
-# rather than continuing to retry a broken engine on every position change.
-LIVE_EVAL_MAX_FAILURES = 3
-
 # How long to wait after the board stops changing before firing a live-query
 # request -- rapid clicking/navigation would otherwise launch a subprocess
 # (find_games_by_move_prefix does a full games+moves table scan) on every
@@ -123,7 +113,7 @@ class ProfileView(QWidget):
         self.command_panel.archive_updated.connect(self.browser.refresh)
         self.board.position_changed.connect(self._update_nav_buttons)
         self.board.position_changed.connect(self._on_position_changed_for_live_query)
-        self.board.position_changed.connect(self._on_position_changed_for_live_eval)
+        self.board.position_changed.connect(self._on_position_changed_clears_eval)
 
         # Live board-query filter: debounced so rapid navigation doesn't fire
         # a query per click, and threaded (via FetchWorker) so the scan
@@ -141,28 +131,16 @@ class ProfileView(QWidget):
         self.live_query_checkbox.toggled.connect(self.browser.set_live_query_enabled)
         self.live_query_checkbox.toggled.connect(self._on_live_query_toggled)
 
-        # Live engine eval: same debounce idea as live-query, but a
-        # chess.engine.SimpleEngine process isn't safe for overlapping
-        # calls, so this also needs a busy/pending guard -- a trigger that
-        # arrives while a call is already in flight just marks "pending"
-        # rather than starting a second concurrent call; when the in-flight
-        # call finishes, a pending trigger immediately re-runs against
-        # whatever the board's position actually is by then (not a stashed
-        # stale one), so a burst of rapid navigation collapses to exactly
-        # one more analysis of the final position.
+        # On-demand engine analysis: runs once per "Analyze position" click
+        # rather than continuously on every board change -- deliberately
+        # not auto-triggered, so the engine only ever runs when you
+        # actually ask it to (lighter on CPU/memory, and much less surface
+        # area for anything engine-related to go wrong unattended). A
+        # generation counter still guards against a slow analysis result
+        # arriving after you've since moved on to a different position.
         self._live_eval_generation = 0
         self._live_eval_busy = False
-        self._live_eval_pending = False
         self._live_eval_worker: FetchWorker | None = None
-        self._live_eval_timer = QTimer(self)
-        self._live_eval_timer.setSingleShot(True)
-        self._live_eval_timer.setInterval(LIVE_EVAL_DEBOUNCE_MS)
-        self._live_eval_timer.timeout.connect(self._run_live_eval)
-        # Safety net: if the engine keeps failing (e.g. its process was
-        # killed by antivirus, or repeatedly crashes), stop retrying on
-        # every position change and turn the feature off with a clear
-        # message instead of leaving it silently failing forever.
-        self._live_eval_failure_count = 0
 
         # When checked, selecting a game in the archive also prints /review's
         # eval-annotated move table (not just /show's header) into the chat.
@@ -223,14 +201,16 @@ class ProfileView(QWidget):
         self.status_label = QLabel("No game loaded.")
 
         # Engine status row: shows install state and, once installed,
-        # doubles as the row for live-eval controls. Not a first-run modal
-        # -- the download only happens if/when the user clicks the button.
+        # doubles as the row for on-demand analysis controls. Not a
+        # first-run modal -- the download only happens if/when the user
+        # clicks the button. Analysis itself is on-demand (one click =
+        # one evaluation of the current position), not continuous --
+        # deliberately lighter-weight than auto-analyzing on every move.
         self.engine_status_label = QLabel()
         self.download_engine_btn = QPushButton("Download Stockfish")
         self.download_engine_btn.clicked.connect(self._on_download_engine_clicked)
-        self.live_eval_checkbox = QCheckBox("Live engine eval")
-        self.live_eval_checkbox.setChecked(False)  # opt-in, CPU-consuming, unlike the archive-panel checkboxes
-        self.live_eval_checkbox.toggled.connect(self._on_live_eval_toggled)
+        self.analyze_btn = QPushButton("Analyze position")
+        self.analyze_btn.clicked.connect(self._run_analysis)
         self.eval_tier_combo = QComboBox()
         for label, depth in LIVE_EVAL_TIERS:
             self.eval_tier_combo.addItem(label, depth)
@@ -240,7 +220,7 @@ class ProfileView(QWidget):
         engine_row = QHBoxLayout()
         engine_row.addWidget(self.engine_status_label)
         engine_row.addWidget(self.download_engine_btn)
-        engine_row.addWidget(self.live_eval_checkbox)
+        engine_row.addWidget(self.analyze_btn)
         engine_row.addWidget(self.eval_tier_combo)
         engine_row.addWidget(self.eval_label)
         engine_row.addStretch(1)
@@ -349,13 +329,13 @@ class ProfileView(QWidget):
             version = engine_module.engine_version() or "engine"
             self.engine_status_label.setText(f"Engine: {version} ready")
             self.download_engine_btn.hide()
-            self.live_eval_checkbox.show()
+            self.analyze_btn.show()
             self.eval_tier_combo.show()
             self.eval_label.show()
         else:
             self.engine_status_label.setText("Engine: not installed")
             self.download_engine_btn.show()
-            self.live_eval_checkbox.hide()
+            self.analyze_btn.hide()
             self.eval_tier_combo.hide()
             self.eval_label.hide()
 
@@ -366,31 +346,30 @@ class ProfileView(QWidget):
 
         start_engine_download_flow(self, on_complete)
 
-    def _on_live_eval_toggled(self, checked: bool) -> None:
-        if checked:
-            self._live_eval_failure_count = 0  # fresh start each time it's turned on
-            self._live_eval_timer.start()
-        else:
-            self.board.set_best_move_arrow(None)
-            self.eval_label.setText("")
+    def _on_position_changed_clears_eval(self) -> None:
+        # The old eval/arrow describe a position you've since moved away
+        # from -- clear them rather than leaving stale numbers on screen.
+        # Deliberately does NOT start a new analysis: that only happens on
+        # an explicit "Analyze position" click (see _run_analysis).
+        self.board.set_best_move_arrow(None)
+        self.eval_label.setText("")
 
-    def _on_position_changed_for_live_eval(self) -> None:
-        if self.live_eval_checkbox.isChecked():
-            self.board.set_best_move_arrow(None)  # clear the stale arrow while the new position is pending
-            self._live_eval_timer.start()
-
-    def _run_live_eval(self) -> None:
-        if not self.live_eval_checkbox.isChecked():
-            return
+    def _run_analysis(self) -> None:
+        """Analyzes the CURRENT board position once, on explicit request --
+        not re-triggered automatically on future position changes. Lighter
+        on CPU/memory than continuously re-analyzing on every move, and
+        much less surface area for anything engine-related to go wrong
+        unattended."""
         if self._live_eval_busy:
-            self._live_eval_pending = True
-            return
+            return  # a click while one is already running is just ignored (the button is disabled meanwhile)
 
         self._live_eval_busy = True
+        self.analyze_btn.setEnabled(False)
         self._live_eval_generation += 1
         generation = self._live_eval_generation
         fen = self.board.fen()
         depth = self.eval_tier_combo.currentData()
+        self.eval_label.setText("Analyzing...")
 
         def analyze() -> dict:
             live_engine = self.engine.ensure_live_engine()
@@ -405,22 +384,19 @@ class ProfileView(QWidget):
             }
 
         worker = FetchWorker(analyze)
-        worker.succeeded.connect(lambda data: self._on_live_eval_succeeded(generation, data))
-        worker.failed.connect(lambda msg: self._on_live_eval_failed(generation, msg))
+        worker.succeeded.connect(lambda data: self._on_analysis_succeeded(generation, data))
+        worker.failed.connect(lambda msg: self._on_analysis_failed(generation, msg))
         self._live_eval_worker = worker
         worker.start()
 
-    def _on_live_eval_done(self) -> None:
+    def _on_analysis_done(self) -> None:
         self._live_eval_busy = False
-        if self._live_eval_pending:
-            self._live_eval_pending = False
-            self._run_live_eval()  # re-reads the board's current position, not a stashed one
+        self.analyze_btn.setEnabled(True)
 
-    def _on_live_eval_succeeded(self, generation: int, data: dict) -> None:
-        self._on_live_eval_done()
-        self._live_eval_failure_count = 0
+    def _on_analysis_succeeded(self, generation: int, data: dict) -> None:
+        self._on_analysis_done()
         if generation != self._live_eval_generation:
-            return  # a newer position change has since superseded this result
+            return  # you've since moved on to a different position -- discard this stale result
         if data["mate"] is not None:
             self.eval_label.setText(f"M{data['mate']}" if data["mate"] > 0 else f"-M{abs(data['mate'])}")
         elif data["cp"] is not None:
@@ -432,21 +408,21 @@ class ProfileView(QWidget):
             # this (now-current-generation) result was requested.
             self.board.set_best_move_arrow(chess.Move.from_uci(data["best_move_uci"]))
 
-    def _on_live_eval_failed(self, generation: int, message: str) -> None:
-        self._on_live_eval_done()
-        self._live_eval_failure_count += 1
+    def _on_analysis_failed(self, generation: int, message: str) -> None:
+        self._on_analysis_done()
         if generation != self._live_eval_generation:
             return
         self.eval_label.setText("(engine error)")
-        if self._live_eval_failure_count >= LIVE_EVAL_MAX_FAILURES:
-            self.live_eval_checkbox.setChecked(False)  # also clears the arrow/label via _on_live_eval_toggled
-            self.status_label.setText(
-                f"Live engine eval disabled after {LIVE_EVAL_MAX_FAILURES} repeated errors: {message}")
+        self.status_label.setText(f"Analysis failed: {message}")
 
     def cleanup(self) -> None:
         """Terminates any live Stockfish subprocess(es) owned by this
         profile tab -- called from MainWindow.closeEvent so no stockfish.exe
-        processes are left orphaned when the app exits."""
+        processes are left orphaned when the app exits. Also cancels/waits
+        for any in-flight batch review worker first -- letting the process
+        exit while a QThread is still running is the same fatal-abort
+        hazard as overwriting it mid-run (see CommandPanel.cleanup)."""
+        self.command_panel.cleanup()
         self.engine.quit_all()
 
     def _on_bookmark(self) -> None:
