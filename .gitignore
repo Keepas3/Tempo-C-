@@ -9,5 +9,7 @@ games/*
 !games/README.md
 profiles/
 gui/data/profiles.json
+gui/engine/
+gui/data/engine.json
 __pycache__/
 *.pyc

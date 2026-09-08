@@ -14,14 +14,30 @@ import html
 from datetime import datetime, timezone
 from urllib.parse import quote, unquote
 
-from PySide6.QtCore import QEvent, QObject, Qt, Signal
-from PySide6.QtGui import QFont, QTextCursor
-from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QLineEdit, QTextBrowser, QVBoxLayout, QWidget
+from PySide6.QtCore import QEvent, QObject, QRect, Qt, Signal
+from PySide6.QtGui import QFont, QMouseEvent, QTextCursor
+from PySide6.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QProgressDialog,
+    QTextBrowser,
+    QVBoxLayout,
+    QWidget,
+)
 
 import opening_moves
+from analysis_cache import AnalysisCache
 from command_popup import COMMANDS, CommandPopup, GameTypePopup, OpeningPopup
 from db_reader import DbReader
+from engine import BATCH_DEPTH, BATCH_SETTING_KEY, ENGINE_ID, EngineManager
+from engine import engine_version as current_engine_version
+from engine import is_available as engine_is_available
+from engine_batch_worker import EngineBatchWorker
 from fetch_worker import FetchWorker
+from review_data import build_basic_review_payload, build_stockfish_review_payload
 from tempo_cli import TempoCli, TempoCliError
 
 HEADER_COLOR = "#7fb3ff"
@@ -96,11 +112,17 @@ class CommandPanel(QWidget):
     game_requested = Signal(int)
     # Emitted after a fetch adds at least one new game, so the browser can refresh.
     archive_updated = Signal()
+    # Emitted when a move is clicked in a /review table, so the board can
+    # jump straight to the position right after that move.
+    move_requested = Signal(int, int)  # game_id, ply
 
-    def __init__(self, db: DbReader, cli: TempoCli, parent=None):
+    def __init__(self, db: DbReader, cli: TempoCli, cache: AnalysisCache, engine: EngineManager, parent=None):
         super().__init__(parent)
         self.db = db
         self.cli = cli
+        self.cache = cache
+        self.engine = engine
+        self._review_worker: EngineBatchWorker | None = None
 
         self.output = QTextBrowser()
         self.output.setReadOnly(True)
@@ -187,6 +209,15 @@ class CommandPanel(QWidget):
         self._print(WELCOME_TEXT)
         self._refresh_last_fetch_row()
 
+        # Clicking anywhere else in the app (board, browser, output pane,
+        # another tab) dismisses whichever popup is open -- installed on the
+        # whole application (not just self.input) so it also catches clicks
+        # outside this panel entirely, not just clicks on other widgets
+        # within it. All popups exist by this point in __init__, so there's
+        # no ordering hazard like the one guarded against below for
+        # self.input's own filter installation (constructed earlier).
+        QApplication.instance().installEventFilter(self)
+
     def _format_last_fetch(self, entry: dict | None) -> str:
         if entry is None:
             return "never"
@@ -225,6 +256,12 @@ class CommandPanel(QWidget):
             except ValueError:
                 return
             self.game_requested.emit(game_id)
+        elif text.startswith("ply:"):
+            try:
+                game_id_str, ply_str = text[len("ply:"):].split(":")
+                self.move_requested.emit(int(game_id_str), int(ply_str))
+            except ValueError:
+                return
         elif text.startswith("showmore:"):
             color_key = text[len("showmore:"):]
             self._show_all_openings[color_key] = not self._show_all_openings.get(color_key, False)
@@ -332,6 +369,10 @@ class CommandPanel(QWidget):
         self.input.setCursorPosition(len(command))
 
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.MouseButtonPress:
+            self._dismiss_popups_on_outside_click(event)
+            return False  # never consume the click -- other widgets still need it
+
         # Check the event type/source *before* touching self.popup/opening_popup:
         # this filter is installed on self.input, and constructing a child
         # widget parented to it (the popups themselves, in __init__) raises
@@ -369,6 +410,21 @@ class CommandPanel(QWidget):
                 active_popup.hide()
                 return True
         return super().eventFilter(obj, event)
+
+    def _dismiss_popups_on_outside_click(self, event: QMouseEvent) -> None:
+        """Hides any visible popup when the user clicks anywhere that isn't
+        the input box or the popup itself -- the popups deliberately never
+        take keyboard focus (see _BasePopup's WA_ShowWithoutActivating), so
+        there's no natural focus-out event to hide on; this is the click
+        equivalent."""
+        global_pos = event.globalPosition().toPoint()
+        input_rect = QRect(self.input.mapToGlobal(self.input.rect().topLeft()), self.input.size())
+        for popup in (self.popup, self.opening_popup, self.game_type_popup):
+            if not popup.isVisible():
+                continue
+            if input_rect.contains(global_pos) or popup.geometry().contains(global_pos):
+                continue
+            popup.hide()
 
     def _on_submit(self) -> None:
         line = self.input.text().strip()
@@ -464,8 +520,7 @@ class CommandPanel(QWidget):
                 self._print_error("usage: /review <id>")
                 return
             game_id = int(args[0])
-            data = self.cli.review(game_id)
-            self._print(self._format_review(data))
+            self._run_review(game_id)
             self.game_requested.emit(game_id)
         elif cmd == "fetch":
             self._dispatch_fetch(args)
@@ -479,15 +534,90 @@ class CommandPanel(QWidget):
         loaded the game onto the board; re-emitting would loop back here)."""
         self._print(f'<hr style="border:none; border-top:1px solid #444; margin:10px 0 4px 0;">'
                     f'<span style="color:{MUTED_COLOR}">Selected game #{game_id} from archive</span>')
+        if include_review:
+            self._run_review(game_id)
+            return
         try:
-            if include_review:
-                data = self.cli.review(game_id)
-                self._print(self._format_review(data))
-            else:
-                data = self.cli.show(game_id)
-                self._print(self._format_game_header(data))
+            data = self.cli.show(game_id)
+            self._print(self._format_game_header(data))
         except TempoCliError as e:
             self._print_error(str(e))
+
+    def _run_review(self, game_id: int) -> None:
+        """Renders /review for `game_id`: instant if Stockfish isn't set
+        up (today's basic evaluator, unchanged) or if a matching analysis
+        is already cached; otherwise runs a background batch analysis with
+        a real, cancellable progress dialog first."""
+        if not engine_is_available():
+            self._print_basic_review(game_id)
+            return
+
+        detail = self.db.load_game(game_id)
+        if detail is None:
+            self._print_error(f"no game with id {game_id}")
+            return
+        version = current_engine_version()
+        total_plies = len(detail.moves)
+        cache_rows = self.cache.get_full(game_id, total_plies, ENGINE_ID, version, BATCH_SETTING_KEY)
+        if cache_rows is not None:
+            payload = build_stockfish_review_payload(detail, cache_rows, version, BATCH_DEPTH)
+            self._print(self._format_review(payload, game_id))
+            return
+
+        missing = self.cache.get_missing_plies(game_id, total_plies, ENGINE_ID, version, BATCH_SETTING_KEY)
+        sans = [m.san for m in detail.moves]
+
+        progress = QProgressDialog(f"Analyzing game #{game_id} with {version}...", "Cancel", 0, len(missing), self)
+        progress.setWindowTitle("Engine analysis")
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        worker = EngineBatchWorker(self.db.db_path, sans, self.engine, self.cache, game_id, version, missing, self)
+
+        def on_progress(done: int, total: int) -> None:
+            progress.setMaximum(total)
+            progress.setValue(done)
+
+        def render_from_cache() -> bool:
+            rows = self.cache.get_full(game_id, total_plies, ENGINE_ID, version, BATCH_SETTING_KEY)
+            if rows is None:
+                return False
+            payload = build_stockfish_review_payload(detail, rows, version, BATCH_DEPTH)
+            self._print(self._format_review(payload, game_id))
+            return True
+
+        def on_succeeded() -> None:
+            progress.close()
+            if not render_from_cache():
+                self._print_error("analysis completed but the cache read failed unexpectedly")
+
+        def on_cancelled() -> None:
+            progress.close()
+            if not render_from_cache():
+                self._print(f'<span style="color:{MUTED_COLOR}">Analysis cancelled -- showing basic evaluator.</span>')
+                self._print_basic_review(game_id)
+
+        def on_failed(message: str) -> None:
+            progress.close()
+            self._print_error(f"engine analysis failed: {message}")
+            self._print_basic_review(game_id)
+
+        progress.canceled.connect(worker.request_cancel)
+        worker.progress.connect(on_progress)
+        worker.succeeded.connect(on_succeeded)
+        worker.cancelled.connect(on_cancelled)
+        worker.failed.connect(on_failed)
+        self._review_worker = worker
+        worker.start()
+        progress.show()
+
+    def _print_basic_review(self, game_id: int) -> None:
+        try:
+            data = self.cli.review(game_id)
+        except TempoCliError as e:
+            self._print_error(str(e))
+            return
+        self._print(self._format_review(build_basic_review_payload(data), game_id))
 
     def _dispatch_fetch(self, args: list[str]) -> None:
         if len(args) < 2:
@@ -780,15 +910,44 @@ class CommandPanel(QWidget):
             header += f'<br><span style="color:{MUTED_COLOR}">Opening:</span> {_esc(g["opening"])} ({_esc(g.get("eco", ""))})'
         return header
 
-    def _format_review(self, data: dict) -> str:
+    _SEVERITY_COLORS = {"blunder": ERROR_COLOR, "mistake": "#e0a030", "inaccuracy": "#d4c840"}
+    _SEVERITY_LABELS = {"blunder": "Blunder", "mistake": "Mistake", "inaccuracy": "Inaccuracy"}
+
+    def _format_review(self, data: dict, game_id: int) -> str:
         g, evals = data["game"], data["evals"]
+        mates = data.get("mates", {})
+        best_moves = data.get("best_moves", {})
+        severities = data.get("severities", {})
+        engine_label = data.get("engine_label")
+
+        def move_link(ply: int) -> str:
+            # ply here is the position AFTER this move is played (1-based);
+            # idx is the 0-based index used by g["moves"]/evals/mates/etc.
+            idx = ply - 1
+            san = _esc(g["moves"][idx]["san"])
+            if idx in mates:
+                mate_n = mates[idx]
+                ev_text = f"M{mate_n}" if mate_n > 0 else f"-M{abs(mate_n)}"
+            else:
+                ev_text = f"{evals[idx] / 100.0:+.2f}"
+            ev = f'<span style="color:{MUTED_COLOR}">[{ev_text}]</span>'
+            link = (f'<a href="ply:{game_id}:{ply}" style="color:{HEADER_COLOR}; text-decoration:none;">{san}</a> {ev}')
+            severity = severities.get(idx)
+            if severity:
+                link += (f' <span style="color:{self._SEVERITY_COLORS[severity]}">'
+                         f'{self._SEVERITY_LABELS[severity]}</span>')
+            best = best_moves.get(idx)
+            if best:
+                link += (f'<br><span style="color:{MUTED_COLOR}; font-size:smaller;">'
+                         f'engine likes: {_esc(best)}</span>')
+            return link
+
         rows = []
         for i in range(0, len(g["moves"]), 2):
             move_no = i // 2 + 1
-            white_move = f'{_esc(g["moves"][i]["san"])} <span style="color:{MUTED_COLOR}">[{evals[i] / 100.0:+.2f}]</span>'
-            if i + 1 < len(g["moves"]):
-                black_move = f'{_esc(g["moves"][i + 1]["san"])} <span style="color:{MUTED_COLOR}">[{evals[i + 1] / 100.0:+.2f}]</span>'
-            else:
-                black_move = ""
+            white_move = move_link(i + 1)
+            black_move = move_link(i + 2) if i + 1 < len(g["moves"]) else ""
             rows.append([str(move_no), white_move, black_move])
-        return self._format_game_header(g) + _table(["#", "White", "Black"], rows)
+
+        banner = f'<div style="color:{MUTED_COLOR}">Evaluated with: {_esc(engine_label)}</div>' if engine_label else ""
+        return self._format_game_header(g) + banner + _table(["#", "White", "Black"], rows)

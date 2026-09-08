@@ -14,17 +14,18 @@ from PySide6.QtWidgets import QHeaderView, QTreeWidget, QTreeWidgetItem
 from db_reader import DbReader
 
 GAME_ID_ROLE = 1000
-COLUMNS = ["Game", "Time", "Type", "Site", "Result"]
+COLUMNS = ["Game", "Color", "Time", "Type", "Site", "Result"]
 
+COLOR_ORDER = {"white": 0, "black": 1}
 TYPE_ORDER = {"Bullet": 0, "Blitz": 1, "Rapid": 2, "Classical": 3, "Daily": 4, "Unknown": 5}
 RESULT_ORDER = {"Win": 0, "Draw": 1, "Loss": 2, "?": 3}
 
 # Which direction each column starts in the first time it's clicked (i.e.
 # when switching to it from a different column). Game defaults to
 # descending (most recent first, matching the initial unsorted load); the
-# rest default to ascending (lowest time / earliest category / A-Z / best
-# result first).
-DEFAULT_ASCENDING = {0: False, 1: True, 2: True, 3: True, 4: True}
+# rest default to ascending (White before Black / lowest time / earliest
+# category / A-Z / best result first).
+DEFAULT_ASCENDING = {0: False, 1: True, 2: True, 3: True, 4: True, 5: True}
 
 
 def _abbrev_date(date: str) -> str:
@@ -38,12 +39,14 @@ def _abbrev_date(date: str) -> str:
 
 def _sort_key(column: int, game) -> object:
     if column == 1:
-        return game.time_seconds
+        return COLOR_ORDER.get(game.your_color, len(COLOR_ORDER))
     if column == 2:
-        return TYPE_ORDER.get(game.time_category, len(TYPE_ORDER))
+        return game.time_seconds
     if column == 3:
-        return game.site
+        return TYPE_ORDER.get(game.time_category, len(TYPE_ORDER))
     if column == 4:
+        return game.site
+    if column == 5:
         return RESULT_ORDER.get(game.result, len(RESULT_ORDER))
     return game.date  # column 0 (or anything unrecognized): "YYYY.MM.DD" sorts correctly as text
 
@@ -65,10 +68,11 @@ class GameBrowser(QTreeWidget):
         # after the fixed-width columns, instead of a fixed width that
         # truncates opponent names.
         self.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.setColumnWidth(1, 70)
+        self.setColumnWidth(1, 55)
         self.setColumnWidth(2, 70)
-        self.setColumnWidth(3, 80)
-        self.setColumnWidth(4, 60)
+        self.setColumnWidth(3, 70)
+        self.setColumnWidth(4, 80)
+        self.setColumnWidth(5, 60)
         self.header().setSortIndicatorShown(True)
         # Without this, sectionClicked never fires -- clicking a header does
         # nothing (the header just looks clickable because of the sort
@@ -138,9 +142,11 @@ class GameBrowser(QTreeWidget):
 
                 games_sorted = sorted(months[month], key=lambda g: _sort_key(self._sort_column, g), reverse=reverse)
                 for game in games_sorted:
-                    label = f"{_abbrev_date(game.date)}  vs {game.opponent}  ({game.your_color})"
-                    full_label = f"{game.date}  vs {game.opponent}  ({game.your_color})"
-                    game_item = QTreeWidgetItem([label, game.time_label, game.time_category, game.site, game.result])
+                    label = f"{_abbrev_date(game.date)}  vs {game.opponent}"
+                    full_label = f"{game.date}  vs {game.opponent}"
+                    color_display = game.your_color.capitalize()
+                    game_item = QTreeWidgetItem(
+                        [label, color_display, game.time_label, game.time_category, game.site, game.result])
                     game_item.setData(0, GAME_ID_ROLE, game.id)
                     game_item.setToolTip(0, full_label)  # full year on hover
                     month_item.addChild(game_item)

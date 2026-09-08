@@ -14,6 +14,26 @@ from PySide6.QtSvgWidgets import QSvgWidget
 BOARD_SIZE = 480
 SQUARE_SIZE = BOARD_SIZE // 8
 
+# Best-move arrow styling. python-chess's Arrow only recognizes the named
+# colors "green"/"red"/"yellow"/"blue" -- anything else (e.g. a raw hex
+# string passed directly as Arrow(color=...)) silently fails to resolve
+# internally and falls through un-parsed, which Qt's SVG renderer then
+# treats as an invalid color (rendering solid black, fully opaque, ignoring
+# any alpha) rather than raising an error. The correct way to customize an
+# arrow's actual color is this `colors=` override passed to
+# chess.svg.board(), remapping the "arrow green" theme key to a real
+# 6-digit-hex-plus-alpha value chess.svg's own color parser understands.
+ARROW_COLORS = {"arrow green": "#4caf5090"}  # light green, ~56% opacity
+# Thins the arrow's shaft -- chess.svg draws it at a fixed 20% of square
+# size by default (quite thick), with no public parameter to adjust it;
+# this CSS override (higher cascade priority than the SVG presentation
+# attribute chess.svg sets inline) is the only way to slim it down without
+# hand-rolling arrow rendering. Sized in chess.svg's own INTERNAL coordinate
+# units (its module-level SQUARE_SIZE=45), not this file's BOARD_SIZE-scaled
+# one -- the whole SVG is scaled up to BOARD_SIZE via viewBox, so a style
+# value expressed in the external pixel size would end up scaled twice.
+ARROW_STYLE = f'<style>.arrow {{ stroke-width: {chess.svg.SQUARE_SIZE * 0.08:.1f}px; }}</style>'
+
 
 class BoardWidget(QSvgWidget):
     # Emitted whenever on_mainline or mainline_ply changes, so surrounding
@@ -30,6 +50,8 @@ class BoardWidget(QSvgWidget):
         self.on_mainline = True
         self.selected_square: chess.Square | None = None
         self._last_move: chess.Move | None = None
+        self._best_move_arrow: chess.Move | None = None
+        self.orientation: chess.Color = chess.WHITE
 
         self._render()
 
@@ -81,14 +103,38 @@ class BoardWidget(QSvgWidget):
             replay.push(move)
         return sans
 
+    def set_best_move_arrow(self, move: chess.Move | None) -> None:
+        """Shows (or clears, if None) an arrow for the engine's suggested
+        move on the current position -- set from a live-eval result."""
+        self._best_move_arrow = move
+        self._render()
+
+    def flip(self) -> None:
+        """Toggles which side's perspective the board is drawn from."""
+        self.set_orientation(not self.orientation)
+
+    def set_orientation(self, color: chess.Color) -> None:
+        if color == self.orientation:
+            return
+        self.orientation = color
+        self._render()
+
     # --- Mouse interaction (click-to-select, click-to-move) -------------------
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         pos = event.position()
-        file_idx = int(pos.x() // SQUARE_SIZE)
-        rank_idx = 7 - int(pos.y() // SQUARE_SIZE)
-        if not (0 <= file_idx <= 7 and 0 <= rank_idx <= 7):
+        col = int(pos.x() // SQUARE_SIZE)
+        row = int(pos.y() // SQUARE_SIZE)
+        if not (0 <= col <= 7 and 0 <= row <= 7):
             return
+        # Matches chess.svg.board()'s own orientation-dependent coordinate
+        # formula (x = file if White-POV else 7-file; y = 7-rank if
+        # White-POV else rank) so clicks land on the square actually drawn
+        # there, in either orientation.
+        if self.orientation == chess.WHITE:
+            file_idx, rank_idx = col, 7 - row
+        else:
+            file_idx, rank_idx = 7 - col, row
         square = chess.square(file_idx, rank_idx)
         self._handle_square_click(square)
 
@@ -134,12 +180,23 @@ class BoardWidget(QSvgWidget):
 
     def _render(self) -> None:
         check_square = self.board.king(self.board.turn) if self.board.is_check() else None
+        arrows = []
+        if self._best_move_arrow is not None:
+            # "green" (not a raw hex string) so chess.svg's own color lookup
+            # resolves it -- see ARROW_COLORS/ARROW_STYLE above for why and
+            # how the actual shade/opacity/thickness are customized instead.
+            arrows = [chess.svg.Arrow(self._best_move_arrow.from_square, self._best_move_arrow.to_square, color="green")]
         svg = chess.svg.board(
             self.board,
             size=BOARD_SIZE,
             coordinates=False,
+            orientation=self.orientation,
             lastmove=self._last_move,
             check=check_square,
             squares=chess.SquareSet([self.selected_square]) if self.selected_square is not None else None,
+            arrows=arrows,
+            colors=ARROW_COLORS,
         )
+        if arrows:
+            svg = svg.replace("</svg>", ARROW_STYLE + "</svg>")
         self.load(svg.encode("utf-8"))

@@ -47,14 +47,14 @@ class MainWindow(QMainWindow):
         self.resize(1700, 800)
 
         # Left/Right navigate the active tab's board like its Prev/Next
-        # buttons, from anywhere in the window -- except while actually
-        # typing/editing text (the command input), where the arrow keys
-        # should just move the text cursor as normal. An application-level
-        # filter is used (rather than overriding keyPressEvent) so this
-        # works regardless of which panel currently has focus -- the
-        # browser tree and output pane would otherwise consume Left/Right
-        # themselves for their own navigation before a window-level handler
-        # ever saw the event.
+        # buttons, and R resets it to the start of the game, from anywhere
+        # in the window -- except while actually typing/editing text (the
+        # command input), where these keys should behave as normal text
+        # input. An application-level filter is used (rather than
+        # overriding keyPressEvent) so this works regardless of which panel
+        # currently has focus -- the browser tree and output pane would
+        # otherwise consume these keys themselves before a window-level
+        # handler ever saw the event.
         QApplication.instance().installEventFilter(self)
 
     def _add_profile_tab(self, record: ProfileRecord) -> ProfileView:
@@ -86,6 +86,17 @@ class MainWindow(QMainWindow):
 
         start_new_profile_flow(self, self.config, on_complete)
 
+    def closeEvent(self, event) -> None:
+        # Terminates any live Stockfish subprocess(es) each tab may own --
+        # without this, closing the app would leave orphaned stockfish.exe
+        # processes running (QThread/subprocess children aren't killed
+        # automatically just because the parent window closes).
+        for i in range(self.tabs.count()):
+            view = self.tabs.widget(i)
+            if isinstance(view, ProfileView):
+                view.cleanup()
+        super().closeEvent(event)
+
     def eventFilter(self, obj, event) -> bool:
         if event.type() == QEvent.Type.KeyPress and not isinstance(QApplication.focusWidget(), QLineEdit):
             active = self.tabs.currentWidget()
@@ -95,6 +106,9 @@ class MainWindow(QMainWindow):
                     return True
                 if event.key() == Qt.Key.Key_Right:
                     active.next_ply()
+                    return True
+                if event.key() == Qt.Key.Key_R:
+                    active.go_to_start()
                     return True
         return super().eventFilter(obj, event)
 

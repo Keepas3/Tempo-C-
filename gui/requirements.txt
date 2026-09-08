@@ -1,2 +1,2 @@
 PySide6
-python-chess
+python-chess>=1.9

@@ -84,6 +84,23 @@ duplicate games.
 - `review`'s eval numbers come from a simple material + piece-square-table
   evaluator ([evaluate.h](evaluate.h)) — not a real engine, so they won't
   match Stockfish/chess.com analysis. Treat them as a rough "material moved"
-  signal, not tactical truth.
+  signal, not tactical truth. This is used automatically as a fallback when
+  the optional engine analysis below isn't set up.
 - Opening names come from the PGN's `Opening` tag when present, falling back
   to an embedded ECO-code lookup table ([eco.h](eco.h)) when it's missing.
+
+## Engine analysis (optional)
+
+The GUI can optionally use a real [Stockfish](https://stockfishchess.org/)
+engine for `/review` (live eval while navigating the board, and full-game
+blunder/mistake/inaccuracy detection) instead of the basic evaluator above.
+Click "Download Stockfish" in the GUI to fetch the official prebuilt binary
+directly from [official-stockfish/Stockfish](https://github.com/official-stockfish/Stockfish)
+(currently pinned to release `sf_19`) — nothing is downloaded automatically.
+
+Stockfish is GPLv3-licensed. This app talks to it only over a UCI subprocess
+pipe (never linking it as a library), which is the standard "mere
+aggregation" pattern every major chess GUI uses to integrate a GPL engine
+without the app itself needing to be GPL-licensed. The engine binary and its
+settings live in `gui/engine/` and `gui/data/engine.json` (both gitignored,
+not part of this repo).
