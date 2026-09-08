@@ -66,14 +66,17 @@ class TempoCli:
     def stats(self, *category_filter: str) -> dict:
         return self.run("stats", *category_filter)
 
-    def opening(self, query: str) -> dict:
-        return self.run("opening", query)
+    def opening(self, query: str, range_token: str = "all") -> dict:
+        return self.run("opening", query, range_token)
 
-    def opening_exact(self, name: str, limit: int = 3) -> dict:
-        return self.run("opening_exact", name, str(limit))
+    def opening_exact(self, name: str, limit: int = 3, range_token: str = "all") -> dict:
+        return self.run("opening_exact", name, str(limit), range_token)
 
     def moves(self, sequence: list[str]) -> dict:
         return self.run("moves", *sequence)
+
+    def games_by_move_prefix(self, sequence: list[str]) -> dict:
+        return self.run("moves_games", *sequence)
 
     def list_games(self, limit: int = 20) -> dict:
         return self.run("list", str(limit))
@@ -90,5 +93,11 @@ class TempoCli:
             args += [str(year), str(month)]
         return self.run(*args, timeout=90)
 
-    def fetch_lichess(self, username: str, days: int = 90) -> dict:
-        return self.run("fetch", "lichess", username, str(days), timeout=90)
+    def fetch_lichess(self, username: str, days: int | None = None) -> dict:
+        args = ["fetch", "lichess", username]
+        if days is not None:
+            args.append(str(days))
+        return self.run(*args, timeout=90)
+
+    def last_fetch_status(self) -> dict:
+        return self.run("last_fetch")

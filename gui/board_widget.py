@@ -66,6 +66,21 @@ class BoardWidget(QSvgWidget):
     def fen(self) -> str:
         return self.board.fen()
 
+    def current_san_sequence(self) -> list[str]:
+        """Full SAN sequence of the current position, mainline + any
+        sideline branch. mainline_sans[:mainline_ply] alone is insufficient
+        once on_mainline is False -- it only tracks the loaded game's
+        recorded line, never branch moves (_handle_square_click pushes to
+        self.board but never appends there). SAN is position-dependent, so
+        it must be computed by replaying each move on a fresh board rather
+        than converting self.board.move_stack after the fact."""
+        replay = chess.Board()
+        sans: list[str] = []
+        for move in self.board.move_stack:
+            sans.append(replay.san(move))
+            replay.push(move)
+        return sans
+
     # --- Mouse interaction (click-to-select, click-to-move) -------------------
 
     def mousePressEvent(self, event: QMouseEvent) -> None:

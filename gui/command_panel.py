@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import calendar
 import html
+from datetime import datetime, timezone
 from urllib.parse import quote, unquote
 
 from PySide6.QtCore import QEvent, QObject, Qt, Signal
 from PySide6.QtGui import QFont, QTextCursor
-from PySide6.QtWidgets import QLineEdit, QTextBrowser, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QLineEdit, QTextBrowser, QVBoxLayout, QWidget
 
 import opening_moves
 from command_popup import COMMANDS, CommandPopup, GameTypePopup, OpeningPopup
@@ -121,12 +122,43 @@ class CommandPanel(QWidget):
         self.game_type_popup = GameTypePopup(self.input)
         self.game_type_popup.command_chosen.connect(self._sync_stats_input_from_popup)
 
+        # Always-visible (not a popup like GameTypePopup) since this needs to
+        # persist across multiple /stats and /opening calls rather than reset
+        # after each submit -- it's a standing filter, not a one-shot command
+        # argument. Per-tab: each CommandPanel/profile gets its own, matching
+        # the app's existing complete per-tab isolation.
+        self.range_combo = QComboBox()
+        for label, days in [("Last 14 days", 14), ("Last 30 days", 30), ("Last 60 days", 60),
+                             ("Last 90 days", 90), ("Last 180 days", 180), ("All time", None)]:
+            self.range_combo.addItem(label, userData=days)
+        self.range_combo.setCurrentIndex(3)  # "Last 90 days" default
+        self.range_combo.currentIndexChanged.connect(self._on_range_changed)
+
+        range_row = QHBoxLayout()
+        range_row.addWidget(QLabel("Range:"))
+        range_row.addWidget(self.range_combo)
+        range_row.addStretch(1)
+
+        self.last_fetch_label = QLabel("Last fetched: ...")
+        self.last_fetch_label.setStyleSheet(f"color: {MUTED_COLOR};")
+        last_fetch_row = QHBoxLayout()
+        last_fetch_row.addWidget(self.last_fetch_label)
+        last_fetch_row.addStretch(1)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.addWidget(self.output, stretch=1)
+        layout.addLayout(range_row)
+        layout.addLayout(last_fetch_row)
         layout.addWidget(self.input)
 
         self.input.textChanged.connect(self._on_input_changed)
+
+        # Current date-range filter (days, or None for "all time"), and the
+        # last /opening query typed, so changing the range can re-run
+        # whatever /stats and/or /opening results are currently on screen.
+        self._range_days: int | None = 90
+        self._last_opening_query: str | None = None
 
         # Last /stats result and which opening rows are expanded, so a click
         # can re-render just that block in place (see _replace_stats_block).
@@ -153,6 +185,27 @@ class CommandPanel(QWidget):
         self._opening_results_end: QTextCursor | None = None
 
         self._print(WELCOME_TEXT)
+        self._refresh_last_fetch_row()
+
+    def _format_last_fetch(self, entry: dict | None) -> str:
+        if entry is None:
+            return "never"
+        raw = entry.get("last_fetched_at", "")
+        try:
+            dt = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            return dt.astimezone().strftime("%b %d, %I:%M %p").replace(" 0", " ")
+        except ValueError:
+            return raw or "never"
+
+    def _refresh_last_fetch_row(self) -> None:
+        try:
+            data = self.cli.last_fetch_status()
+        except TempoCliError:
+            self.last_fetch_label.setText("Last fetched: unavailable")
+            return
+        cc = self._format_last_fetch(data.get("chesscom"))
+        lc = self._format_last_fetch(data.get("lichess"))
+        self.last_fetch_label.setText(f"Last fetched — chess.com: {cc}, lichess: {lc}")
 
     def _print(self, html_fragment: str) -> None:
         self.output.append(html_fragment)
@@ -344,6 +397,31 @@ class CommandPanel(QWidget):
         except Exception as e:  # defensive: never let a bad command kill the GUI
             self._print_error(str(e))
 
+    def _range_token(self) -> str:
+        return f"{self._range_days}d" if self._range_days is not None else "all"
+
+    def _refresh_stats_data(self, args: list[str]) -> None:
+        self._stats_data = self.cli.stats(*args, self._range_token())
+        self._stats_filter = list(args)
+        self._expanded_openings = set()
+        self._opening_games_cache = {}
+        self._show_all_openings = {"white": False, "black": False}
+
+    def _refresh_opening_data(self, query: str) -> None:
+        self._last_opening_query = query
+        data = self.cli.opening(query, self._range_token())
+        self._opening_results = data["games"]
+        self._opening_results_show_all = False
+
+    def _on_range_changed(self) -> None:
+        self._range_days = self.range_combo.currentData()
+        if self._stats_data is not None:
+            self._refresh_stats_data(self._stats_filter)
+            self._replace_stats_block()
+        if self._opening_results is not None and self._last_opening_query is not None:
+            self._refresh_opening_data(self._last_opening_query)
+            self._replace_opening_results_block()
+
     def _dispatch(self, cmd: str, args: list[str]) -> None:
         if cmd == "help" or cmd == "":
             self._print(HELP_TEXT)
@@ -352,11 +430,7 @@ class CommandPanel(QWidget):
             data = self.cli.list_games(limit)
             self._print(self._format_games(data["games"]))
         elif cmd == "stats":
-            self._stats_data = self.cli.stats(*args)
-            self._stats_filter = list(args)
-            self._expanded_openings = set()
-            self._opening_games_cache = {}
-            self._show_all_openings = {"white": False, "black": False}
+            self._refresh_stats_data(args)
             self.game_type_popup.reset()  # next time the dropdown opens, start with nothing checked
             self._render_stats_block()
         elif cmd == "clear":
@@ -369,9 +443,7 @@ class CommandPanel(QWidget):
             if not args:
                 self._print_error("usage: /opening <name-or-ECO>")
                 return
-            data = self.cli.opening(" ".join(args))
-            self._opening_results = data["games"]
-            self._opening_results_show_all = False
+            self._refresh_opening_data(" ".join(args))
             self._render_opening_results_block()
         elif cmd == "moves":
             if not args:
@@ -400,6 +472,23 @@ class CommandPanel(QWidget):
         else:
             self._print_error(f"unknown command '/{cmd}'. Type /help for a list.")
 
+    def display_selected_game(self, game_id: int, include_review: bool) -> None:
+        """Prints /show (or /review, if `include_review`) info for a game
+        selected by clicking it in the archive panel -- mirrors typing the
+        command, but without re-emitting game_requested (the caller already
+        loaded the game onto the board; re-emitting would loop back here)."""
+        self._print(f'<hr style="border:none; border-top:1px solid #444; margin:10px 0 4px 0;">'
+                    f'<span style="color:{MUTED_COLOR}">Selected game #{game_id} from archive</span>')
+        try:
+            if include_review:
+                data = self.cli.review(game_id)
+                self._print(self._format_review(data))
+            else:
+                data = self.cli.show(game_id)
+                self._print(self._format_game_header(data))
+        except TempoCliError as e:
+            self._print_error(str(e))
+
     def _dispatch_fetch(self, args: list[str]) -> None:
         if len(args) < 2:
             self._print_error("usage: /fetch chesscom <user> [year month]  |  /fetch lichess <user> [days]")
@@ -416,7 +505,7 @@ class CommandPanel(QWidget):
                 self._print_error("usage: /fetch chesscom <user> [year month] (both or neither)")
                 return
         elif site == "lichess":
-            days = int(args[2]) if len(args) >= 3 else 90
+            days = int(args[2]) if len(args) >= 3 else None
             fetch_fn = lambda: self.cli.fetch_lichess(username, days)
         else:
             self._print_error(f"unknown fetch site '{site}' (expected chesscom or lichess)")
@@ -434,6 +523,7 @@ class CommandPanel(QWidget):
 
     def _on_fetch_succeeded(self, data: dict) -> None:
         self._print(self._format_fetch_results(data["results"]))
+        self._refresh_last_fetch_row()
 
     def _insert_tracked_block(self, html: str) -> tuple[QTextCursor, QTextCursor]:
         """Inserts `html` as a distinct block and returns (start, end)
@@ -489,20 +579,27 @@ class CommandPanel(QWidget):
             return
         self._stats_end = self._replace_tracked_block(self._stats_start, self._stats_end, self._format_stats(self._stats_data))
 
+    def _opening_range_banner(self) -> str:
+        if self._range_days is None:
+            return ""
+        return f'<div style="color:{HEADER_COLOR}">Range: last {self._range_days} days</div>'
+
     def _render_opening_results_block(self) -> None:
-        html = self._format_games(self._opening_results, truncate=DEFAULT_GAMES_SHOWN, show_all=self._opening_results_show_all)
+        html = self._opening_range_banner() + self._format_games(
+            self._opening_results, truncate=DEFAULT_GAMES_SHOWN, show_all=self._opening_results_show_all)
         self._opening_results_start, self._opening_results_end = self._insert_tracked_block(html)
 
     def _replace_opening_results_block(self) -> None:
         if self._opening_results_start is None or self._opening_results_end is None or self._opening_results is None:
             return
-        html = self._format_games(self._opening_results, truncate=DEFAULT_GAMES_SHOWN, show_all=self._opening_results_show_all)
+        html = self._opening_range_banner() + self._format_games(
+            self._opening_results, truncate=DEFAULT_GAMES_SHOWN, show_all=self._opening_results_show_all)
         self._opening_results_end = self._replace_tracked_block(self._opening_results_start, self._opening_results_end, html)
 
     def _recent_games_for(self, name: str) -> list[dict]:
         if name not in self._opening_games_cache:
             try:
-                self._opening_games_cache[name] = self.cli.opening_exact(name, 3)["games"]
+                self._opening_games_cache[name] = self.cli.opening_exact(name, 3, self._range_token())["games"]
             except TempoCliError:
                 self._opening_games_cache[name] = []
         return self._opening_games_cache[name]
@@ -610,9 +707,13 @@ class CommandPanel(QWidget):
         total = s["wins"] + s["losses"] + s["draws"]
         parts = []
 
-        if self._stats_filter:
-            types = ", ".join(t.capitalize() for t in self._stats_filter)
-            parts.append(f'<div style="color:{HEADER_COLOR}">Filtered to: {_esc(types)}</div>')
+        if self._stats_filter or self._range_days is not None:
+            filter_parts = []
+            if self._stats_filter:
+                filter_parts.append(", ".join(t.capitalize() for t in self._stats_filter))
+            if self._range_days is not None:
+                filter_parts.append(f"last {self._range_days} days")
+            parts.append(f'<div style="color:{HEADER_COLOR}">Filtered to: {_esc(", ".join(filter_parts))}</div>')
 
         if s.get("earliest_date") and s.get("latest_date"):
             span = f"{_month_year(s['earliest_date'])} &ndash; {_month_year(s['latest_date'])}"

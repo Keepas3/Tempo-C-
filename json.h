@@ -110,6 +110,17 @@ inline std::string to_json(const std::vector<OpeningStat>& stats) {
     return o.str();
 }
 
+inline std::string to_json(const FetchHistoryRow& f) {
+    std::ostringstream o;
+    o << "{\"last_fetched_at\": " << json_str(f.last_fetched_at);
+    if (f.last_covered_year > 0) {
+        o << ", \"last_covered_year\": " << f.last_covered_year
+          << ", \"last_covered_month\": " << f.last_covered_month;
+    }
+    o << "}";
+    return o.str();
+}
+
 inline std::string to_json(const TimeControlStat& t) {
     std::ostringstream o;
     o << "{\"category\": " << json_str(t.category)

@@ -58,6 +58,7 @@ class GameBrowser(QTreeWidget):
         self._tree_data: dict[int, dict[int, list]] = {}
         self._sort_column = 0
         self._sort_ascending = False  # matches the initial most-recent-first load
+        self._live_query_enabled = False
 
         self.setHeaderLabels(COLUMNS)
         # Column 0 (the game title) stretches to fill whatever space is left
@@ -80,6 +81,22 @@ class GameBrowser(QTreeWidget):
     def refresh(self) -> None:
         self._tree_data = self.db.games_by_year_month()
         self._rebuild(preserve_state=False)
+
+    def set_live_query_enabled(self, enabled: bool) -> None:
+        self._live_query_enabled = enabled
+        if not enabled:
+            self.refresh()  # revert to the exact normal, unfiltered view
+
+    def show_filtered(self, games: list) -> None:
+        """Renders `games` (GameRow objects matching the current board
+        position) as the live-filtered view, reusing the same tree-building
+        shape as refresh()/games_by_year_month(). Only meaningful while
+        live query is enabled -- the caller is responsible for that gate."""
+        tree: dict[int, dict[int, list]] = {}
+        for game in games:
+            tree.setdefault(game.year, {}).setdefault(game.month, []).append(game)
+        self._tree_data = tree
+        self._rebuild(preserve_state=True)
 
     def _on_header_clicked(self, column: int) -> None:
         if column == self._sort_column:

@@ -5,8 +5,9 @@ what used to be MainWindow's whole body, unchanged in behavior.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
+    QCheckBox,
     QDialog,
     QHBoxLayout,
     QInputDialog,
@@ -22,10 +23,17 @@ from PySide6.QtWidgets import (
 from board_widget import BoardWidget
 from bookmarks import Bookmark, Bookmarks
 from command_panel import CommandPanel
-from db_reader import DbReader
+from db_reader import DbReader, game_summary_to_row
+from fetch_worker import FetchWorker
 from game_browser import GameBrowser
 from profiles import ProfileRecord
 from tempo_cli import TempoCli
+
+# How long to wait after the board stops changing before firing a live-query
+# request -- rapid clicking/navigation would otherwise launch a subprocess
+# (find_games_by_move_prefix does a full games+moves table scan) on every
+# single click.
+LIVE_QUERY_DEBOUNCE_MS = 200
 
 BOOKMARK_ID_ROLE = 1000
 
@@ -90,16 +98,50 @@ class ProfileView(QWidget):
         self.browser = GameBrowser(self.db)
 
         self.browser.game_selected.connect(self.load_game)
+        self.browser.game_selected.connect(self._on_browser_game_selected)
         self.command_panel.game_requested.connect(self.load_game)
         self.command_panel.archive_updated.connect(self.browser.refresh)
         self.board.position_changed.connect(self._update_nav_buttons)
+        self.board.position_changed.connect(self._on_position_changed_for_live_query)
+
+        # Live board-query filter: debounced so rapid navigation doesn't fire
+        # a query per click, and threaded (via FetchWorker) so the scan
+        # doesn't block the GUI. A monotonic generation counter discards a
+        # slow query's result if a newer position change has since started
+        # a fresher one.
+        self._live_query_generation = 0
+        self._live_query_worker: FetchWorker | None = None
+        self._live_query_timer = QTimer(self)
+        self._live_query_timer.setSingleShot(True)
+        self._live_query_timer.setInterval(LIVE_QUERY_DEBOUNCE_MS)
+        self._live_query_timer.timeout.connect(self._run_live_query)
+
+        self.live_query_checkbox = QCheckBox("Live query by board")
+        self.live_query_checkbox.toggled.connect(self.browser.set_live_query_enabled)
+        self.live_query_checkbox.toggled.connect(self._on_live_query_toggled)
+
+        # When checked, selecting a game in the archive also prints /review's
+        # eval-annotated move table (not just /show's header) into the chat.
+        # Unchecked by default -- the review table is the heavier of the two.
+        self.show_review_checkbox = QCheckBox("Also show move review on select")
+
+        browser_controls = QHBoxLayout()
+        browser_controls.addWidget(self.live_query_checkbox)
+        browser_controls.addWidget(self.show_review_checkbox)
+        browser_controls.addStretch(1)
+
+        browser_container = QWidget()
+        browser_layout = QVBoxLayout(browser_container)
+        browser_layout.setContentsMargins(0, 0, 0, 0)
+        browser_layout.addLayout(browser_controls)
+        browser_layout.addWidget(self.browser)
 
         center = self._build_center_panel()
 
         splitter = QSplitter()
         splitter.addWidget(self.command_panel)
         splitter.addWidget(center)
-        splitter.addWidget(self.browser)
+        splitter.addWidget(browser_container)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
         splitter.setStretchFactor(2, 2)
@@ -164,11 +206,51 @@ class ProfileView(QWidget):
         self._update_nav_buttons()
         self.browser.select_game(game_id)  # keep the browser's selection in sync regardless of how the game was loaded
 
+    def _on_browser_game_selected(self, game_id: int) -> None:
+        # Only for clicks in the archive panel -- /show and /review typed in
+        # the chat already print their own info before calling load_game,
+        # so this must not also fire for that path (it would double-print).
+        self.command_panel.display_selected_game(game_id, self.show_review_checkbox.isChecked())
+
     def _update_nav_buttons(self) -> None:
         on_main = self.board.on_mainline
         self.prev_btn.setEnabled(on_main and self.board.mainline_ply > 0)
         self.next_btn.setEnabled(on_main and self.board.mainline_ply < len(self.board.mainline_sans))
         self.mainline_btn.setEnabled(not on_main)
+
+    # --- Live board-query archive filter -----------------------------------
+
+    def _on_position_changed_for_live_query(self) -> None:
+        if self.live_query_checkbox.isChecked():
+            self._live_query_timer.start()  # restarts the debounce window
+
+    def _on_live_query_toggled(self, checked: bool) -> None:
+        if checked:
+            self._live_query_timer.start()
+
+    def _run_live_query(self) -> None:
+        if not self.live_query_checkbox.isChecked():
+            return
+        self._live_query_generation += 1
+        generation = self._live_query_generation
+        sequence = self.board.current_san_sequence()
+
+        worker = FetchWorker(lambda: self.cli.games_by_move_prefix(sequence))
+        worker.succeeded.connect(lambda data: self._on_live_query_succeeded(generation, data))
+        worker.failed.connect(lambda msg: self._on_live_query_failed(generation, msg))
+        self._live_query_worker = worker
+        worker.start()
+
+    def _on_live_query_succeeded(self, generation: int, data: dict) -> None:
+        if generation != self._live_query_generation:
+            return  # a newer position change has since superseded this query
+        games = [game_summary_to_row(g) for g in data["games"]]
+        self.browser.show_filtered(games)
+
+    def _on_live_query_failed(self, generation: int, message: str) -> None:
+        if generation != self._live_query_generation:
+            return
+        self.status_label.setText(f"Live query failed: {message}")
 
     def _on_bookmark(self) -> None:
         note, ok = QInputDialog.getText(self, "Bookmark position", "Note (optional):")

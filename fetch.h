@@ -39,16 +39,31 @@ inline bool fetch_chesscom_month(const std::string& username, int year, int mont
     return fetch_url_to_file(url, out_path);
 }
 
-inline bool fetch_lichess_range(const std::string& username, int days, const std::string& out_path) {
+// Shared core for both lichess entry points below -- an explicit
+// [since_ms, until_ms) window, downloaded the same way either was reached.
+inline bool fetch_lichess_url(const std::string& username, long long since_ms, long long until_ms,
+                               const std::string& out_path) {
     if (!is_valid_username(username)) return false;
-
-    auto now = std::chrono::system_clock::now();
-    auto until_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-    auto since_ms = until_ms - static_cast<long long>(days) * 24LL * 60 * 60 * 1000;
 
     std::string url = "https://lichess.org/api/games/user/" + username +
                        "?since=" + std::to_string(since_ms) +
                        "&until=" + std::to_string(until_ms) +
                        "&opening=true&clocks=true";
     return fetch_url_to_file(url, out_path, {"Accept: application/x-chess-pgn"});
+}
+
+inline bool fetch_lichess_range(const std::string& username, int days, const std::string& out_path) {
+    auto now = std::chrono::system_clock::now();
+    auto until_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+    auto since_ms = until_ms - static_cast<long long>(days) * 24LL * 60 * 60 * 1000;
+    return fetch_lichess_url(username, since_ms, until_ms, out_path);
+}
+
+// Fetches from an explicit `since_ms` boundary (e.g. the timestamp of the
+// last successful fetch) through now -- used for incremental /fetch, as
+// opposed to fetch_lichess_range's rolling day-count.
+inline bool fetch_lichess_since(const std::string& username, long long since_ms, const std::string& out_path) {
+    auto now = std::chrono::system_clock::now();
+    auto until_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+    return fetch_lichess_url(username, since_ms, until_ms, out_path);
 }

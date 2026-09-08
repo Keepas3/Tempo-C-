@@ -103,6 +103,50 @@ def classify_time_control(tc: str) -> tuple[str, str, int]:
     return time_label, category, base_seconds
 
 
+# Representative (label, sort_seconds) per category, for rows coming back
+# from the C++ move-prefix query (json.h's GameSummary has no raw
+# time_control field, only the already-classified category) -- see
+# coarse_time_fields.
+_CATEGORY_DISPLAY: dict[str, tuple[str, int]] = {
+    "Bullet": ("Bullet", 60),
+    "Blitz": ("Blitz", 300),
+    "Rapid": ("Rapid", 900),
+    "Classical": ("Classical", 1800),
+    "Daily": ("Daily", DAILY_SORT_SECONDS),
+    "Unknown": ("Unknown", UNKNOWN_SORT_SECONDS),
+}
+
+
+def coarse_time_fields(time_category: str) -> tuple[str, int]:
+    """Derives a display label + sort-seconds bucket from an already-
+    classified time_category string alone (no raw time_control available).
+    Used only for rows from the C++ move-prefix query -- the label shows
+    the category name rather than a precise duration, since the true
+    duration isn't known at that point. The normal unfiltered browser view
+    (games_by_year_month) keeps full precision, unaffected."""
+    return _CATEGORY_DISPLAY.get(time_category, ("Unknown", UNKNOWN_SORT_SECONDS))
+
+
+def game_summary_to_row(data: dict) -> GameRow:
+    """Converts one game dict from the C++ --json moves_games response
+    (a GameSummary) into a GameRow, for feeding into GameBrowser's
+    existing tree-rendering path alongside the normal unfiltered rows."""
+    time_label, time_seconds = coarse_time_fields(data["time_category"])
+    year, month = _parse_year_month(data["date"])
+    your_color = data["your_color"]
+    # GameRow.opponent is a computed property reading black/white by
+    # your_color; the JSON already supplies a precomputed opponent name,
+    # so set only the field the property will actually read.
+    white = data["opponent"] if your_color == "black" else ""
+    black = data["opponent"] if your_color == "white" else ""
+    return GameRow(
+        id=data["id"], date=data["date"], year=year, month=month,
+        white=white, black=black, your_color=your_color, result=data["result"],
+        opening=data["opening"], site=data["site"],
+        time_label=time_label, time_category=data["time_category"], time_seconds=time_seconds,
+    )
+
+
 @dataclass
 class MoveRow:
     san: str
