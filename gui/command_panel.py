@@ -217,6 +217,16 @@ class CommandPanel(QWidget):
         self._opening_results_start: QTextCursor | None = None
         self._opening_results_end: QTextCursor | None = None
 
+        # /explorer repertoire browser: which color and how deep into the
+        # move tree the current block shows, so drilling into a move or
+        # clicking a breadcrumb can re-query and replace the block in place
+        # (same pattern as _stats_start/_end above).
+        self._explorer_color: str | None = None
+        self._explorer_sequence: list[str] = []
+        self._explorer_replies: list[dict] | None = None
+        self._explorer_start: QTextCursor | None = None
+        self._explorer_end: QTextCursor | None = None
+
         self._print(WELCOME_TEXT)
         self._refresh_last_fetch_row()
 
@@ -280,6 +290,11 @@ class CommandPanel(QWidget):
         elif text == "showmoregames":
             self._opening_results_show_all = not self._opening_results_show_all
             self._replace_opening_results_block()
+        elif text.startswith("explorer:"):
+            color, _sep, seq_text = text[len("explorer:"):].partition(":")
+            sequence = unquote(seq_text).split() if seq_text else []
+            self._refresh_explorer_data(color, sequence)
+            self._replace_explorer_block()
 
     def _print_error(self, message: str) -> None:
         self._print(f'<span style="color:{ERROR_COLOR}">[Error] {_esc(message)}</span>')
@@ -518,6 +533,12 @@ class CommandPanel(QWidget):
                 return
             data = self.cli.moves(args)
             self._print(self._format_replies(data["replies"]))
+        elif cmd == "explorer":
+            if not args or args[0].lower() not in ("white", "black"):
+                self._print_error("usage: /explorer <white|black> [san-sequence...]")
+                return
+            self._refresh_explorer_data(args[0].lower(), args[1:])
+            self._render_explorer_block()
         elif cmd == "show":
             if not args:
                 self._print_error("usage: /show <id>")
@@ -776,6 +797,19 @@ class CommandPanel(QWidget):
             self._opening_results, truncate=DEFAULT_GAMES_SHOWN, show_all=self._opening_results_show_all)
         self._opening_results_end = self._replace_tracked_block(self._opening_results_start, self._opening_results_end, html)
 
+    def _refresh_explorer_data(self, color: str, sequence: list[str]) -> None:
+        self._explorer_color = color
+        self._explorer_sequence = list(sequence)
+        self._explorer_replies = self.cli.explorer(color, sequence)["replies"]
+
+    def _render_explorer_block(self) -> None:
+        self._explorer_start, self._explorer_end = self._insert_tracked_block(self._format_explorer())
+
+    def _replace_explorer_block(self) -> None:
+        if self._explorer_start is None or self._explorer_end is None or self._explorer_replies is None:
+            return
+        self._explorer_end = self._replace_tracked_block(self._explorer_start, self._explorer_end, self._format_explorer())
+
     def _recent_games_for(self, name: str) -> list[dict]:
         if name not in self._opening_games_cache:
             try:
@@ -949,6 +983,74 @@ class CommandPanel(QWidget):
             rows.append([f'<b>{_esc(r["san"])}</b>', str(r["count"]),
                          f'{r["wins"]}W {r["losses"]}L {r["draws"]}D', _win_rate_span(r["wins"], games)])
         return _table(["Move", "Games", "Record", "Win rate"], rows)
+
+    _EXPLORER_BAR_WIDTH = 180  # px -- fixed rather than percentage widths, since QTextBrowser's table layout
+                               # doesn't reliably honor percentage-width cells the way real HTML/CSS does.
+
+    def _explorer_result_bar(self, wins: int, losses: int, draws: int) -> str:
+        total = wins + losses + draws
+        if not total:
+            return ""
+        win_w = round(self._EXPLORER_BAR_WIDTH * wins / total)
+        loss_w = round(self._EXPLORER_BAR_WIDTH * losses / total)
+        draw_w = max(0, self._EXPLORER_BAR_WIDTH - win_w - loss_w)
+
+        def seg(width: int, color: str, pct: float) -> str:
+            if width <= 0:
+                return ""
+            label = f"{pct:.0f}%" if pct >= 8 else ""  # skip the label on slivers too narrow to hold text
+            return (f'<td style="background:{color}; width:{width}px; color:#111; font-size:9px; '
+                    f'text-align:center; padding:1px 0;">{label}</td>')
+
+        win_pct, draw_pct, loss_pct = (100.0 * n / total for n in (wins, draws, losses))
+        segs = seg(win_w, WIN_COLOR, win_pct) + seg(draw_w, DRAW_COLOR, draw_pct) + seg(loss_w, LOSS_COLOR, loss_pct)
+        return f'<table cellspacing="0" cellpadding="0" style="width:{self._EXPLORER_BAR_WIDTH}px;"><tr>{segs}</tr></table>'
+
+    @staticmethod
+    def _explorer_move_label(san: str, ply_index: int) -> str:
+        # Move numbers only precede White's moves (even ply), matching how
+        # /moves and /show already display SAN sequences elsewhere.
+        prefix = f"{ply_index // 2 + 1}." if ply_index % 2 == 0 else ""
+        return prefix + san
+
+    def _format_explorer(self) -> str:
+        color = self._explorer_color
+        sequence = self._explorer_sequence
+        replies = self._explorer_replies or []
+
+        color_label = "White" if color == "white" else "Black"
+        parts = [f'<div><b style="color:{HEADER_COLOR}">Repertoire explorer</b> '
+                 f'<span style="color:{MUTED_COLOR}">-- your moves as {color_label}</span></div>']
+
+        crumbs = [f'<a href="explorer:{color}:" style="color:{HEADER_COLOR}; text-decoration:none;">Start</a>']
+        for i, san in enumerate(sequence):
+            prefix = sequence[: i + 1]
+            href = "explorer:" + color + ":" + quote(" ".join(prefix))
+            label = self._explorer_move_label(san, i)
+            crumbs.append(f'<a href="{href}" style="color:{HEADER_COLOR}; text-decoration:none;">{_esc(label)}</a>')
+        parts.append(f'<div style="margin:4px 0;">{" &rsaquo; ".join(crumbs)}</div>')
+
+        if not replies:
+            parts.append(f'<span style="color:{MUTED_COLOR}">No games reached this position.</span>')
+            return "".join(parts)
+
+        total_games = sum(r["count"] for r in replies)
+        rows = []
+        for r in replies:
+            freq_pct = 100.0 * r["count"] / total_games if total_games else 0.0
+            next_seq = sequence + [r["san"]]
+            href = "explorer:" + color + ":" + quote(" ".join(next_seq))
+            label = self._explorer_move_label(r["san"], len(sequence))
+            link = f'<a href="{href}" style="color:inherit; text-decoration:none;"><b>{_esc(label)}</b></a>'
+            rows.append([
+                link,
+                f'{freq_pct:.0f}% <span style="color:{MUTED_COLOR}">({r["count"]})</span>',
+                self._explorer_result_bar(r["wins"], r["losses"], r["draws"]),
+            ])
+        parts.append(_table(["Move", "Played", "Result"], rows))
+        parts.append(f'<div style="color:{MUTED_COLOR}; margin-top:2px;">{total_games} game(s) reached this position '
+                      f'<span style="color:{MUTED_COLOR}">(click a move to drill in, or a breadcrumb to jump back)</span></div>')
+        return "".join(parts)
 
     def _format_game_header(self, g: dict) -> str:
         result_html = f'<span style="color:{_result_color(g.get("result", ""))}"><b>{_esc(g.get("result", ""))}</b></span>' \

@@ -572,6 +572,17 @@ int run_json_command(Archive& archive, const std::vector<std::string>& args) {
             // sequence means "the starting position," matching every game.
             std::vector<std::string> sequence(args.begin() + 1, args.end());
             std::cout << to_json(archive.find_games_by_move_prefix(sequence)) << "\n";
+        } else if (cmd == "explorer") {
+            // Repertoire explorer: like "moves", but restricted to games
+            // played as the given color, and (unlike "moves") an empty SAN
+            // sequence is valid here -- it's the natural starting point,
+            // showing your move-1 choices as that color.
+            if (args.size() < 2 || (args[1] != "white" && args[1] != "black")) {
+                std::cout << json_error("usage: explorer <white|black> [san-sequence...]") << "\n";
+                return 1;
+            }
+            std::vector<std::string> sequence(args.begin() + 2, args.end());
+            std::cout << to_json(archive.opponent_replies(sequence, args[1])) << "\n";
         } else if (cmd == "stats") {
             std::vector<std::string> category_filter;
             std::string min_date;

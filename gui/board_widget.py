@@ -23,7 +23,11 @@ SQUARE_SIZE = BOARD_SIZE // 8
 # arrow's actual color is this `colors=` override passed to
 # chess.svg.board(), remapping the "arrow green" theme key to a real
 # 6-digit-hex-plus-alpha value chess.svg's own color parser understands.
-ARROW_COLORS = {"arrow green": "#4caf5090"}  # light green, ~56% opacity
+ARROW_COLORS = {
+    "arrow green": "#4caf5090",  # light green, ~56% opacity -- the engine's best move
+    "arrow yellow": "#4caf5055",  # same green, fainter -- MultiPV's 2nd-best line
+    "arrow blue": "#4caf5030",  # same green, faintest -- MultiPV's 3rd-best line
+}
 # Thins the arrow's shaft -- chess.svg draws it at a fixed 20% of square
 # size by default (quite thick), with no public parameter to adjust it;
 # this CSS override (higher cascade priority than the SVG presentation
@@ -51,6 +55,7 @@ class BoardWidget(QSvgWidget):
         self.selected_square: chess.Square | None = None
         self._last_move: chess.Move | None = None
         self._best_move_arrow: chess.Move | None = None
+        self._secondary_move_arrows: list[chess.Move] = []
         self.orientation: chess.Color = chess.WHITE
 
         self._render()
@@ -81,6 +86,16 @@ class BoardWidget(QSvgWidget):
     def prev_ply(self) -> None:
         if self.on_mainline:
             self.set_ply(self.mainline_ply - 1)
+        elif self.board.move_stack:
+            # Off the mainline (e.g. explorer click-to-play or a manual
+            # move) -- undo one move at a time instead of doing nothing,
+            # since set_ply(mainline_ply - 1) would just re-jump to the
+            # branch point and discard the rest of the sideline.
+            self.board.pop()
+            self._last_move = self.board.move_stack[-1] if self.board.move_stack else None
+            self.selected_square = None
+            self._render()
+            self.position_changed.emit()
 
     def return_to_mainline(self) -> None:
         self.set_ply(self.mainline_ply)
@@ -103,10 +118,33 @@ class BoardWidget(QSvgWidget):
             replay.push(move)
         return sans
 
+    def push_san(self, san: str) -> bool:
+        """Plays `san` on the current position, branching off the mainline
+        exactly like a manual click-move (used by the opening explorer
+        panel's click-to-play). Returns False (leaving the board untouched)
+        if `san` isn't legal here."""
+        try:
+            move = self.board.push_san(san)
+        except ValueError:
+            return False
+        self._last_move = move
+        self.on_mainline = False
+        self.selected_square = None
+        self._render()
+        self.position_changed.emit()
+        return True
+
     def set_best_move_arrow(self, move: chess.Move | None) -> None:
         """Shows (or clears, if None) an arrow for the engine's suggested
         move on the current position -- set from a live-eval result."""
         self._best_move_arrow = move
+        self._render()
+
+    def set_secondary_move_arrows(self, moves: list[chess.Move]) -> None:
+        """Shows faded green arrows (up to 2) for MultiPV's 2nd/3rd-best
+        lines alongside the main best-move arrow -- same color, progressively
+        more transparent, so they read as "also good, but less so"."""
+        self._secondary_move_arrows = moves[:2]
         self._render()
 
     def flip(self) -> None:
@@ -180,12 +218,21 @@ class BoardWidget(QSvgWidget):
 
     def _render(self) -> None:
         check_square = self.board.king(self.board.turn) if self.board.is_check() else None
+        # "green"/"yellow"/"blue" (not raw hex strings) so chess.svg's own
+        # color lookup resolves them -- see ARROW_COLORS/ARROW_STYLE above
+        # for why and how the actual shade/opacity/thickness are customized
+        # instead (all three theme keys are remapped to the same green, at
+        # decreasing opacity, so 2nd/3rd-best MultiPV lines read as fainter
+        # versions of the best-move arrow rather than a different color).
         arrows = []
         if self._best_move_arrow is not None:
-            # "green" (not a raw hex string) so chess.svg's own color lookup
-            # resolves it -- see ARROW_COLORS/ARROW_STYLE above for why and
-            # how the actual shade/opacity/thickness are customized instead.
-            arrows = [chess.svg.Arrow(self._best_move_arrow.from_square, self._best_move_arrow.to_square, color="green")]
+            arrows.append(chess.svg.Arrow(self._best_move_arrow.from_square, self._best_move_arrow.to_square, color="green"))
+        drawn_squares = {(a.tail, a.head) for a in arrows}
+        for move, color in zip(self._secondary_move_arrows, ("yellow", "blue")):
+            if (move.from_square, move.to_square) in drawn_squares:
+                continue  # already drawn (e.g. as the best move) -- don't double up
+            arrows.append(chess.svg.Arrow(move.from_square, move.to_square, color=color))
+            drawn_squares.add((move.from_square, move.to_square))
         svg = chess.svg.board(
             self.board,
             size=BOARD_SIZE,

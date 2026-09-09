@@ -75,6 +75,9 @@ class TempoCli:
     def moves(self, sequence: list[str]) -> dict:
         return self.run("moves", *sequence)
 
+    def explorer(self, color: str, sequence: list[str]) -> dict:
+        return self.run("explorer", color, *sequence)
+
     def games_by_move_prefix(self, sequence: list[str]) -> dict:
         return self.run("moves_games", *sequence)
 

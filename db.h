@@ -408,14 +408,21 @@ public:
     // For every game whose move list has `sequence` as an exact SAN prefix,
     // tallies the move played at ply == sequence.size() (whoever's turn that
     // is) into a per-distinct-move bucket, with win/loss/draw counted
-    // relative to your_color. Sorted by frequency descending.
-    std::vector<NextMoveStat> opponent_replies(const std::vector<std::string>& sequence) {
+    // relative to your_color. Sorted by frequency descending. If
+    // `color_filter` is "white" or "black", only games where your_color
+    // matches are considered -- used by the repertoire explorer to show
+    // your own move choices consistently (ply parity always lines up with
+    // your_color once the games are restricted this way).
+    std::vector<NextMoveStat> opponent_replies(const std::vector<std::string>& sequence,
+                                                const std::string& color_filter = "") {
         std::map<int, std::pair<std::string, std::string>> game_info; // game_id -> (your_color, result)
         {
             sqlite3_stmt* stmt = prepare("SELECT id, your_color, result FROM games;");
             while (sqlite3_step(stmt) == SQLITE_ROW) {
                 int id = sqlite3_column_int(stmt, 0);
-                game_info[id] = {column_text(stmt, 1), column_text(stmt, 2)};
+                std::string your_color = column_text(stmt, 1);
+                if (!color_filter.empty() && your_color != color_filter) continue;
+                game_info[id] = {your_color, column_text(stmt, 2)};
             }
             sqlite3_finalize(stmt);
         }
@@ -425,6 +432,7 @@ public:
             sqlite3_stmt* stmt = prepare("SELECT game_id, ply, san FROM moves ORDER BY game_id, ply;");
             while (sqlite3_step(stmt) == SQLITE_ROW) {
                 int game_id = sqlite3_column_int(stmt, 0);
+                if (!color_filter.empty() && game_info.find(game_id) == game_info.end()) continue;
                 int ply = sqlite3_column_int(stmt, 1);
                 moves_by_game[game_id][ply] = column_text(stmt, 2);
             }
