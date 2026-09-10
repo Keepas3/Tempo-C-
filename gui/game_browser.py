@@ -9,12 +9,17 @@ from __future__ import annotations
 import calendar
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import QHeaderView, QTreeWidget, QTreeWidgetItem
 
+from colors import DRAW_COLOR, LOSS_COLOR, MUTED_COLOR, WIN_COLOR
 from db_reader import DbReader
 
 GAME_ID_ROLE = 1000
 COLUMNS = ["Game", "Color", "Time", "Type", "Site", "Result"]
+RESULT_COLUMN = 5
+
+_RESULT_COLOR = {"Win": WIN_COLOR, "Loss": LOSS_COLOR, "Draw": DRAW_COLOR}
 
 COLOR_ORDER = {"white": 0, "black": 1}
 TYPE_ORDER = {"Bullet": 0, "Blitz": 1, "Rapid": 2, "Classical": 3, "Daily": 4, "Unknown": 5}
@@ -64,6 +69,9 @@ class GameBrowser(QTreeWidget):
         self._live_query_enabled = False
 
         self.setHeaderLabels(COLUMNS)
+        self.setAlternatingRowColors(True)  # zebra striping -- a dense table of near-identical rows is otherwise easy to lose your place in
+        self.setUniformRowHeights(True)
+        self.setStyleSheet("QTreeWidget::item { padding: 3px 0; }")  # a bit less cramped than the default row height
         # Column 0 (the game title) stretches to fill whatever space is left
         # after the fixed-width columns, instead of a fixed width that
         # truncates opponent names.
@@ -149,6 +157,8 @@ class GameBrowser(QTreeWidget):
                         [label, color_display, game.time_label, game.time_category, game.site, game.result])
                     game_item.setData(0, GAME_ID_ROLE, game.id)
                     game_item.setToolTip(0, full_label)  # full year on hover
+                    result_color = _RESULT_COLOR.get(game.result, MUTED_COLOR)
+                    game_item.setForeground(RESULT_COLUMN, QBrush(QColor(result_color)))
                     month_item.addChild(game_item)
                     self._items_by_id[game.id] = game_item
 

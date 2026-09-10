@@ -5,6 +5,8 @@ what used to be MainWindow's whole body, unchanged in behavior.
 """
 from __future__ import annotations
 
+import html
+
 import chess
 import chess.engine
 from PySide6.QtCore import Qt, QTimer
@@ -55,6 +57,10 @@ LIVE_EVAL_MAX_FAILURES = 3
 LIVE_QUERY_DEBOUNCE_MS = 200
 # Same debounce idea, for the board-driven opening explorer panel.
 LIVE_EXPLORER_DEBOUNCE_MS = 200
+
+# The "Larger board" toggle's enlarged size -- BOARD_SIZE (imported from
+# board_widget) is the normal/default size.
+LARGE_BOARD_SIZE = 640
 
 BOOKMARK_ID_ROLE = 1000
 
@@ -116,7 +122,10 @@ class ProfileView(QWidget):
         self.cache = AnalysisCache(db_path)
         self.engine = EngineManager()
 
-        self.command_panel = CommandPanel(self.db, self.cli, self.cache, self.engine)
+        self.command_panel = CommandPanel(
+            self.db, self.cli, self.cache, self.engine, self.bookmarks,
+            get_current_fen=lambda: self.board.fen(),
+        )
         self.board = BoardWidget()
         self.browser = GameBrowser(self.db)
         self.explorer_panel = ExplorerPanel()
@@ -227,6 +236,7 @@ class ProfileView(QWidget):
         self.next_btn = QPushButton("Next >")
         self.mainline_btn = QPushButton("Return to mainline")
         self.flip_btn = QPushButton("Flip board")
+        self.board_size_btn = QPushButton("Larger board")
         self.bookmark_btn = QPushButton("Bookmark position")
         self.view_bookmarks_btn = QPushButton("View bookmarks")
 
@@ -235,6 +245,7 @@ class ProfileView(QWidget):
         self.mainline_btn.clicked.connect(self.board.return_to_mainline)
         self.flip_btn.clicked.connect(self.board.flip)
         self.flip_btn.clicked.connect(self._sync_eval_bar_orientation)
+        self.board_size_btn.clicked.connect(self._on_toggle_board_size)
         self.bookmark_btn.clicked.connect(self._on_bookmark)
         self.view_bookmarks_btn.clicked.connect(self._on_view_bookmarks)
 
@@ -243,6 +254,7 @@ class ProfileView(QWidget):
         nav_row.addWidget(self.next_btn)
         nav_row.addWidget(self.mainline_btn)
         nav_row.addWidget(self.flip_btn)
+        nav_row.addWidget(self.board_size_btn)
 
         bookmark_row = QHBoxLayout()
         bookmark_row.addWidget(self.bookmark_btn)
@@ -263,7 +275,6 @@ class ProfileView(QWidget):
         for label, depth in LIVE_EVAL_TIERS:
             self.eval_tier_combo.addItem(label, depth)
         self.eval_tier_combo.setCurrentIndex(1)  # "Balanced"
-        self.eval_label = QLabel("")
 
         # Multiple lines: when on, each live-eval request asks the engine
         # for its top 3 candidate moves (MultiPV=3) instead of just the
@@ -272,11 +283,20 @@ class ProfileView(QWidget):
         self.multipv_checkbox.setChecked(False)
         self.multipv_checkbox.toggled.connect(self._on_multipv_toggled)
         self.multipv_lines_label = QLabel("")
+        # Rich text so each line can be a clickable move link (see
+        # _render_multipv_lines/_on_multipv_move_clicked below).
+        self.multipv_lines_label.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse)
+        self.multipv_lines_label.setOpenExternalLinks(False)
+        self.multipv_lines_label.linkActivated.connect(self._on_multipv_move_clicked)
 
-        # Visual white/black advantage bar next to the board -- mirrors
-        # eval_label's number, not a separate data source. Sized to match
-        # the board's own height so it reads as one unit alongside it.
-        self.eval_bar = EvalBar(BOARD_SIZE)
+        # Visual white/black advantage bar next to the board, with the
+        # score drawn inside it (see eval_bar.py) rather than in a separate
+        # label above it -- a sibling label would make the bar's *column*
+        # taller than the board, pushing the bar's own top edge down out of
+        # line with the board's. Sized to match the board's own height
+        # exactly, kept in sync by _sync_eval_bar_size on every board-size
+        # change, so the two always line up top-to-bottom.
+        self.eval_bar = EvalBar(self.board.board_size)
         self.eval_bar.set_orientation(self.board.orientation == chess.WHITE)
 
         engine_row = QHBoxLayout()
@@ -288,21 +308,22 @@ class ProfileView(QWidget):
 
         multipv_row = QHBoxLayout()
         multipv_row.addWidget(self.multipv_checkbox)
-        multipv_row.addWidget(self.multipv_lines_label)
         multipv_row.addStretch(1)
+
+        multipv_column = QVBoxLayout()
+        multipv_column.addLayout(multipv_row)
+        multipv_column.addWidget(self.multipv_lines_label)
 
         self._refresh_engine_status_row()
 
-        # The eval number sits right above its bar, not off in engine_row,
-        # so the score and the bar it describes read as one readout.
-        self.eval_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        eval_column = QVBoxLayout()
-        eval_column.addWidget(self.eval_label)
-        eval_column.addWidget(self.eval_bar)
-
+        # board_row holds only the bar and the board themselves -- both
+        # fixed-height widgets of the same height, so a plain QHBoxLayout
+        # (which vertically centers same-height widgets, i.e. aligns them
+        # top AND bottom at once) keeps their edges lined up with no extra
+        # alignment flags needed.
         board_row = QHBoxLayout()
         board_row.addStretch(1)
-        board_row.addLayout(eval_column)
+        board_row.addWidget(self.eval_bar)
         board_row.addWidget(self.board)
         board_row.addStretch(1)
 
@@ -312,7 +333,7 @@ class ProfileView(QWidget):
         layout.addLayout(nav_row)
         layout.addLayout(bookmark_row)
         layout.addLayout(engine_row)
-        layout.addLayout(multipv_row)
+        layout.addLayout(multipv_column)
         layout.addStretch(1)
 
         container = QWidget()
@@ -367,6 +388,13 @@ class ProfileView(QWidget):
 
     def _sync_eval_bar_orientation(self) -> None:
         self.eval_bar.set_orientation(self.board.orientation == chess.WHITE)
+
+    def _on_toggle_board_size(self) -> None:
+        enlarged = self.board.board_size == BOARD_SIZE
+        new_size = LARGE_BOARD_SIZE if enlarged else BOARD_SIZE
+        self.board.set_board_size(new_size)
+        self.eval_bar.set_height(new_size)
+        self.board_size_btn.setText("Smaller board" if enlarged else "Larger board")
 
     def _update_nav_buttons(self) -> None:
         on_main = self.board.on_mainline
@@ -455,7 +483,6 @@ class ProfileView(QWidget):
             self.download_engine_btn.hide()
             self.live_eval_checkbox.show()
             self.eval_tier_combo.show()
-            self.eval_label.show()
             self.eval_bar.show()
             self.multipv_checkbox.show()
             self.multipv_lines_label.show()
@@ -464,7 +491,6 @@ class ProfileView(QWidget):
             self.download_engine_btn.show()
             self.live_eval_checkbox.hide()
             self.eval_tier_combo.hide()
-            self.eval_label.hide()
             self.eval_bar.hide()
             self.multipv_checkbox.hide()
             self.multipv_lines_label.hide()
@@ -483,7 +509,6 @@ class ProfileView(QWidget):
         else:
             self.board.set_best_move_arrow(None)
             self.board.set_secondary_move_arrows([])
-            self.eval_label.setText("")
             self.eval_bar.clear()
             self.multipv_lines_label.setText("")
 
@@ -550,12 +575,6 @@ class ProfileView(QWidget):
         self._live_eval_failure_count = 0
         if generation != self._live_eval_generation:
             return  # a newer position change has since superseded this result
-        if data["mate"] is not None:
-            self.eval_label.setText(f"M{data['mate']}" if data["mate"] > 0 else f"-M{abs(data['mate'])}")
-        elif data["cp"] is not None:
-            self.eval_label.setText(f"{data['cp'] / 100.0:+.2f}")
-        else:
-            self.eval_label.setText("--")
         self.eval_bar.set_eval(data["cp"], data["mate"])
         if data["best_move_uci"] and self.board.fen() == data["fen"]:
             # Only draw the arrow if the board hasn't moved on again since
@@ -580,8 +599,12 @@ class ProfileView(QWidget):
             if line["best_move_uci"]:
                 move = chess.Move.from_uci(line["best_move_uci"])
                 move_str = chess.Board(fen).san(move)
-            rows.append(f"{i}. {score_str}  {move_str}")
-        self.multipv_lines_label.setText("   ".join(rows))
+            text = f"{i}. {score_str}  {html.escape(move_str)}"
+            if move_str:
+                rows.append(f'<a href="play:{html.escape(move_str)}" style="color:inherit; text-decoration:none;">{text}</a>')
+            else:
+                rows.append(text)
+        self.multipv_lines_label.setText("<br>".join(rows))
         # Faded arrows for the 2nd/3rd-best lines (index 0 is the best move,
         # already drawn by set_best_move_arrow in _on_live_eval_succeeded).
         secondary_moves = [
@@ -590,13 +613,17 @@ class ProfileView(QWidget):
         ]
         self.board.set_secondary_move_arrows(secondary_moves)
 
+    def _on_multipv_move_clicked(self, href: str) -> None:
+        if href.startswith("play:"):
+            self.board.push_san(href[len("play:"):])
+
+
     def _on_live_eval_failed(self, generation: int, message: str) -> None:
         self._on_live_eval_done()
         self._live_eval_failure_count += 1
         if generation != self._live_eval_generation:
             return
-        self.eval_label.setText("(engine error)")
-        self.eval_bar.clear()
+        self.eval_bar.show_error()
         self.multipv_lines_label.setText("")
         self.board.set_secondary_move_arrows([])
         if self._live_eval_failure_count >= LIVE_EVAL_MAX_FAILURES:

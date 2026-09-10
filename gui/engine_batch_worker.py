@@ -9,12 +9,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import chess
 import chess.engine
 from PySide6.QtCore import QThread, Signal
 
 from analysis_cache import AnalysisCache
-from engine import BATCH_DEPTH, BATCH_SETTING_KEY, ENGINE_ID, EngineManager
+from engine import BATCH_DEPTH, BATCH_SETTING_KEY, EngineManager
+from engine_analysis_core import analyze_missing_plies
 
 
 class EngineBatchWorker(QThread):
@@ -51,37 +51,16 @@ class EngineBatchWorker(QThread):
             return
 
         try:
-            wanted = set(self._plies_to_analyze)
-            total = len(self._plies_to_analyze)
-            done = 0
-
-            board = chess.Board()
-            for ply, san in enumerate(self._sans):
-                # Analyze AFTER pushing this ply's move, matching the
-                # existing evals[] convention from analysis.h::evaluate_game
-                # (evals[i] = eval after move i) that _format_review already
-                # indexes by -- keeps both data sources aligned the same way.
-                board.push_san(san)
-                if ply in wanted:
-                    if self._cancel_requested:
-                        self.cancelled.emit()
-                        return
-                    info = engine.analyse(board, chess.engine.Limit(depth=BATCH_DEPTH))
-                    score = info["score"].white()
-                    pv = info.get("pv", [])
-                    self._cache.store_ply(
-                        self._game_id, ply, ENGINE_ID, self._engine_version, BATCH_SETTING_KEY,
-                        score.score(), score.mate(),
-                        pv[0].uci() if pv else None,
-                        " ".join(m.uci() for m in pv) if pv else None,
-                    )
-                    done += 1
-                    self.progress.emit(done, total)
-
-            if self._cancel_requested:
-                self.cancelled.emit()
-            else:
+            completed = analyze_missing_plies(
+                engine, self._sans, self._plies_to_analyze, self._cache, self._game_id,
+                self._engine_version, BATCH_SETTING_KEY, BATCH_DEPTH,
+                on_progress=self.progress.emit,
+                should_cancel=lambda: self._cancel_requested,
+            )
+            if completed:
                 self.succeeded.emit()
+            else:
+                self.cancelled.emit()
         except Exception as e:
             self.failed.emit(str(e))
         finally:

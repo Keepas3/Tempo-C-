@@ -11,8 +11,7 @@ from PySide6.QtCore import Signal
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtSvgWidgets import QSvgWidget
 
-BOARD_SIZE = 480
-SQUARE_SIZE = BOARD_SIZE // 8
+BOARD_SIZE = 480  # default size; BoardWidget.set_board_size() can resize per-instance
 
 # Best-move arrow styling. python-chess's Arrow only recognizes the named
 # colors "green"/"red"/"yellow"/"blue" -- anything else (e.g. a raw hex
@@ -46,7 +45,9 @@ class BoardWidget(QSvgWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(BOARD_SIZE, BOARD_SIZE)
+        self.board_size = BOARD_SIZE
+        self.square_size = BOARD_SIZE // 8
+        self.setFixedSize(self.board_size, self.board_size)
 
         self.board = chess.Board()
         self.mainline_sans: list[str] = []
@@ -147,6 +148,17 @@ class BoardWidget(QSvgWidget):
         self._secondary_move_arrows = moves[:2]
         self._render()
 
+    def set_board_size(self, size: int) -> None:
+        """Resizes the board itself (e.g. the "Larger board" toggle) --
+        updates the pixel size the SVG renders at and the square-size used
+        for click-to-move hit-testing together, so they never drift apart."""
+        if size == self.board_size:
+            return
+        self.board_size = size
+        self.square_size = size // 8
+        self.setFixedSize(size, size)
+        self._render()
+
     def flip(self) -> None:
         """Toggles which side's perspective the board is drawn from."""
         self.set_orientation(not self.orientation)
@@ -161,8 +173,8 @@ class BoardWidget(QSvgWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         pos = event.position()
-        col = int(pos.x() // SQUARE_SIZE)
-        row = int(pos.y() // SQUARE_SIZE)
+        col = int(pos.x() // self.square_size)
+        row = int(pos.y() // self.square_size)
         if not (0 <= col <= 7 and 0 <= row <= 7):
             return
         # Matches chess.svg.board()'s own orientation-dependent coordinate
@@ -235,7 +247,7 @@ class BoardWidget(QSvgWidget):
             drawn_squares.add((move.from_square, move.to_square))
         svg = chess.svg.board(
             self.board,
-            size=BOARD_SIZE,
+            size=self.board_size,
             coordinates=False,
             orientation=self.orientation,
             lastmove=self._last_move,

@@ -104,3 +104,29 @@ aggregation" pattern every major chess GUI uses to integrate a GPL engine
 without the app itself needing to be GPL-licensed. The engine binary and its
 settings live in `gui/engine/` and `gui/data/engine.json` (both gitignored,
 not part of this repo).
+
+## Claude AI assistant (optional)
+
+The chat panel can answer free-text questions typed without a leading `/` --
+about your archive (stats, openings, specific games, playstyle patterns) or
+general chess knowledge (opening theory, endgame technique) -- using Claude
+(Anthropic's API). It uses tool-use so it queries your local archive instead
+of guessing, and is deliberately economical: it narrows to a small set of
+relevant games via cheap metadata search before ever requesting movetext or
+spending Stockfish time on deeper analysis.
+
+Set the `ANTHROPIC_API_KEY` environment variable before launching the GUI to
+enable it:
+
+```
+set ANTHROPIC_API_KEY=sk-ant-...
+python gui/main.py
+```
+
+The key is read from the environment only and is never written to disk by
+this app. Without it set, the chat panel explains how to enable it instead
+of attempting a request. Playstyle/weakness questions reason over games
+you've already run `/review`'s full Stockfish analysis on (not the separate
+live "Analyze position" button, which doesn't persist anything) -- when
+coverage is thin, the assistant can run a small, targeted batch analysis on
+specific games itself, capped at a handful per request.

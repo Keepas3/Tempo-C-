@@ -12,6 +12,7 @@ from __future__ import annotations
 import calendar
 import html
 from datetime import datetime, timezone
+from typing import Callable
 from urllib.parse import quote, unquote
 
 from PySide6.QtCore import QEvent, QObject, QRect, Qt, Signal
@@ -29,7 +30,10 @@ from PySide6.QtWidgets import (
 )
 
 import opening_moves
+import llm_settings
+import markdown_lite
 from analysis_cache import AnalysisCache
+from bookmarks import Bookmarks
 from command_popup import COMMANDS, CommandPopup, GameTypePopup, OpeningPopup
 from db_reader import DbReader
 from engine import BATCH_DEPTH, BATCH_SETTING_KEY, ENGINE_ID, EngineManager
@@ -37,15 +41,11 @@ from engine import engine_version as current_engine_version
 from engine import is_available as engine_is_available
 from engine_batch_worker import EngineBatchWorker
 from fetch_worker import FetchWorker
+from llm_tools import build_tools
+from llm_worker import LlmWorker
 from review_data import build_basic_review_payload, build_stockfish_review_payload
 from tempo_cli import TempoCli, TempoCliError
-
-HEADER_COLOR = "#7fb3ff"
-MUTED_COLOR = "#888888"
-WIN_COLOR = "#5cb85c"
-LOSS_COLOR = "#e57373"
-DRAW_COLOR = "#b0b0b0"
-ERROR_COLOR = "#e57373"
+from colors import DRAW_COLOR, ERROR_COLOR, HEADER_COLOR, LOSS_COLOR, MUTED_COLOR, WIN_COLOR
 DEFAULT_OPENINGS_SHOWN = 5
 DEFAULT_GAMES_SHOWN = 10
 
@@ -99,12 +99,12 @@ def _month_year(pgn_date: str) -> str:
 
 
 def _table(headers: list[str], rows: list[list[str]]) -> str:
-    head = "".join(f'<th align="left" style="color:{MUTED_COLOR}; border-bottom:1px solid #555; padding:3px 8px 3px 0;">{_esc(h)}</th>' for h in headers)
+    head = "".join(f'<th align="left" style="color:{MUTED_COLOR}; border-bottom:1px solid #555; padding:4px 14px 6px 0;">{_esc(h)}</th>' for h in headers)
     body = ""
     for row in rows:
-        cells = "".join(f'<td style="padding:2px 8px 2px 0;">{cell}</td>' for cell in row)
+        cells = "".join(f'<td style="padding:4px 14px 4px 0;">{cell}</td>' for cell in row)
         body += f"<tr>{cells}</tr>"
-    return f'<table cellspacing="0" style="width:100%; margin-top:4px;"><tr>{head}</tr>{body}</table>'
+    return f'<table cellspacing="0" style="width:100%; margin-top:6px;"><tr>{head}</tr>{body}</table>'
 
 
 class CommandPanel(QWidget):
@@ -116,12 +116,17 @@ class CommandPanel(QWidget):
     # jump straight to the position right after that move.
     move_requested = Signal(int, int)  # game_id, ply
 
-    def __init__(self, db: DbReader, cli: TempoCli, cache: AnalysisCache, engine: EngineManager, parent=None):
+    def __init__(
+        self, db: DbReader, cli: TempoCli, cache: AnalysisCache, engine: EngineManager,
+        bookmarks: Bookmarks, get_current_fen: Callable[[], str], parent=None,
+    ):
         super().__init__(parent)
         self.db = db
         self.cli = cli
         self.cache = cache
         self.engine = engine
+        self.bookmarks = bookmarks
+        self.get_current_fen = get_current_fen
         self._review_worker: EngineBatchWorker | None = None
         self._review_progress: QProgressDialog | None = None
         # Workers that have been asked to cancel but haven't emitted
@@ -135,13 +140,26 @@ class CommandPanel(QWidget):
         # analyzing.
         self._retiring_review_workers: list[EngineBatchWorker] = []
 
+        # Same worker-lifecycle pattern as the review worker above, for the
+        # LLM assistant's tool-use loop.
+        self._llm_worker: LlmWorker | None = None
+        self._retiring_llm_workers: list[LlmWorker] = []
+        # Text-only turns, in-memory for this tab's session only -- intra-
+        # turn tool_use/tool_result traffic is never persisted here, only
+        # the final question/answer text, so history stays small.
+        self._llm_history: list[dict] = []
+        self._llm_start: QTextCursor | None = None
+        self._llm_end: QTextCursor | None = None
+
         self.output = QTextBrowser()
         self.output.setReadOnly(True)
-        self.output.setFont(QFont("Segoe UI", 10))
+        self.output.setFont(QFont("Segoe UI", 11))
+        self.output.document().setDocumentMargin(12)  # breathing room from the panel edge, instead of text touching it
         self.output.setOpenLinks(False)  # we handle anchor clicks ourselves (expand/collapse), not real navigation
         self.output.anchorClicked.connect(self._on_anchor_clicked)
 
         self.input = QLineEdit()
+        self.input.setMinimumHeight(28)  # matches the slightly larger chat font -- a cramped input looked out of place under it
         self.input.setPlaceholderText("Type / for commands...")
         self.input.returnPressed.connect(self._on_submit)
         self.input.installEventFilter(self)
@@ -202,7 +220,7 @@ class CommandPanel(QWidget):
         self._stats_end: QTextCursor | None = None
         # Recent-games lookups are fetched lazily (only when a row is first
         # expanded) and cached here so re-collapsing/re-expanding is instant.
-        self._opening_games_cache: dict[str, list[dict]] = {}
+        self._opening_games_cache: dict[tuple[str, str], list[dict]] = {}
         # Long opening lists start truncated (see DEFAULT_OPENINGS_SHOWN);
         # "white"/"black" here track whether each section has been expanded
         # to show the rest.
@@ -463,10 +481,14 @@ class CommandPanel(QWidget):
                     f'<span style="color:{MUTED_COLOR}">&gt; {_esc(line)}</span>')
 
         if not line.startswith("/"):
-            self._print(
-                f'<span style="color:{MUTED_COLOR}">Natural-language questions aren\'t available yet '
-                f'-- try /help for the commands that work today.</span>'
-            )
+            if not llm_settings.is_available():
+                self._print(
+                    f'<span style="color:{MUTED_COLOR}">Claude isn\'t configured -- set the '
+                    f'<code>ANTHROPIC_API_KEY</code> environment variable and restart the app to ask '
+                    f'questions here. Try /help for the commands that work today.</span>'
+                )
+                return
+            self._run_llm_query(line)
             return
 
         parts = line[1:].split()
@@ -521,6 +543,11 @@ class CommandPanel(QWidget):
             self._stats_end = None
             self._opening_results_start = None
             self._opening_results_end = None
+            self._explorer_start = None
+            self._explorer_end = None
+            self._llm_start = None
+            self._llm_end = None
+            self._print(WELCOME_TEXT)  # clear wipes the whole document -- put the welcome hint back
         elif cmd == "opening":
             if not args:
                 self._print_error("usage: /opening <name-or-ECO>")
@@ -597,15 +624,29 @@ class CommandPanel(QWidget):
             self._retiring_review_workers.remove(worker)
         worker.deleteLater()
 
+    def _cancel_active_llm_query(self) -> None:
+        """Same pattern as _cancel_active_review, for the LLM assistant's
+        tool-use loop."""
+        if self._llm_worker is not None:
+            if self._llm_worker.isRunning():
+                self._llm_worker.request_cancel()
+            self._llm_worker = None
+
+    def _retire_llm_worker(self, worker: LlmWorker) -> None:
+        if worker in self._retiring_llm_workers:
+            self._retiring_llm_workers.remove(worker)
+        worker.deleteLater()
+
     def cleanup(self) -> None:
-        """Cancels and waits (briefly) for any in-flight/retiring review
-        workers to actually stop -- called from ProfileView.cleanup() on
+        """Cancels and waits (briefly) for any in-flight/retiring review or
+        LLM workers to actually stop -- called from ProfileView.cleanup() on
         app exit. Unlike normal interactive use, blocking briefly here is
         fine (and necessary): letting the process exit while a QThread is
         still running is the same fatal-abort hazard _cancel_active_review
         guards against during ordinary use."""
         self._cancel_active_review()
-        for worker in list(self._retiring_review_workers):
+        self._cancel_active_llm_query()
+        for worker in list(self._retiring_review_workers) + list(self._retiring_llm_workers):
             worker.request_cancel()
             worker.wait(2000)
 
@@ -630,6 +671,10 @@ class CommandPanel(QWidget):
             self._print(self._format_review(payload, game_id))
             return
 
+        # /review and the LLM assistant's run_batch_analysis tool both
+        # write to the same engine_analysis cache and both spawn batch
+        # engines -- never let them run concurrently in one tab.
+        self._cancel_active_llm_query()
         self._cancel_active_review()
 
         missing = self.cache.get_missing_plies(game_id, total_plies, ENGINE_ID, version, BATCH_SETTING_KEY)
@@ -654,18 +699,34 @@ class CommandPanel(QWidget):
             self._print(self._format_review(payload, game_id))
             return True
 
+        def clear_review_worker_if_current() -> None:
+            # A worker that finishes normally (not via _cancel_active_review)
+            # was never otherwise cleared from self._review_worker -- left
+            # as-is, that stale reference would eventually point at a
+            # deleteLater()-reaped C++ object (once _retire_review_worker's
+            # finished-signal handler runs), and the next /review's
+            # _cancel_active_review() touching .isRunning() on it would hit
+            # the same libshiboken "already deleted" crash this whole
+            # worker-lifecycle scheme exists to prevent. Guarded by identity
+            # so this never clobbers a newer worker that's since replaced it.
+            if self._review_worker is worker:
+                self._review_worker = None
+
         def on_succeeded() -> None:
+            clear_review_worker_if_current()
             progress.close()
             if not render_from_cache():
                 self._print_error("analysis completed but the cache read failed unexpectedly")
 
         def on_cancelled() -> None:
+            clear_review_worker_if_current()
             progress.close()
             if not render_from_cache():
                 self._print(f'<span style="color:{MUTED_COLOR}">Analysis cancelled -- showing basic evaluator.</span>')
                 self._print_basic_review(game_id)
 
         def on_failed(message: str) -> None:
+            clear_review_worker_if_current()
             progress.close()
             self._print_error(f"engine analysis failed: {message}")
             self._print_basic_review(game_id)
@@ -689,6 +750,77 @@ class CommandPanel(QWidget):
             self._print_error(str(e))
             return
         self._print(self._format_review(build_basic_review_payload(data), game_id))
+
+    # --- LLM assistant (free-text questions) --------------------------------
+
+    def _run_llm_query(self, question: str) -> None:
+        # run_batch_analysis (a tool the LLM can call) and /review both
+        # write to the same engine_analysis cache and both spawn batch
+        # engines -- never let them run concurrently in one tab.
+        self._cancel_active_review()
+        self._cancel_active_llm_query()
+
+        self._llm_start, self._llm_end = self._insert_tracked_block(
+            f'<span style="color:{MUTED_COLOR}">Thinking...</span>'
+        )
+
+        worker = LlmWorker(
+            llm_settings.api_key(), build_tools(),
+            self.db, self.cli, self.cache, self.engine, self.bookmarks, self.get_current_fen,
+            self._llm_history, question, self,
+        )
+        worker.status.connect(self._on_llm_status)
+        worker.answer_chunk.connect(self._on_llm_answer_chunk)
+        worker.succeeded.connect(lambda text, w=worker: self._on_llm_succeeded(w, question, text))
+        worker.failed.connect(lambda msg, w=worker: self._on_llm_failed(w, msg))
+        worker.cancelled.connect(lambda w=worker: self._on_llm_cancelled(w))
+        worker.finished.connect(lambda w=worker: self._retire_llm_worker(w))
+        self._retiring_llm_workers.append(worker)
+        self._llm_worker = worker
+        worker.start()
+
+    def _clear_llm_worker_if_current(self, worker: LlmWorker) -> None:
+        # Same fix as clear_review_worker_if_current in _run_review: a
+        # worker that finishes normally was never otherwise cleared from
+        # self._llm_worker, which would eventually dangle once
+        # _retire_llm_worker's deleteLater() is processed -- guarded by
+        # identity so a newer worker that's since replaced it is untouched.
+        if self._llm_worker is worker:
+            self._llm_worker = None
+
+    def _replace_llm_block(self, html_fragment: str) -> None:
+        if self._llm_start is None or self._llm_end is None:
+            return
+        self._llm_end = self._replace_tracked_block(self._llm_start, self._llm_end, html_fragment)
+
+    def _on_llm_status(self, text: str) -> None:
+        self._replace_llm_block(f'<span style="color:{MUTED_COLOR}">{_esc(text)}</span>')
+
+    def _on_llm_answer_chunk(self, text: str) -> None:
+        self._replace_llm_block(self._format_llm_answer(text))
+
+    def _on_llm_succeeded(self, worker: LlmWorker, question: str, text: str) -> None:
+        self._clear_llm_worker_if_current(worker)
+        self._replace_llm_block(self._format_llm_answer(text))
+        self._llm_history.append({"role": "user", "content": question})
+        self._llm_history.append({"role": "assistant", "content": text})
+        # Keep the last several exchanges only -- bounds how much history
+        # (and therefore token cost) every future turn in this tab resends.
+        self._llm_history = self._llm_history[-20:]
+
+    def _on_llm_failed(self, worker: LlmWorker, message: str) -> None:
+        self._clear_llm_worker_if_current(worker)
+        self._replace_llm_block(f'<span style="color:{ERROR_COLOR}">[Error] {_esc(message)}</span>')
+
+    def _on_llm_cancelled(self, worker: LlmWorker) -> None:
+        self._clear_llm_worker_if_current(worker)
+        self._replace_llm_block(f'<span style="color:{MUTED_COLOR}">Cancelled.</span>')
+
+    def _format_llm_answer(self, text: str) -> str:
+        return (
+            f'<div style="margin-top:4px;"><b style="color:{HEADER_COLOR}">Claude</b></div>'
+            f'<div>{markdown_lite.to_html(text)}</div>'
+        )
 
     def _dispatch_fetch(self, args: list[str]) -> None:
         if len(args) < 2:
@@ -810,13 +942,24 @@ class CommandPanel(QWidget):
             return
         self._explorer_end = self._replace_tracked_block(self._explorer_start, self._explorer_end, self._format_explorer())
 
-    def _recent_games_for(self, name: str) -> list[dict]:
-        if name not in self._opening_games_cache:
+    def _recent_games_for(self, name: str, color_key: str) -> list[dict]:
+        # find_games_by_exact_opening (the C++ side of opening_exact) has no
+        # color filter -- it matches by opening name alone and returns the
+        # most recent N regardless of color. Fetching a wider batch (15,
+        # not just the 3 we'll actually show) and filtering to color_key
+        # here in Python is what keeps a White-section row's examples from
+        # ever showing a game the user actually played as Black (or vice
+        # versa), without needing a C++ change. Cached by (name, color_key)
+        # -- not name alone -- so the White and Black sections never share
+        # a cache entry when they list the same opening name.
+        cache_key = (name, color_key)
+        if cache_key not in self._opening_games_cache:
             try:
-                self._opening_games_cache[name] = self.cli.opening_exact(name, 3, self._range_token())["games"]
+                games = self.cli.opening_exact(name, 15, self._range_token())["games"]
+                self._opening_games_cache[cache_key] = [g for g in games if g["your_color"] == color_key][:3]
             except TempoCliError:
-                self._opening_games_cache[name] = []
-        return self._opening_games_cache[name]
+                self._opening_games_cache[cache_key] = []
+        return self._opening_games_cache[cache_key]
 
     def _openings_table(self, openings: list[dict], color_key: str) -> str:
         # Long lists (plus each row's own optional expansion) can make /stats
@@ -826,9 +969,9 @@ class CommandPanel(QWidget):
         show_all = self._show_all_openings.get(color_key, False)
         visible = openings if show_all else openings[:DEFAULT_OPENINGS_SHOWN]
 
-        head = (f'<tr><th align="left" style="color:{MUTED_COLOR}; border-bottom:1px solid #555; padding:3px 8px 3px 0;">Opening</th>'
-                f'<th align="left" style="color:{MUTED_COLOR}; border-bottom:1px solid #555; padding:3px 8px 3px 0;">Games</th>'
-                f'<th align="left" style="color:{MUTED_COLOR}; border-bottom:1px solid #555; padding:3px 8px 3px 0;">Win rate</th></tr>')
+        head = (f'<tr><th align="left" style="color:{MUTED_COLOR}; border-bottom:1px solid #555; padding:4px 14px 6px 0;">Opening</th>'
+                f'<th align="left" style="color:{MUTED_COLOR}; border-bottom:1px solid #555; padding:4px 14px 6px 0;">Games</th>'
+                f'<th align="left" style="color:{MUTED_COLOR}; border-bottom:1px solid #555; padding:4px 14px 6px 0;">Win rate</th></tr>')
         rows = []
         for o in visible:
             name = o["opening"]
@@ -836,9 +979,9 @@ class CommandPanel(QWidget):
             arrow = "&#9662;" if expanded else "&#9656;"  # ▾ / ▸
             href = "opening:" + quote(name)
             link = f'<a href="{href}" style="color:inherit; text-decoration:none;">{arrow} {_esc(name)}</a>'
-            rows.append(f'<tr><td style="padding:2px 8px 2px 0;">{link}</td>'
-                        f'<td style="padding:2px 8px 2px 0;">{o["games"]}</td>'
-                        f'<td style="padding:2px 8px 2px 0;">{_win_rate_span(o["wins"], o["games"])}</td></tr>')
+            rows.append(f'<tr><td style="padding:4px 14px 4px 0;">{link}</td>'
+                        f'<td style="padding:4px 14px 4px 0;">{o["games"]}</td>'
+                        f'<td style="padding:4px 14px 4px 0;">{_win_rate_span(o["wins"], o["games"])}</td></tr>')
             if expanded:
                 moves = opening_moves.get_moves(name)
                 if moves:
@@ -846,7 +989,7 @@ class CommandPanel(QWidget):
                 else:
                     detail = f'<span style="color:{MUTED_COLOR}">move order not found</span>'
 
-                recent = self._recent_games_for(name)
+                recent = self._recent_games_for(name, color_key)
                 if recent:
                     recent_lines = []
                     for g in recent:
