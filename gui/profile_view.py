@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QPushButton,
     QSplitter,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
 from analysis_cache import AnalysisCache
 from board_widget import BOARD_SIZE, BoardWidget
 from bookmarks import Bookmark, Bookmarks
+from colors import HEADER_COLOR, MUTED_COLOR
 from command_panel import CommandPanel
 from db_reader import DbReader, game_summary_to_row
 import engine as engine_module
@@ -135,10 +137,13 @@ class ProfileView(QWidget):
         self.command_panel.game_requested.connect(self.load_game)
         self.command_panel.move_requested.connect(self._on_move_requested)
         self.command_panel.archive_updated.connect(self.browser.refresh)
+        self.command_panel.review_ready.connect(self._on_review_ready)
         self.board.position_changed.connect(self._update_nav_buttons)
         self.board.position_changed.connect(self._on_position_changed_for_live_query)
         self.board.position_changed.connect(self._on_position_changed_for_live_eval)
         self.board.position_changed.connect(self._on_position_changed_for_live_explorer)
+        self.board.position_changed.connect(self._on_position_changed_for_review_highlight)
+        self.board.position_changed.connect(self._update_move_counter)
         self.explorer_panel.enabled_changed.connect(self._on_live_explorer_toggled)
         self.explorer_panel.color_changed.connect(lambda _c: self._live_explorer_timer.start())
         self.explorer_panel.move_clicked.connect(self._on_explorer_move_clicked)
@@ -217,6 +222,7 @@ class ProfileView(QWidget):
         right_splitter.setStretchFactor(1, 1)
 
         center = self._build_center_panel()
+        self._update_move_counter()  # initial "Start" label -- otherwise blank until the first position_changed
 
         splitter = QSplitter()
         splitter.addWidget(self.command_panel)
@@ -314,17 +320,39 @@ class ProfileView(QWidget):
         multipv_column.addLayout(multipv_row)
         multipv_column.addWidget(self.multipv_lines_label)
 
+        # /review's move-by-move table, shown here instead of in the chat --
+        # hidden until a review actually renders (see _on_review_ready), so
+        # it doesn't sit as an empty box before one's ever been shown. Its
+        # own scrollbar (rather than letting it grow unbounded) keeps a long
+        # game's move list from pushing the whole center column out of view.
+        self.review_panel = QTextBrowser()
+        self.review_panel.setOpenLinks(False)  # handled ourselves -- see _on_review_anchor_clicked
+        self.review_panel.anchorClicked.connect(self._on_review_anchor_clicked)
+        self.review_panel.setMaximumHeight(320)
+        self.review_panel.hide()
+
         self._refresh_engine_status_row()
 
-        # board_row holds only the bar and the board themselves -- both
-        # fixed-height widgets of the same height, so a plain QHBoxLayout
-        # (which vertically centers same-height widgets, i.e. aligns them
-        # top AND bottom at once) keeps their edges lined up with no extra
-        # alignment flags needed.
+        # Move counter, right of the board -- reflects whatever's actually
+        # on the board's own move stack (chess.Board.move_stack), not
+        # anything game/archive-specific, so it counts correctly whether
+        # you're stepping through a loaded/analyzed game, a branched
+        # sideline off one, or a position you've set up and are just
+        # playing out yourself with no game loaded at all.
+        self.move_counter_label = QLabel("")
+        self.move_counter_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.move_counter_label.setMinimumWidth(90)
+
+        # board_row holds the bar, board, and move counter -- all fixed-
+        # height/natural-height widgets, so a plain QHBoxLayout (which
+        # vertically centers same-height widgets, i.e. aligns the bar and
+        # board top AND bottom at once) keeps their edges lined up with no
+        # extra alignment flags needed.
         board_row = QHBoxLayout()
         board_row.addStretch(1)
         board_row.addWidget(self.eval_bar)
         board_row.addWidget(self.board)
+        board_row.addWidget(self.move_counter_label)
         board_row.addStretch(1)
 
         layout = QVBoxLayout()
@@ -334,6 +362,7 @@ class ProfileView(QWidget):
         layout.addLayout(bookmark_row)
         layout.addLayout(engine_row)
         layout.addLayout(multipv_column)
+        layout.addWidget(self.review_panel)
         layout.addStretch(1)
 
         container = QWidget()
@@ -358,6 +387,14 @@ class ProfileView(QWidget):
             self.status_label.setText(f"No game with id {game_id}")
             return
         self.current_game_id = game_id
+        # Clear any review left over from a previous game -- if this load is
+        # about to be followed by a fresh review (e.g. the archive's "show
+        # review on select" checkbox), _on_review_ready repopulates it right
+        # after; this just prevents a stale, now-mismatched review lingering
+        # on screen in the meantime.
+        self.review_panel.clear()
+        self.review_panel.hide()
+        self.command_panel.clear_review_state()
         sans = [m.san for m in detail.moves]
         self.board.load_game(sans)
         # Auto-orient to your own side -- white stays the default view
@@ -386,6 +423,40 @@ class ProfileView(QWidget):
             self.load_game(game_id)
         self.board.set_ply(ply)
 
+    def _on_review_ready(self, html: str, ply: int) -> None:
+        self.review_panel.setHtml(html)
+        self.review_panel.show()
+        if ply >= 0:
+            # Keeps whichever move is highlighted actually visible as you
+            # step through a long game, instead of the highlight silently
+            # moving off-screen -- re-setting the HTML resets scroll
+            # position, so this has to run after every setHtml, not just
+            # the first one. ("ply-N" is a named anchor _format_review
+            # embeds at every move, not just the highlighted one.)
+            self.review_panel.scrollToAnchor(f"ply-{ply}")
+
+    def _on_position_changed_for_review_highlight(self) -> None:
+        if self.review_panel.isHidden() or self.current_game_id is None:
+            return
+        # Sideline moves (explorer click-to-play, manual board moves) have
+        # no corresponding row in the review table -- clear the highlight
+        # rather than pointing it at the wrong move.
+        ply = self.board.mainline_ply if self.board.on_mainline else -1
+        self.command_panel.set_review_ply(self.current_game_id, ply)
+
+    def _on_review_anchor_clicked(self, url) -> None:
+        # Same "ply:<game_id>:<ply>" scheme _format_review's move links use
+        # in the chat panel -- reused as-is here since this panel renders
+        # that exact same HTML, just in a different widget.
+        text = url.toString()
+        if not text.startswith("ply:"):
+            return
+        try:
+            game_id_str, ply_str = text[len("ply:"):].split(":")
+        except ValueError:
+            return
+        self._on_move_requested(int(game_id_str), int(ply_str))
+
     def _sync_eval_bar_orientation(self) -> None:
         self.eval_bar.set_orientation(self.board.orientation == chess.WHITE)
 
@@ -401,6 +472,24 @@ class ProfileView(QWidget):
         self.prev_btn.setEnabled(on_main and self.board.mainline_ply > 0)
         self.next_btn.setEnabled(on_main and self.board.mainline_ply < len(self.board.mainline_sans))
         self.mainline_btn.setEnabled(not on_main)
+
+    def _update_move_counter(self) -> None:
+        # len(move_stack) is the half-move ("ply") count on the board's
+        # ACTUAL current position -- unlike mainline_ply, this stays
+        # correct on a branched sideline and even with no loaded game at
+        # all (e.g. a bookmark's raw FEN, or just moving pieces around).
+        ply = len(self.board.board.move_stack)
+        if ply == 0:
+            self.move_counter_label.setText(
+                f'<div style="color:{HEADER_COLOR}; font-weight:bold; font-size:13pt;">Start</div>'
+            )
+            return
+        move_number = ply // 2 + 1
+        side_to_move = "White" if self.board.board.turn else "Black"
+        self.move_counter_label.setText(
+            f'<div style="color:{HEADER_COLOR}; font-weight:bold; font-size:13pt;">Move {move_number}</div>'
+            f'<div style="color:{MUTED_COLOR}; font-size:9pt;">{side_to_move} to move</div>'
+        )
 
     # --- Live board-query archive filter -----------------------------------
 

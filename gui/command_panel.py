@@ -115,6 +115,10 @@ class CommandPanel(QWidget):
     # Emitted when a move is clicked in a /review table, so the board can
     # jump straight to the position right after that move.
     move_requested = Signal(int, int)  # game_id, ply
+    # Emitted with the rendered /review HTML instead of printing it into the
+    # chat -- ProfileView shows it in a dedicated panel under the board.
+    # Second arg is the ply to scroll/highlight to, or -1 for none.
+    review_ready = Signal(str, int)
 
     def __init__(
         self, db: DbReader, cli: TempoCli, cache: AnalysisCache, engine: EngineManager,
@@ -150,6 +154,13 @@ class CommandPanel(QWidget):
         self._llm_history: list[dict] = []
         self._llm_start: QTextCursor | None = None
         self._llm_end: QTextCursor | None = None
+
+        # The data behind whatever review is currently shown in ProfileView's
+        # panel, kept around so set_review_ply can cheaply re-render with a
+        # different highlighted move as the board's position changes --
+        # no re-analysis, just re-formatting the same already-computed data.
+        self._last_review_data: dict | None = None
+        self._last_review_game_id: int | None = None
 
         self.output = QTextBrowser()
         self.output.setReadOnly(True)
@@ -579,8 +590,13 @@ class CommandPanel(QWidget):
                 self._print_error("usage: /review <id>")
                 return
             game_id = int(args[0])
-            self._run_review(game_id)
+            # game_requested first, then _run_review -- ProfileView.load_game
+            # (which game_requested triggers) clears any stale review panel
+            # content from a previously-loaded game; doing it in this order
+            # means that clear happens before this command's own review is
+            # rendered, not after (which would immediately wipe it again).
             self.game_requested.emit(game_id)
+            self._run_review(game_id)
         elif cmd == "fetch":
             self._dispatch_fetch(args)
         else:
@@ -650,6 +666,42 @@ class CommandPanel(QWidget):
             worker.request_cancel()
             worker.wait(2000)
 
+    def _emit_review(self, data: dict, game_id: int) -> None:
+        """Renders a /review table into the dedicated panel under the board
+        (see review_ready, connected in ProfileView) instead of the chat --
+        the chat just gets a short breadcrumb so it's clear the command did
+        something. Stores `data` so set_review_ply can cheaply re-render
+        with a different move highlighted as the board's position changes,
+        without redoing any analysis/cache lookup."""
+        self._last_review_data = data
+        self._last_review_game_id = game_id
+        # No highlight yet -- by the time this runs the board's already
+        # been reset to the game's start (see the load-before-review
+        # ordering note in _dispatch's "review" branch), so there's no
+        # move played yet to highlight.
+        html = self._format_review(data, game_id)
+        self.review_ready.emit(html, -1)
+        self._print(f'<span style="color:{MUTED_COLOR}">Move review for game #{game_id} shown below the board.</span>')
+
+    def set_review_ply(self, game_id: int, ply: int) -> None:
+        """Re-renders the currently-shown review with `ply` highlighted and
+        scrolled into view -- called from ProfileView whenever the board's
+        position changes while that game's review is on screen. No-op if
+        the panel isn't currently showing `game_id`'s review (e.g. a
+        different, unreviewed game is loaded, or no review has been run
+        yet in this tab)."""
+        if self._last_review_data is None or game_id != self._last_review_game_id:
+            return
+        html = self._format_review(self._last_review_data, game_id, current_ply=ply)
+        self.review_ready.emit(html, ply)
+
+    def clear_review_state(self) -> None:
+        """Called from ProfileView.load_game() when switching to a
+        different game, so a later set_review_ply() call for the old game
+        (e.g. a stray queued signal) doesn't re-render stale data."""
+        self._last_review_data = None
+        self._last_review_game_id = None
+
     def _run_review(self, game_id: int) -> None:
         """Renders /review for `game_id`: instant if Stockfish isn't set
         up (today's basic evaluator, unchanged) or if a matching analysis
@@ -668,7 +720,7 @@ class CommandPanel(QWidget):
         cache_rows = self.cache.get_full(game_id, total_plies, ENGINE_ID, version, BATCH_SETTING_KEY)
         if cache_rows is not None:
             payload = build_stockfish_review_payload(detail, cache_rows, version, BATCH_DEPTH)
-            self._print(self._format_review(payload, game_id))
+            self._emit_review(payload, game_id)
             return
 
         # /review and the LLM assistant's run_batch_analysis tool both
@@ -696,7 +748,7 @@ class CommandPanel(QWidget):
             if rows is None:
                 return False
             payload = build_stockfish_review_payload(detail, rows, version, BATCH_DEPTH)
-            self._print(self._format_review(payload, game_id))
+            self._emit_review(payload, game_id)
             return True
 
         def clear_review_worker_if_current() -> None:
@@ -749,7 +801,7 @@ class CommandPanel(QWidget):
         except TempoCliError as e:
             self._print_error(str(e))
             return
-        self._print(self._format_review(build_basic_review_payload(data), game_id))
+        self._emit_review(build_basic_review_payload(data), game_id)
 
     # --- LLM assistant (free-text questions) --------------------------------
 
@@ -1208,7 +1260,7 @@ class CommandPanel(QWidget):
     _SEVERITY_COLORS = {"blunder": ERROR_COLOR, "mistake": "#e0a030", "inaccuracy": "#d4c840"}
     _SEVERITY_LABELS = {"blunder": "Blunder", "mistake": "Mistake", "inaccuracy": "Inaccuracy"}
 
-    def _format_review(self, data: dict, game_id: int) -> str:
+    def _format_review(self, data: dict, game_id: int, current_ply: int = -1) -> str:
         g, evals = data["game"], data["evals"]
         mates = data.get("mates", {})
         best_moves = data.get("best_moves", {})
@@ -1235,7 +1287,16 @@ class CommandPanel(QWidget):
             if best:
                 link += (f'<br><span style="color:{MUTED_COLOR}; font-size:smaller;">'
                          f'engine likes: {_esc(best)}</span>')
-            return link
+            # A named anchor at every ply (not just the highlighted one) so
+            # ProfileView can always scrollToAnchor() the current move into
+            # view, whichever it ends up being. The highlight itself is
+            # just a background pill around the link+eval -- Qt's rich-text
+            # subset has no real glow/box-shadow, so a solid contrasting
+            # background is the closest "stands out" effect available.
+            anchor = f'<a name="ply-{ply}"></a>'
+            if ply == current_ply:
+                return f'{anchor}<span style="background-color:#2d4a6b; border:1px solid {HEADER_COLOR}; border-radius:4px; padding:2px 5px;">{link}</span>'
+            return anchor + link
 
         rows = []
         for i in range(0, len(g["moves"]), 2):
