@@ -185,7 +185,7 @@ _BASE_TOOLS: list[dict] = [
     },
     {
         "name": "summarize_cached_analysis",
-        "description": f"Aggregates already-cached Stockfish analysis across up to {llm_settings.MAX_SUMMARIZE_GAMES} games into blunder/mistake/inaccuracy counts by game phase, plus a handful of concrete example moves. Only reads what's already cached -- never returns raw per-ply data.",
+        "description": f"Aggregates already-cached Stockfish analysis across up to {llm_settings.MAX_SUMMARIZE_GAMES} games into blunder/mistake/inaccuracy counts by game phase, per-game and average accuracy percentages (lichess-style, for the user's own color), plus a handful of concrete example moves. Only reads what's already cached -- never returns raw per-ply data.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -369,8 +369,8 @@ class ToolExecutor:
         version = engine_module.engine_version()
         if version is None:
             return {
-                "summary": {"blunders": 0, "mistakes": 0, "inaccuracies": 0, "by_phase": {"opening": 0, "middlegame": 0, "endgame": 0}},
-                "examples": [], "skipped_uncached_game_ids": list(game_ids),
+                "summary": {"blunders": 0, "mistakes": 0, "inaccuracies": 0, "by_phase": {"opening": 0, "middlegame": 0, "endgame": 0}, "average_accuracy": None},
+                "accuracy_by_game": {}, "examples": [], "skipped_uncached_game_ids": list(game_ids),
             }
 
         counts = {"blunders": 0, "mistakes": 0, "inaccuracies": 0}
@@ -378,6 +378,8 @@ class ToolExecutor:
         examples: list[dict] = []
         skipped: list[int] = []
         plural = {"blunder": "blunders", "mistake": "mistakes", "inaccuracy": "inaccuracies"}
+        accuracy_by_game: dict[int, dict] = {}
+        your_accuracies: list[float] = []
 
         for game_id in game_ids:
             detail = self.ctx.db.load_game(game_id)
@@ -396,7 +398,20 @@ class ToolExecutor:
                 if len(examples) < 5:
                     examples.append({"game_id": game_id, "ply": ply, "san": detail.moves[ply].san, "severity": severity})
 
-        return {"summary": {**counts, "by_phase": by_phase}, "examples": examples, "skipped_uncached_game_ids": skipped}
+            accuracy = payload.get("accuracy")
+            if accuracy:
+                accuracy_by_game[game_id] = accuracy
+                your_accuracy = accuracy.get(detail.your_color)
+                if your_accuracy is not None:
+                    your_accuracies.append(your_accuracy)
+
+        average_accuracy = sum(your_accuracies) / len(your_accuracies) if your_accuracies else None
+        return {
+            "summary": {**counts, "by_phase": by_phase, "average_accuracy": average_accuracy},
+            "accuracy_by_game": accuracy_by_game,
+            "examples": examples,
+            "skipped_uncached_game_ids": skipped,
+        }
 
     def _tool_get_repertoire_stats(self, inp: dict) -> dict:
         return self.ctx.cli.explorer(inp["color"], inp.get("sequence") or [])

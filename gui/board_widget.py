@@ -37,6 +37,18 @@ ARROW_COLORS = {
 # value expressed in the external pixel size would end up scaled twice.
 ARROW_STYLE = f'<style>.arrow {{ stroke-width: {chess.svg.SQUARE_SIZE * 0.08:.1f}px; }}</style>'
 
+# Selection highlighting: chess.svg's `squares=` parameter (the old
+# approach) draws a literal black-and-white X on top of the square,
+# obscuring whatever piece is there -- not what "select this piece" should
+# look like. `fill=` instead tints the square itself (drawn beneath the
+# piece, like a highlighted background), which is what every other chess
+# GUI does for this. Selected square gets a warm highlight (the near-
+# universal convention); each square the selected piece can legally reach
+# gets a softer, distinctly-colored tint so the two read as different
+# things at a glance.
+SELECTED_SQUARE_COLOR = "#f6f66999"
+LEGAL_MOVE_COLOR = "#4a90d270"
+
 
 class BoardWidget(QSvgWidget):
     # Emitted whenever on_mainline or mainline_ply changes, so surrounding
@@ -245,6 +257,13 @@ class BoardWidget(QSvgWidget):
                 continue  # already drawn (e.g. as the best move) -- don't double up
             arrows.append(chess.svg.Arrow(move.from_square, move.to_square, color=color))
             drawn_squares.add((move.from_square, move.to_square))
+        fill: dict[chess.Square, str] = {}
+        if self.selected_square is not None:
+            fill[self.selected_square] = SELECTED_SQUARE_COLOR
+            for move in self.board.legal_moves:
+                if move.from_square == self.selected_square:
+                    fill[move.to_square] = LEGAL_MOVE_COLOR
+
         svg = chess.svg.board(
             self.board,
             size=self.board_size,
@@ -252,7 +271,7 @@ class BoardWidget(QSvgWidget):
             orientation=self.orientation,
             lastmove=self._last_move,
             check=check_square,
-            squares=chess.SquareSet([self.selected_square]) if self.selected_square is not None else None,
+            fill=fill,
             arrows=arrows,
             colors=ARROW_COLORS,
         )

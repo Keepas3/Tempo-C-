@@ -10,6 +10,7 @@ import html
 import chess
 import chess.engine
 from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -21,7 +22,6 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QPushButton,
     QSplitter,
-    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 from analysis_cache import AnalysisCache
 from board_widget import BOARD_SIZE, BoardWidget
 from bookmarks import Bookmark, Bookmarks
-from colors import HEADER_COLOR, MUTED_COLOR
+from colors import HEADER_COLOR, LOSS_COLOR, MUTED_COLOR, WIN_COLOR
 from command_panel import CommandPanel
 from db_reader import DbReader, game_summary_to_row
 import engine as engine_module
@@ -137,7 +137,6 @@ class ProfileView(QWidget):
         self.command_panel.game_requested.connect(self.load_game)
         self.command_panel.move_requested.connect(self._on_move_requested)
         self.command_panel.archive_updated.connect(self.browser.refresh)
-        self.command_panel.review_ready.connect(self._on_review_ready)
         self.board.position_changed.connect(self._update_nav_buttons)
         self.board.position_changed.connect(self._on_position_changed_for_live_query)
         self.board.position_changed.connect(self._on_position_changed_for_live_eval)
@@ -290,7 +289,11 @@ class ProfileView(QWidget):
         self.multipv_checkbox.toggled.connect(self._on_multipv_toggled)
         self.multipv_lines_label = QLabel("")
         # Rich text so each line can be a clickable move link (see
-        # _render_multipv_lines/_on_multipv_move_clicked below).
+        # _render_multipv_lines/_on_multipv_move_clicked below). Default
+        # QLabel styling here was tiny and plain black -- bump the font up
+        # to match the rest of the app's text instead of inheriting Qt's
+        # small default.
+        self.multipv_lines_label.setFont(QFont("Segoe UI", 11))
         self.multipv_lines_label.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse)
         self.multipv_lines_label.setOpenExternalLinks(False)
         self.multipv_lines_label.linkActivated.connect(self._on_multipv_move_clicked)
@@ -319,17 +322,6 @@ class ProfileView(QWidget):
         multipv_column = QVBoxLayout()
         multipv_column.addLayout(multipv_row)
         multipv_column.addWidget(self.multipv_lines_label)
-
-        # /review's move-by-move table, shown here instead of in the chat --
-        # hidden until a review actually renders (see _on_review_ready), so
-        # it doesn't sit as an empty box before one's ever been shown. Its
-        # own scrollbar (rather than letting it grow unbounded) keeps a long
-        # game's move list from pushing the whole center column out of view.
-        self.review_panel = QTextBrowser()
-        self.review_panel.setOpenLinks(False)  # handled ourselves -- see _on_review_anchor_clicked
-        self.review_panel.anchorClicked.connect(self._on_review_anchor_clicked)
-        self.review_panel.setMaximumHeight(320)
-        self.review_panel.hide()
 
         self._refresh_engine_status_row()
 
@@ -362,7 +354,6 @@ class ProfileView(QWidget):
         layout.addLayout(bookmark_row)
         layout.addLayout(engine_row)
         layout.addLayout(multipv_column)
-        layout.addWidget(self.review_panel)
         layout.addStretch(1)
 
         container = QWidget()
@@ -389,11 +380,9 @@ class ProfileView(QWidget):
         self.current_game_id = game_id
         # Clear any review left over from a previous game -- if this load is
         # about to be followed by a fresh review (e.g. the archive's "show
-        # review on select" checkbox), _on_review_ready repopulates it right
-        # after; this just prevents a stale, now-mismatched review lingering
-        # on screen in the meantime.
-        self.review_panel.clear()
-        self.review_panel.hide()
+        # review on select" checkbox), CommandPanel repopulates its review
+        # block right after; this just prevents a stale, now-mismatched
+        # review lingering in the chat in the meantime.
         self.command_panel.clear_review_state()
         sans = [m.san for m in detail.moves]
         self.board.load_game(sans)
@@ -423,39 +412,17 @@ class ProfileView(QWidget):
             self.load_game(game_id)
         self.board.set_ply(ply)
 
-    def _on_review_ready(self, html: str, ply: int) -> None:
-        self.review_panel.setHtml(html)
-        self.review_panel.show()
-        if ply >= 0:
-            # Keeps whichever move is highlighted actually visible as you
-            # step through a long game, instead of the highlight silently
-            # moving off-screen -- re-setting the HTML resets scroll
-            # position, so this has to run after every setHtml, not just
-            # the first one. ("ply-N" is a named anchor _format_review
-            # embeds at every move, not just the highlighted one.)
-            self.review_panel.scrollToAnchor(f"ply-{ply}")
-
     def _on_position_changed_for_review_highlight(self) -> None:
-        if self.review_panel.isHidden() or self.current_game_id is None:
+        # CommandPanel.set_review_ply no-ops on its own if there's no review
+        # currently shown for this game, so this can call it unconditionally
+        # rather than tracking "is a review visible" here too.
+        if self.current_game_id is None:
             return
         # Sideline moves (explorer click-to-play, manual board moves) have
         # no corresponding row in the review table -- clear the highlight
         # rather than pointing it at the wrong move.
         ply = self.board.mainline_ply if self.board.on_mainline else -1
         self.command_panel.set_review_ply(self.current_game_id, ply)
-
-    def _on_review_anchor_clicked(self, url) -> None:
-        # Same "ply:<game_id>:<ply>" scheme _format_review's move links use
-        # in the chat panel -- reused as-is here since this panel renders
-        # that exact same HTML, just in a different widget.
-        text = url.toString()
-        if not text.startswith("ply:"):
-            return
-        try:
-            game_id_str, ply_str = text[len("ply:"):].split(":")
-        except ValueError:
-            return
-        self._on_move_requested(int(game_id_str), int(ply_str))
 
     def _sync_eval_bar_orientation(self) -> None:
         self.eval_bar.set_orientation(self.board.orientation == chess.WHITE)
@@ -680,20 +647,30 @@ class ProfileView(QWidget):
         for i, line in enumerate(lines, start=1):
             if line["mate"] is not None:
                 score_str = f"M{line['mate']}" if line["mate"] > 0 else f"-M{abs(line['mate'])}"
+                score_color = WIN_COLOR if line["mate"] > 0 else LOSS_COLOR
             elif line["cp"] is not None:
                 score_str = f"{line['cp'] / 100.0:+.2f}"
+                score_color = WIN_COLOR if line["cp"] > 0 else (LOSS_COLOR if line["cp"] < 0 else MUTED_COLOR)
             else:
-                score_str = "--"
+                score_str, score_color = "--", MUTED_COLOR
             move_str = ""
             if line["best_move_uci"]:
                 move = chess.Move.from_uci(line["best_move_uci"])
                 move_str = chess.Board(fen).san(move)
-            text = f"{i}. {score_str}  {html.escape(move_str)}"
+            # One row per candidate line, spaced out and with a clear visual
+            # hierarchy (rank badge / colored score / bold move) instead of
+            # the previous plain "1. +0.34  Nf3" text stacked with <br>.
+            text = (
+                f'<span style="color:{HEADER_COLOR}; font-weight:bold;">{i}.</span>&nbsp;&nbsp;'
+                f'<span style="color:{score_color}; font-weight:bold;">{score_str}</span>&nbsp;&nbsp;'
+                f'<b>{html.escape(move_str)}</b>'
+            )
+            row_html = f'<div style="padding:3px 0;">{text}</div>'
             if move_str:
-                rows.append(f'<a href="play:{html.escape(move_str)}" style="color:inherit; text-decoration:none;">{text}</a>')
+                rows.append(f'<a href="play:{html.escape(move_str)}" style="text-decoration:none; color:inherit;">{row_html}</a>')
             else:
-                rows.append(text)
-        self.multipv_lines_label.setText("<br>".join(rows))
+                rows.append(row_html)
+        self.multipv_lines_label.setText("".join(rows))
         # Faded arrows for the 2nd/3rd-best lines (index 0 is the best move,
         # already drawn by set_best_move_arrow in _on_live_eval_succeeded).
         secondary_moves = [

@@ -16,8 +16,8 @@ COMMANDS = [
     ("/opening", "<query>", "Win/loss record for an opening (name substring or ECO code)"),
     ("/moves", "<sequence>", "What was played after a SAN sequence, e.g. /moves e4 e5 Nf3"),
     ("/explorer", "<white|black>", "Browse your own repertoire move-by-move, lichess-explorer style"),
-    ("/fetch chesscom", "<user> [year month]", "Fetch games from chess.com"),
-    ("/fetch lichess", "<user> [days]", "Fetch games from lichess"),
+    ("/fetch chesscom", "<user>", "Fetch games from chess.com"),
+    ("/fetch lichess", "<user>", "Fetch games from lichess"),
     ("/clear", "", "Clear the chat history"),
     ("/help", "", "Show this list"),
 ]

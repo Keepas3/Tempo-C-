@@ -10,6 +10,7 @@ instead of turning into run-on wrapped paragraphs in a narrow panel.
 from __future__ import annotations
 
 import calendar
+import chess
 import html
 from datetime import datetime, timezone
 from typing import Callable
@@ -23,7 +24,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QProgressDialog,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
@@ -43,7 +43,7 @@ from engine_batch_worker import EngineBatchWorker
 from fetch_worker import FetchWorker
 from llm_tools import build_tools
 from llm_worker import LlmWorker
-from review_data import build_basic_review_payload, build_stockfish_review_payload
+from review_data import build_basic_review_payload, build_moves_only_payload, build_stockfish_review_payload
 from tempo_cli import TempoCli, TempoCliError
 from colors import DRAW_COLOR, ERROR_COLOR, HEADER_COLOR, LOSS_COLOR, MUTED_COLOR, WIN_COLOR
 DEFAULT_OPENINGS_SHOWN = 5
@@ -99,12 +99,12 @@ def _month_year(pgn_date: str) -> str:
 
 
 def _table(headers: list[str], rows: list[list[str]]) -> str:
-    head = "".join(f'<th align="left" style="color:{MUTED_COLOR}; border-bottom:1px solid #555; padding:4px 14px 6px 0;">{_esc(h)}</th>' for h in headers)
+    head = "".join(f'<th align="left" style="color:{MUTED_COLOR}; border-bottom:1px solid #555; padding:2px 12px 4px 0;">{_esc(h)}</th>' for h in headers)
     body = ""
     for row in rows:
-        cells = "".join(f'<td style="padding:4px 14px 4px 0;">{cell}</td>' for cell in row)
+        cells = "".join(f'<td style="padding:2px 12px 2px 0;">{cell}</td>' for cell in row)
         body += f"<tr>{cells}</tr>"
-    return f'<table cellspacing="0" style="width:100%; margin-top:6px;"><tr>{head}</tr>{body}</table>'
+    return f'<table cellspacing="0" style="width:100%; margin-top:4px;"><tr>{head}</tr>{body}</table>'
 
 
 class CommandPanel(QWidget):
@@ -115,10 +115,6 @@ class CommandPanel(QWidget):
     # Emitted when a move is clicked in a /review table, so the board can
     # jump straight to the position right after that move.
     move_requested = Signal(int, int)  # game_id, ply
-    # Emitted with the rendered /review HTML instead of printing it into the
-    # chat -- ProfileView shows it in a dedicated panel under the board.
-    # Second arg is the ply to scroll/highlight to, or -1 for none.
-    review_ready = Signal(str, int)
 
     def __init__(
         self, db: DbReader, cli: TempoCli, cache: AnalysisCache, engine: EngineManager,
@@ -132,7 +128,6 @@ class CommandPanel(QWidget):
         self.bookmarks = bookmarks
         self.get_current_fen = get_current_fen
         self._review_worker: EngineBatchWorker | None = None
-        self._review_progress: QProgressDialog | None = None
         # Workers that have been asked to cancel but haven't emitted
         # QThread's built-in `finished` signal yet -- kept referenced here
         # until they actually stop, so overwriting self._review_worker with
@@ -155,12 +150,14 @@ class CommandPanel(QWidget):
         self._llm_start: QTextCursor | None = None
         self._llm_end: QTextCursor | None = None
 
-        # The data behind whatever review is currently shown in ProfileView's
-        # panel, kept around so set_review_ply can cheaply re-render with a
+        # The data behind whatever review is currently shown in the chat,
+        # kept around so set_review_ply can cheaply re-render with a
         # different highlighted move as the board's position changes --
         # no re-analysis, just re-formatting the same already-computed data.
         self._last_review_data: dict | None = None
         self._last_review_game_id: int | None = None
+        self._review_block_start: QTextCursor | None = None
+        self._review_block_end: QTextCursor | None = None
 
         self.output = QTextBrowser()
         self.output.setReadOnly(True)
@@ -558,6 +555,7 @@ class CommandPanel(QWidget):
             self._explorer_end = None
             self._llm_start = None
             self._llm_end = None
+            self.clear_review_state()
             self._print(WELCOME_TEXT)  # clear wipes the whole document -- put the welcome hint back
         elif cmd == "opening":
             if not args:
@@ -619,18 +617,14 @@ class CommandPanel(QWidget):
             self._print_error(str(e))
 
     def _cancel_active_review(self) -> None:
-        """Cancels any in-flight batch review before starting a new one, and
-        closes its progress dialog immediately (rather than leaving two
-        dialogs on screen). The old worker's thread may take a moment to
-        actually stop -- see _retire_review_worker for how its QThread
-        wrapper is kept alive (not orphaned) until it genuinely does."""
+        """Cancels any in-flight batch review before starting a new one.
+        The old worker's thread may take a moment to actually stop -- see
+        _retire_review_worker for how its QThread wrapper is kept alive
+        (not orphaned) until it genuinely does."""
         if self._review_worker is not None:
             if self._review_worker.isRunning():
                 self._review_worker.request_cancel()
             self._review_worker = None
-        if self._review_progress is not None:
-            self._review_progress.close()
-            self._review_progress = None
 
     def _retire_review_worker(self, worker: EngineBatchWorker) -> None:
         """Connected to QThread's built-in `finished` signal (emitted once
@@ -667,12 +661,21 @@ class CommandPanel(QWidget):
             worker.wait(2000)
 
     def _emit_review(self, data: dict, game_id: int) -> None:
-        """Renders a /review table into the dedicated panel under the board
-        (see review_ready, connected in ProfileView) instead of the chat --
-        the chat just gets a short breadcrumb so it's clear the command did
-        something. Stores `data` so set_review_ply can cheaply re-render
-        with a different move highlighted as the board's position changes,
-        without redoing any analysis/cache lookup."""
+        """Renders /review's move-by-move table into the chat, in its own
+        tracked block (like /stats, /opening, /explorer -- see
+        _insert_tracked_block) so set_review_ply -- and this method itself,
+        called again for the same game as a batch analysis progresses from
+        "just the moves" to fully evaluated -- can cheaply update just this
+        block in place, without re-appending a second copy or disturbing
+        the rest of the chat history. A genuinely new /review (a different
+        game, or nothing shown yet) still inserts a fresh block, so past
+        reviews remain in the chat history rather than being overwritten.
+        Stores `data` too, so a later highlight update is pure
+        re-formatting -- no re-analysis or cache lookup."""
+        replace_existing = (
+            self._review_block_start is not None and self._review_block_end is not None
+            and self._last_review_game_id == game_id
+        )
         self._last_review_data = data
         self._last_review_game_id = game_id
         # No highlight yet -- by the time this runs the board's already
@@ -680,33 +683,52 @@ class CommandPanel(QWidget):
         # ordering note in _dispatch's "review" branch), so there's no
         # move played yet to highlight.
         html = self._format_review(data, game_id)
-        self.review_ready.emit(html, -1)
-        self._print(f'<span style="color:{MUTED_COLOR}">Move review for game #{game_id} shown below the board.</span>')
+        if replace_existing:
+            self._review_block_end = self._replace_tracked_block(self._review_block_start, self._review_block_end, html)
+        else:
+            self._review_block_start, self._review_block_end = self._insert_tracked_block(html)
 
     def set_review_ply(self, game_id: int, ply: int) -> None:
         """Re-renders the currently-shown review with `ply` highlighted and
         scrolled into view -- called from ProfileView whenever the board's
         position changes while that game's review is on screen. No-op if
-        the panel isn't currently showing `game_id`'s review (e.g. a
+        the chat isn't currently showing `game_id`'s review (e.g. a
         different, unreviewed game is loaded, or no review has been run
         yet in this tab)."""
         if self._last_review_data is None or game_id != self._last_review_game_id:
             return
+        if self._review_block_start is None or self._review_block_end is None:
+            return
         html = self._format_review(self._last_review_data, game_id, current_ply=ply)
-        self.review_ready.emit(html, ply)
+        self._review_block_end = self._replace_tracked_block(self._review_block_start, self._review_block_end, html)
+        if ply >= 0:
+            # Keeps whichever move is highlighted actually visible as you
+            # step through a long game, instead of the highlight silently
+            # moving off-screen. _replace_tracked_block deliberately
+            # restores the scroll position it had before the edit (so
+            # unrelated block updates elsewhere don't yank the view around)
+            # -- this scrollToAnchor is a separate, deliberate move on top
+            # of that, not a fight against it.
+            self.output.scrollToAnchor(f"ply-{ply}")
 
     def clear_review_state(self) -> None:
         """Called from ProfileView.load_game() when switching to a
         different game, so a later set_review_ply() call for the old game
-        (e.g. a stray queued signal) doesn't re-render stale data."""
+        (e.g. a stray queued signal) doesn't re-render stale data into a
+        block that no longer matches what's on the board."""
         self._last_review_data = None
         self._last_review_game_id = None
+        self._review_block_start = None
+        self._review_block_end = None
 
     def _run_review(self, game_id: int) -> None:
-        """Renders /review for `game_id`: instant if Stockfish isn't set
-        up (today's basic evaluator, unchanged) or if a matching analysis
-        is already cached; otherwise runs a background batch analysis with
-        a real, cancellable progress dialog first."""
+        """Renders /review for `game_id`: instant if Stockfish isn't set up
+        (today's basic evaluator, unchanged) or if a matching analysis is
+        already cached. Otherwise, shows the game's plain move list right
+        away (build_moves_only_payload) -- no waiting on the engine just to
+        see what was played -- and runs the batch analysis in the
+        background, updating that same chat block in place (first with
+        live progress, then with the real evals) once it's actually done."""
         if not engine_is_available():
             self._print_basic_review(game_id)
             return
@@ -732,16 +754,30 @@ class CommandPanel(QWidget):
         missing = self.cache.get_missing_plies(game_id, total_plies, ENGINE_ID, version, BATCH_SETTING_KEY)
         sans = [m.san for m in detail.moves]
 
-        progress = QProgressDialog(f"Analyzing game #{game_id} with {version}...", "Cancel", 0, len(missing), self)
-        progress.setWindowTitle("Engine analysis")
-        progress.setMinimumDuration(0)
-        progress.setValue(0)
+        self._emit_review(build_moves_only_payload(detail, f"Analyzing with {version}... (0/{len(missing)})"), game_id)
 
         worker = EngineBatchWorker(self.db.db_path, sans, self.engine, self.cache, game_id, version, missing, self)
 
+        # This review may since have been superseded by a newer one (a
+        # different game, triggered while this one was still analyzing in
+        # the background) -- in that case self._last_review_game_id has
+        # already moved on, and none of these callbacks should touch the
+        # chat anymore: there's no longer a block here that's "this
+        # review's" to update, and inserting a fresh one would land out of
+        # place, disconnected from the (now-frozen) pending block it
+        # belongs after.
+        def is_current() -> bool:
+            return self._last_review_game_id == game_id
+
         def on_progress(done: int, total: int) -> None:
-            progress.setMaximum(total)
-            progress.setValue(done)
+            if not is_current():
+                return
+            # Updates every few plies rather than every single one -- the
+            # numbers moving that granularly isn't worth a full block
+            # replace that often, especially on a long game.
+            if done != total and done % 5 != 0:
+                return
+            self._emit_review(build_moves_only_payload(detail, f"Analyzing with {version}... ({done}/{total})"), game_id)
 
         def render_from_cache() -> bool:
             rows = self.cache.get_full(game_id, total_plies, ENGINE_ID, version, BATCH_SETTING_KEY)
@@ -766,34 +802,34 @@ class CommandPanel(QWidget):
 
         def on_succeeded() -> None:
             clear_review_worker_if_current()
-            progress.close()
+            if not is_current():
+                return
             if not render_from_cache():
                 self._print_error("analysis completed but the cache read failed unexpectedly")
 
         def on_cancelled() -> None:
             clear_review_worker_if_current()
-            progress.close()
+            if not is_current():
+                return
             if not render_from_cache():
                 self._print(f'<span style="color:{MUTED_COLOR}">Analysis cancelled -- showing basic evaluator.</span>')
                 self._print_basic_review(game_id)
 
         def on_failed(message: str) -> None:
             clear_review_worker_if_current()
-            progress.close()
+            if not is_current():
+                return
             self._print_error(f"engine analysis failed: {message}")
             self._print_basic_review(game_id)
 
-        progress.canceled.connect(worker.request_cancel)
         worker.progress.connect(on_progress)
         worker.succeeded.connect(on_succeeded)
         worker.cancelled.connect(on_cancelled)
         worker.failed.connect(on_failed)
         worker.finished.connect(lambda w=worker: self._retire_review_worker(w))
         self._retiring_review_workers.append(worker)
-        self._review_progress = progress
         self._review_worker = worker
         worker.start()
-        progress.show()
 
     def _print_basic_review(self, game_id: int) -> None:
         try:
@@ -875,23 +911,19 @@ class CommandPanel(QWidget):
         )
 
     def _dispatch_fetch(self, args: list[str]) -> None:
-        if len(args) < 2:
-            self._print_error("usage: /fetch chesscom <user> [year month]  |  /fetch lichess <user> [days]")
+        # No date/day-count args here -- the Range combo above already
+        # filters /stats and /opening by date after the fact, so /fetch
+        # just always pulls the user's full history instead of also making
+        # you think about a separate date range at fetch time.
+        if len(args) != 2:
+            self._print_error("usage: /fetch chesscom <user>  |  /fetch lichess <user>")
             return
         site, username = args[0], args[1]
 
         if site == "chesscom":
-            if len(args) == 4:
-                year, month = int(args[2]), int(args[3])
-                fetch_fn = lambda: self.cli.fetch_chesscom(username, year, month)
-            elif len(args) == 2:
-                fetch_fn = lambda: self.cli.fetch_chesscom(username)
-            else:
-                self._print_error("usage: /fetch chesscom <user> [year month] (both or neither)")
-                return
+            fetch_fn = lambda: self.cli.fetch_chesscom(username)
         elif site == "lichess":
-            days = int(args[2]) if len(args) >= 3 else None
-            fetch_fn = lambda: self.cli.fetch_lichess(username, days)
+            fetch_fn = lambda: self.cli.fetch_lichess(username)
         else:
             self._print_error(f"unknown fetch site '{site}' (expected chesscom or lichess)")
             return
@@ -1257,8 +1289,10 @@ class CommandPanel(QWidget):
             header += f'<br><span style="color:{MUTED_COLOR}">Opening:</span> {_esc(g["opening"])} ({_esc(g.get("eco", ""))})'
         return header
 
-    _SEVERITY_COLORS = {"blunder": ERROR_COLOR, "mistake": "#e0a030", "inaccuracy": "#d4c840"}
-    _SEVERITY_LABELS = {"blunder": "Blunder", "mistake": "Mistake", "inaccuracy": "Inaccuracy"}
+    _SEVERITY_COLORS = {
+        "blunder": ERROR_COLOR, "mistake": "#e0a030", "inaccuracy": "#d4c840", "best": WIN_COLOR,
+    }
+    _SEVERITY_LABELS = {"blunder": "Blunder", "mistake": "Mistake", "inaccuracy": "Inaccuracy", "best": "Best"}
 
     def _format_review(self, data: dict, game_id: int, current_ply: int = -1) -> str:
         g, evals = data["game"], data["evals"]
@@ -1267,26 +1301,62 @@ class CommandPanel(QWidget):
         severities = data.get("severities", {})
         engine_label = data.get("engine_label")
 
+        # Advanced one move at a time as move_link() is called (always in
+        # game order -- see the rows loop below), so at the moment each
+        # move is being formatted this board is in the position BEFORE that
+        # move -- exactly where best_moves[idx]'s suggested alternative
+        # applies, which is what's needed to convert its UCI into the
+        # correct SAN (e.g. "Nf3" rather than "g1f3": SAN is position-
+        # dependent, since the same destination square can be reachable by
+        # more than one piece).
+        replay = chess.Board()
+
         def move_link(ply: int) -> str:
             # ply here is the position AFTER this move is played (1-based);
             # idx is the 0-based index used by g["moves"]/evals/mates/etc.
             idx = ply - 1
-            san = _esc(g["moves"][idx]["san"])
+            moved_san = g["moves"][idx]["san"]
+            san = _esc(moved_san)
             if idx in mates:
                 mate_n = mates[idx]
                 ev_text = f"M{mate_n}" if mate_n > 0 else f"-M{abs(mate_n)}"
-            else:
+                ev = f' <span style="color:{MUTED_COLOR}">[{ev_text}]</span>'
+            elif evals[idx] is not None:
                 ev_text = f"{evals[idx] / 100.0:+.2f}"
-            ev = f'<span style="color:{MUTED_COLOR}">[{ev_text}]</span>'
-            link = (f'<a href="ply:{game_id}:{ply}" style="color:{HEADER_COLOR}; text-decoration:none;">{san}</a> {ev}')
+                ev = f' <span style="color:{MUTED_COLOR}">[{ev_text}]</span>'
+            else:
+                ev = ""  # not evaluated yet -- a batch analysis may still be running in the background
+            link = (f'<a href="ply:{game_id}:{ply}" style="color:{HEADER_COLOR}; text-decoration:none;">{san}</a>{ev}')
+
+            best_uci = best_moves.get(idx)
+            best_san = None
+            if best_uci:
+                try:
+                    best_san = replay.san(chess.Move.from_uci(best_uci))
+                except (ValueError, AssertionError):
+                    best_san = best_uci  # defensive fallback -- shouldn't happen for a legally-cached move
+
+            # Everything here stays on this one line (no <br>) -- a second
+            # line per move, for every move, was most of why this table
+            # used to run so tall. Exactly one small tag per move once
+            # there's anything to base one on: a bad move gets its
+            # severity plus a compact "-> alternative"; an exact match to
+            # the engine's own top choice gets "Best"; anything else
+            # reasonable (neither flagged nor literally the top choice)
+            # gets a bare checkmark instead of a wordier "Good" -- still a
+            # positive signal, at effectively no extra width.
             severity = severities.get(idx)
             if severity:
-                link += (f' <span style="color:{self._SEVERITY_COLORS[severity]}">'
+                link += (f' <span style="color:{self._SEVERITY_COLORS[severity]}; font-size:smaller;">'
                          f'{self._SEVERITY_LABELS[severity]}</span>')
-            best = best_moves.get(idx)
-            if best:
-                link += (f'<br><span style="color:{MUTED_COLOR}; font-size:smaller;">'
-                         f'engine likes: {_esc(best)}</span>')
+                if best_san and best_san != moved_san:
+                    link += f' <span style="color:{MUTED_COLOR}; font-size:smaller;">&rarr; {_esc(best_san)}</span>'
+            elif best_san is not None and best_san == moved_san:
+                link += f' <span style="color:{WIN_COLOR}; font-size:smaller;">Best</span>'
+            elif best_san is not None:
+                link += f' <span style="color:{WIN_COLOR}; font-size:smaller;" title="Good move">&#10003;</span>'
+
+            replay.push_san(moved_san)  # advance to AFTER this move, ready for the next call
             # A named anchor at every ply (not just the highlighted one) so
             # ProfileView can always scrollToAnchor() the current move into
             # view, whichever it ends up being. The highlight itself is
@@ -1305,5 +1375,28 @@ class CommandPanel(QWidget):
             black_move = move_link(i + 2) if i + 1 < len(g["moves"]) else ""
             rows.append([str(move_no), white_move, black_move])
 
-        banner = f'<div style="color:{MUTED_COLOR}">Evaluated with: {_esc(engine_label)}</div>' if engine_label else ""
-        return self._format_game_header(g) + banner + _table(["#", "White", "Black"], rows)
+        status_text = data.get("status_text")
+        if status_text:
+            banner = f'<div style="color:{MUTED_COLOR}">{_esc(status_text)}</div>'
+        elif engine_label:
+            banner = f'<div style="color:{MUTED_COLOR}">Evaluated with: {_esc(engine_label)}</div>'
+        else:
+            banner = ""
+
+        accuracy_html = ""
+        accuracy = data.get("accuracy")
+        if accuracy and accuracy.get("white") is not None and accuracy.get("black") is not None:
+            # Color-graded per number, reusing colors already used for
+            # severity tags elsewhere in this same table (no new colors
+            # introduced) -- an approximation of chess.com's own
+            # color-banding convention, not a claim of matching their
+            # exact thresholds (which, like their formula, aren't public).
+            def _acc_span(pct: float) -> str:
+                color = WIN_COLOR if pct >= 80 else (self._SEVERITY_COLORS["mistake"] if pct >= 60 else ERROR_COLOR)
+                return f'<span style="color:{color}">{pct:.1f}%</span>'
+            accuracy_html = (
+                f'<div style="color:{MUTED_COLOR}">Accuracy:&nbsp;&nbsp;White {_acc_span(accuracy["white"])}'
+                f'&nbsp;&nbsp;&nbsp;Black {_acc_span(accuracy["black"])}</div>'
+            )
+
+        return self._format_game_header(g) + banner + accuracy_html + _table(["#", "White", "Black"], rows)

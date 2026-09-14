@@ -90,17 +90,11 @@ class TempoCli:
     def review(self, game_id: int) -> dict:
         return self.run("review", str(game_id))
 
-    def fetch_chesscom(self, username: str, year: int | None = None, month: int | None = None) -> dict:
-        args = ["fetch", "chesscom", username]
-        if year is not None and month is not None:
-            args += [str(year), str(month)]
-        return self.run(*args, timeout=90)
+    def fetch_chesscom(self, username: str) -> dict:
+        return self.run("fetch", "chesscom", username, timeout=90)
 
-    def fetch_lichess(self, username: str, days: int | None = None) -> dict:
-        args = ["fetch", "lichess", username]
-        if days is not None:
-            args.append(str(days))
-        return self.run(*args, timeout=90)
+    def fetch_lichess(self, username: str) -> dict:
+        return self.run("fetch", "lichess", username, timeout=90)
 
     def last_fetch_status(self) -> dict:
         return self.run("last_fetch")
