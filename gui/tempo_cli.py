@@ -66,6 +66,9 @@ class TempoCli:
     def stats(self, *category_filter: str) -> dict:
         return self.run("stats", *category_filter)
 
+    def rating(self, *category_filter: str) -> dict:
+        return self.run("rating", *category_filter)
+
     def opening(self, query: str, range_token: str = "all") -> dict:
         return self.run("opening", query, range_token)
 
@@ -90,11 +93,13 @@ class TempoCli:
     def review(self, game_id: int) -> dict:
         return self.run("review", str(game_id))
 
-    def fetch_chesscom(self, username: str) -> dict:
-        return self.run("fetch", "chesscom", username, timeout=90)
+    def fetch_chesscom(self, username: str, full: bool = False) -> dict:
+        args = ["fetch", "chesscom", username] + (["full"] if full else [])
+        return self.run(*args, timeout=600 if full else 90)
 
-    def fetch_lichess(self, username: str) -> dict:
-        return self.run("fetch", "lichess", username, timeout=90)
+    def fetch_lichess(self, username: str, full: bool = False) -> dict:
+        args = ["fetch", "lichess", username] + (["full"] if full else [])
+        return self.run(*args, timeout=600 if full else 90)
 
     def last_fetch_status(self) -> dict:
         return self.run("last_fetch")

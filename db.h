@@ -23,6 +23,7 @@ struct GameSummary {
     std::string opening;
     std::string site; // normalized platform label: "Chess.com", "Lichess", or "Unknown"
     std::string time_category; // "Bullet" / "Blitz" / "Rapid" / "Classical" / "Daily" / "Unknown"
+    std::optional<int> your_elo; // rating for *your* color in this game, if the PGN carried one
 };
 
 struct OpeningStat {
@@ -36,6 +37,18 @@ struct TimeControlStat {
     int games = 0;
     double avg_seconds_per_move = -1.0;
     int time_trouble_moves = 0; // moves made with < 10s on the clock
+    int current_rating = -1;    // -1 = no rating data for this category (in the active filter/range)
+    std::string rating_as_of;   // date of the game current_rating came from
+};
+
+// One game's rating data point for *your* color (from Archive::rating_history).
+struct RatingPoint {
+    int game_id = 0;
+    std::string date;
+    std::string time_category; // "Bullet" / "Blitz" / "Rapid" / "Classical" / "Daily" / "Unknown"
+    int rating = 0;
+    std::string opponent;
+    std::string result_display; // "Win" / "Loss" / "Draw" / "?"
 };
 
 struct NextMoveStat {
@@ -149,6 +162,31 @@ inline bool parse_range_token(const std::string& token, std::string& out_min_dat
     return false;
 }
 
+// Parses a sequence of /stats or /rating trailing tokens (each either a
+// game-type category or a date-range token, see normalize_time_category/
+// parse_range_token) starting at args[start], filling category_filter/
+// min_date. Returns "" on success, or an error message describing the
+// first unrecognized token (mirroring the two call sites' previous
+// inline error text) so callers can print it and bail out.
+inline std::string parse_category_and_range_args(
+    const std::vector<std::string>& args, size_t start,
+    std::vector<std::string>& category_filter, std::string& min_date) {
+    for (size_t i = start; i < args.size(); ++i) {
+        std::string range_date;
+        if (parse_range_token(args[i], range_date)) {
+            min_date = range_date;
+            continue;
+        }
+        std::string category = normalize_time_category(args[i]);
+        if (category.empty()) {
+            return "unknown game type or range: " + args[i] +
+                   " (expected bullet, blitz, rapid, classical, daily, 14d/30d/60d/90d/180d, or all)";
+        }
+        category_filter.push_back(category);
+    }
+    return "";
+}
+
 class Archive {
 public:
     explicit Archive(const std::string& path) {
@@ -187,8 +225,8 @@ public:
 
         const char* sql =
             "INSERT OR IGNORE INTO games "
-            "(event, site, date, white, black, result, your_color, eco, opening, time_control, pgn, imported_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?, datetime('now'));";
+            "(event, site, date, white, black, result, your_color, eco, opening, time_control, white_elo, black_elo, pgn, imported_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now'));";
         sqlite3_stmt* stmt = prepare(sql);
         bind_text(stmt, 1, g.event);
         bind_text(stmt, 2, g.site);
@@ -200,10 +238,13 @@ public:
         bind_text(stmt, 8, g.eco);
         bind_text(stmt, 9, g.opening);
         bind_text(stmt, 10, g.time_control);
-        bind_text(stmt, 11, pgn);
+        if (g.white_elo) sqlite3_bind_int(stmt, 11, *g.white_elo); else sqlite3_bind_null(stmt, 11);
+        if (g.black_elo) sqlite3_bind_int(stmt, 12, *g.black_elo); else sqlite3_bind_null(stmt, 12);
+        bind_text(stmt, 13, pgn);
         step_and_finalize(stmt);
 
         if (sqlite3_changes(db_) == 0) {
+            backfill_rating_on_duplicate(g, pgn);
             return -1; // duplicate, ignored
         }
         int game_id = static_cast<int>(sqlite3_last_insert_rowid(db_));
@@ -225,6 +266,42 @@ public:
 
         (void)result_for_color; // reserved for future use (e.g. cached column)
         return game_id;
+    }
+
+    // Called when insert_game hits an already-imported game (INSERT OR
+    // IGNORE matched the UNIQUE(site, date, white, black, result, pgn) key).
+    // An ordinary incremental fetch rarely re-encounters a duplicate, but an
+    // explicit "full" re-fetch (see main.cpp) re-downloads everything and
+    // will hit one for nearly every existing game -- this is how that
+    // re-fetch backfills white_elo/black_elo onto rows that predate this
+    // feature, without ever overwriting a rating already on file.
+    void backfill_rating_on_duplicate(const Game& g, const std::string& pgn) {
+        if (!g.white_elo && !g.black_elo) return;
+
+        const char* find_sql =
+            "SELECT id FROM games WHERE site=? AND date=? AND white=? AND black=? AND result=? AND pgn=?;";
+        sqlite3_stmt* find_stmt = prepare(find_sql);
+        bind_text(find_stmt, 1, g.site);
+        bind_text(find_stmt, 2, g.date);
+        bind_text(find_stmt, 3, g.white);
+        bind_text(find_stmt, 4, g.black);
+        bind_text(find_stmt, 5, g.result);
+        bind_text(find_stmt, 6, pgn);
+
+        int existing_id = -1;
+        if (sqlite3_step(find_stmt) == SQLITE_ROW) {
+            existing_id = sqlite3_column_int(find_stmt, 0);
+        }
+        sqlite3_finalize(find_stmt);
+        if (existing_id < 0) return; // shouldn't happen (IGNORE just matched this key), but don't crash if it does
+
+        const char* update_sql =
+            "UPDATE games SET white_elo = COALESCE(white_elo, ?), black_elo = COALESCE(black_elo, ?) WHERE id = ?;";
+        sqlite3_stmt* update_stmt = prepare(update_sql);
+        if (g.white_elo) sqlite3_bind_int(update_stmt, 1, *g.white_elo); else sqlite3_bind_null(update_stmt, 1);
+        if (g.black_elo) sqlite3_bind_int(update_stmt, 2, *g.black_elo); else sqlite3_bind_null(update_stmt, 2);
+        sqlite3_bind_int(update_stmt, 3, existing_id);
+        step_and_finalize(update_stmt);
     }
 
     // Returns the recorded fetch state for `platform` ("chesscom"/"lichess"),
@@ -267,7 +344,7 @@ public:
 
     std::vector<GameSummary> list_games(int limit) {
         const char* sql =
-            "SELECT id, date, white, black, your_color, result, opening, site, time_control "
+            "SELECT id, date, white, black, your_color, result, opening, site, time_control, white_elo, black_elo "
             "FROM games ORDER BY id DESC LIMIT ?;";
         sqlite3_stmt* stmt = prepare(sql);
         sqlite3_bind_int(stmt, 1, limit);
@@ -286,6 +363,9 @@ public:
             s.time_category = classify_time_control(column_text(stmt, 8));
             s.opponent = (s.your_color == "white") ? black : white;
             s.result_display = result_relative_to(result, s.your_color);
+            std::optional<int> white_elo = column_optional_int(stmt, 9);
+            std::optional<int> black_elo = column_optional_int(stmt, 10);
+            s.your_elo = (s.your_color == "white") ? white_elo : black_elo;
             out.push_back(s);
         }
         sqlite3_finalize(stmt);
@@ -302,7 +382,7 @@ public:
         }
 
         std::string sql =
-            "SELECT id, date, white, black, your_color, result, opening, site, time_control "
+            "SELECT id, date, white, black, your_color, result, opening, site, time_control, white_elo, black_elo "
             "FROM games WHERE ";
         sql += looks_like_eco ? "eco LIKE ? || '%'" : "opening LIKE '%' || ? || '%'";
         sql += " ORDER BY id DESC LIMIT ?;";
@@ -326,6 +406,9 @@ public:
             s.time_category = classify_time_control(column_text(stmt, 8));
             s.opponent = (s.your_color == "white") ? black : white;
             s.result_display = result_relative_to(result, s.your_color);
+            std::optional<int> white_elo = column_optional_int(stmt, 9);
+            std::optional<int> black_elo = column_optional_int(stmt, 10);
+            s.your_elo = (s.your_color == "white") ? white_elo : black_elo;
             out.push_back(s);
         }
         sqlite3_finalize(stmt);
@@ -338,7 +421,7 @@ public:
     // so a substring match would also pull in unrelated sub-variations.
     std::vector<GameSummary> find_games_by_exact_opening(const std::string& name, int limit = 3, const std::string& min_date = "") {
         const char* sql =
-            "SELECT id, date, white, black, your_color, result, opening, site, time_control "
+            "SELECT id, date, white, black, your_color, result, opening, site, time_control, white_elo, black_elo "
             "FROM games WHERE opening = ? ORDER BY id DESC LIMIT ?;";
         sqlite3_stmt* stmt = prepare(sql);
         bind_text(stmt, 1, name);
@@ -359,6 +442,9 @@ public:
             s.time_category = classify_time_control(column_text(stmt, 8));
             s.opponent = (s.your_color == "white") ? black : white;
             s.result_display = result_relative_to(result, s.your_color);
+            std::optional<int> white_elo = column_optional_int(stmt, 9);
+            std::optional<int> black_elo = column_optional_int(stmt, 10);
+            s.your_elo = (s.your_color == "white") ? white_elo : black_elo;
             out.push_back(s);
         }
         sqlite3_finalize(stmt);
@@ -482,7 +568,7 @@ public:
         std::map<int, GameSummary> game_rows; // game_id -> partially-built GameSummary
         {
             sqlite3_stmt* stmt = prepare(
-                "SELECT id, date, white, black, your_color, result, opening, site, time_control FROM games;");
+                "SELECT id, date, white, black, your_color, result, opening, site, time_control, white_elo, black_elo FROM games;");
             while (sqlite3_step(stmt) == SQLITE_ROW) {
                 GameSummary s;
                 int id = sqlite3_column_int(stmt, 0);
@@ -497,6 +583,9 @@ public:
                 s.time_category = classify_time_control(column_text(stmt, 8));
                 s.opponent = (s.your_color == "white") ? black : white;
                 s.result_display = result_relative_to(result, s.your_color);
+                std::optional<int> white_elo = column_optional_int(stmt, 9);
+                std::optional<int> black_elo = column_optional_int(stmt, 10);
+                s.your_elo = (s.your_color == "white") ? white_elo : black_elo;
                 game_rows[id] = s;
             }
             sqlite3_finalize(stmt);
@@ -561,7 +650,57 @@ public:
         stats.top_openings_black = aggregate_openings("black", category_filter, min_date);
         stats.by_time_control = aggregate_time_control(category_filter, min_date, stats.avg_seconds_per_move, stats.time_trouble_moves);
 
+        // Fold each category's current rating into its by_time_control entry
+        // -- reusing rating_history() (same category/date filters) rather
+        // than a second hand-rolled SQL query, so "current" always means the
+        // same thing here as it does in the dedicated /rating command: the
+        // last (most recent) point for that category.
+        std::map<std::string, RatingPoint> current_by_category;
+        for (const RatingPoint& p : rating_history(category_filter, min_date)) current_by_category[p.time_category] = p;
+        for (TimeControlStat& t : stats.by_time_control) {
+            auto it = current_by_category.find(t.category);
+            if (it != current_by_category.end()) {
+                t.current_rating = it->second.rating;
+                t.rating_as_of = it->second.date;
+            }
+        }
+
         return stats;
+    }
+
+    // One entry per game that has a recorded rating for *your* color,
+    // ordered chronologically (oldest first) so the GUI can render both a
+    // history table and derive "current rating per category" (the last
+    // entry per time_category) from this single list. `category_filter`/
+    // `min_date` mean the same as in compute_stats.
+    std::vector<RatingPoint> rating_history(const std::vector<std::string>& category_filter = {}, const std::string& min_date = "") {
+        const char* sql =
+            "SELECT id, date, white, black, your_color, result, time_control, "
+            "       CASE your_color WHEN 'white' THEN white_elo ELSE black_elo END AS your_elo "
+            "FROM games WHERE your_color != '' AND your_elo IS NOT NULL ORDER BY id ASC;";
+        sqlite3_stmt* stmt = prepare(sql);
+
+        std::vector<RatingPoint> out;
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            std::string date = column_text(stmt, 1);
+            std::string tc = column_text(stmt, 6);
+            if (!passes_filters(date, tc, category_filter, min_date)) continue;
+
+            RatingPoint p;
+            p.game_id = sqlite3_column_int(stmt, 0);
+            p.date = date;
+            std::string white = column_text(stmt, 2);
+            std::string black = column_text(stmt, 3);
+            std::string your_color = column_text(stmt, 4);
+            std::string result = column_text(stmt, 5);
+            p.time_category = classify_time_control(tc);
+            p.rating = sqlite3_column_int(stmt, 7);
+            p.opponent = (your_color == "white") ? black : white;
+            p.result_display = result_relative_to(result, your_color);
+            out.push_back(p);
+        }
+        sqlite3_finalize(stmt);
+        return out;
     }
 
 private:
@@ -737,6 +876,29 @@ private:
             "  last_covered_month INTEGER"
             ");";
         exec_or_throw(schema);
+
+        // CREATE TABLE IF NOT EXISTS above is a no-op on an already-existing
+        // games table, so a column added after the table was first created
+        // (like these two) needs an explicit migration to reach real,
+        // already-populated archives.
+        ensure_column("games", "white_elo", "INTEGER");
+        ensure_column("games", "black_elo", "INTEGER");
+    }
+
+    // Adds `column` to `table` (as `decl`, e.g. "INTEGER") if it doesn't
+    // already exist. Safe to call on every startup -- PRAGMA table_info is
+    // just a metadata read, so this is a cheap no-op once the column exists.
+    void ensure_column(const char* table, const char* column, const char* decl) {
+        std::string sql = std::string("PRAGMA table_info(") + table + ");";
+        sqlite3_stmt* stmt = prepare(sql.c_str());
+        bool exists = false;
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            if (column_text(stmt, 1) == column) { exists = true; break; }
+        }
+        sqlite3_finalize(stmt);
+        if (!exists) {
+            exec_or_throw((std::string("ALTER TABLE ") + table + " ADD COLUMN " + column + " " + decl + ";").c_str());
+        }
     }
 
     sqlite3_stmt* prepare(const char* sql) {
@@ -764,6 +926,11 @@ private:
     static std::string column_text(sqlite3_stmt* stmt, int index) {
         const unsigned char* text = sqlite3_column_text(stmt, index);
         return text ? reinterpret_cast<const char*>(text) : "";
+    }
+
+    static std::optional<int> column_optional_int(sqlite3_stmt* stmt, int index) {
+        if (sqlite3_column_type(stmt, index) == SQLITE_NULL) return std::nullopt;
+        return sqlite3_column_int(stmt, index);
     }
 
     // Maps a PGN result ("1-0", "0-1", "1/2-1/2") to "Win"/"Loss"/"Draw" from

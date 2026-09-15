@@ -28,10 +28,13 @@ void print_help() {
                  "  stats [filters...]  Show win rate, opening, and time-management stats. Filters may include\n"
                  "                      game types (bullet/blitz/rapid/classical/daily) and/or a date range\n"
                  "                      (14d/30d/60d/90d/180d/all; default: all), e.g. 'stats blitz 30d'\n"
+                 "  rating [filters...] Show current rating and rating history per game type (same filters as stats)\n"
                  "  opening <query>     Show win/loss record and games for an opening (name substring or ECO code)\n"
                  "  moves <sequence>    Show what was played after a SAN move sequence, e.g. 'moves e4 e5 Nf3'\n"
-                 "  fetch chesscom <user> [year month]   Fetch games from chess.com (default: current+previous month)\n"
-                 "  fetch lichess <user> [days]          Fetch games from lichess (default: last 90 days)\n"
+                 "  fetch chesscom <user> [year month|full]   Fetch games from chess.com (default: current+previous month;\n"
+                 "                                             'full' re-downloads all history and backfills rating)\n"
+                 "  fetch lichess <user> [days|full]          Fetch games from lichess (default: last 90 days;\n"
+                 "                                             'full' re-downloads all history and backfills rating)\n"
                  "  help                Show this help\n"
                  "  q / quit            Exit\n\n";
 }
@@ -274,6 +277,43 @@ void cmd_stats(Archive& archive, const std::vector<std::string>& category_filter
     print_openings("Openings faced (Black)", s.top_openings_black);
 }
 
+void cmd_rating(Archive& archive, const std::vector<std::string>& category_filter, const std::string& min_date = "") {
+    std::vector<RatingPoint> points = archive.rating_history(category_filter, min_date);
+
+    if (!category_filter.empty() || !min_date.empty()) {
+        std::cout << "Filtered to:";
+        for (const std::string& c : category_filter) std::cout << " " << c;
+        if (!min_date.empty()) std::cout << " since " << min_date;
+        std::cout << "\n";
+    }
+
+    if (points.empty()) {
+        std::cout << "No rating data yet -- games need a WhiteElo/BlackElo PGN tag to show up here "
+                     "(try 'fetch chesscom <user> full' or 'fetch lichess <user> full' to backfill existing games).\n\n";
+        return;
+    }
+
+    // Current rating per category: the last (most recent) point seen for
+    // each time_category, in the same single chronological pass -- matches
+    // how the GUI derives it from this same list, so there's one source of
+    // truth for "current" rather than a second query that could disagree.
+    std::map<std::string, RatingPoint> current_by_category;
+    for (const RatingPoint& p : points) current_by_category[p.time_category] = p;
+
+    std::cout << "Current rating:\n";
+    for (const auto& [category, p] : current_by_category) {
+        std::cout << "  " << category << ": " << p.rating << " (as of " << p.date << ")\n";
+    }
+    std::cout << "\n";
+
+    std::cout << "Rating history (" << points.size() << " game(s)):\n";
+    for (const RatingPoint& p : points) {
+        std::cout << "  " << p.date << "  " << p.time_category << "  " << p.rating
+                  << "  vs " << p.opponent << "  " << p.result_display << "\n";
+    }
+    std::cout << "\n";
+}
+
 void cmd_moves(Archive& archive, const std::vector<std::string>& sequence) {
     std::vector<NextMoveStat> stats = archive.opponent_replies(sequence);
 
@@ -330,7 +370,14 @@ FetchResult fetch_chesscom_one_month_result(Archive& archive, const std::string&
     return r;
 }
 
-std::vector<FetchResult> fetch_chesscom_results(Archive& archive, const std::string& username, int year, int month) {
+// EARLIEST_YEAR is chess.com's own founding year -- a "full" re-fetch has no
+// per-user join-date to start from (that would mean hitting the JSON player
+// profile endpoint, which this app otherwise never touches), so it just
+// walks every month from here forward; months before the account existed
+// come back empty and cost one harmless request each.
+constexpr int EARLIEST_CHESSCOM_YEAR = 2005;
+
+std::vector<FetchResult> fetch_chesscom_results(Archive& archive, const std::string& username, int year, int month, bool full = false) {
     std::vector<FetchResult> results;
     if (!is_valid_username(username)) {
         FetchResult r;
@@ -345,7 +392,23 @@ std::vector<FetchResult> fetch_chesscom_results(Archive& archive, const std::str
     // doesn't carry it, needed below to compute what to record.
     std::vector<std::pair<int, int>> attempted;
 
-    if (year == -1) {
+    if (full) {
+        // Ignore fetch_history entirely and walk every month since chess.com
+        // existed -- re-downloading games insert_game already has just
+        // backfills their white_elo/black_elo (see Archive::insert_game's
+        // duplicate path) rather than creating duplicate rows.
+        std::time_t tt = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        std::tm* local_tm = std::localtime(&tt);
+        int cur_year = local_tm->tm_year + 1900;
+        int cur_month = local_tm->tm_mon + 1;
+        for (int y = EARLIEST_CHESSCOM_YEAR; y < cur_year || (y == cur_year); ++y) {
+            int last_month = (y == cur_year) ? cur_month : 12;
+            for (int m = 1; m <= last_month; ++m) {
+                results.push_back(fetch_chesscom_one_month_result(archive, username, y, m));
+                attempted.push_back({y, m});
+            }
+        }
+    } else if (year == -1) {
         std::time_t tt = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
         std::tm* local_tm = std::localtime(&tt);
         int cur_year = local_tm->tm_year + 1900;
@@ -419,8 +482,10 @@ long long utc_datetime_to_epoch_ms(const std::string& utc_str) {
 
 // `days == -1` means "no explicit range given" -- resolves to "since last
 // successful lichess fetch" if history exists, else the unchanged default
-// of the last 90 days.
-FetchResult fetch_lichess_result(Archive& archive, const std::string& username, int days) {
+// of the last 90 days. `full` bypasses both and asks lichess for every game
+// ever played (since_ms = 0), re-downloading everything so insert_game's
+// duplicate path can backfill white_elo/black_elo onto existing rows.
+FetchResult fetch_lichess_result(Archive& archive, const std::string& username, int days, bool full = false) {
     FetchResult r;
 
     if (!is_valid_username(username)) {
@@ -430,11 +495,14 @@ FetchResult fetch_lichess_result(Archive& archive, const std::string& username, 
         return r;
     }
 
-    std::optional<FetchHistoryRow> history = (days == -1) ? archive.get_last_fetch("lichess") : std::nullopt;
+    std::optional<FetchHistoryRow> history = (!full && days == -1) ? archive.get_last_fetch("lichess") : std::nullopt;
 
     fs::path tmp = fs::temp_directory_path() / "tempo_fetch_lichess.pgn";
     bool ok;
-    if (history) {
+    if (full) {
+        r.source = "lichess (full history)";
+        ok = fetch_lichess_since(username, /*since_ms=*/0, tmp.string());
+    } else if (history) {
         long long since_ms = utc_datetime_to_epoch_ms(history->last_fetched_at);
         r.source = "lichess (since " + history->last_fetched_at + " UTC)";
         ok = fetch_lichess_since(username, since_ms, tmp.string());
@@ -471,14 +539,14 @@ void print_fetch_result(const FetchResult& r) {
               << r.counts.added << " added, " << r.counts.skipped << " already in the archive.\n\n";
 }
 
-void cmd_fetch_chesscom(Archive& archive, const std::string& username, int year, int month) {
-    for (const FetchResult& r : fetch_chesscom_results(archive, username, year, month)) {
+void cmd_fetch_chesscom(Archive& archive, const std::string& username, int year, int month, bool full = false) {
+    for (const FetchResult& r : fetch_chesscom_results(archive, username, year, month, full)) {
         print_fetch_result(r);
     }
 }
 
-void cmd_fetch_lichess(Archive& archive, const std::string& username, int days) {
-    print_fetch_result(fetch_lichess_result(archive, username, days));
+void cmd_fetch_lichess(Archive& archive, const std::string& username, int days, bool full = false) {
+    print_fetch_result(fetch_lichess_result(archive, username, days, full));
 }
 
 inline std::string to_json(const FetchResult& r) {
@@ -586,40 +654,40 @@ int run_json_command(Archive& archive, const std::vector<std::string>& args) {
         } else if (cmd == "stats") {
             std::vector<std::string> category_filter;
             std::string min_date;
-            for (size_t i = 1; i < args.size(); ++i) {
-                std::string range_date;
-                if (parse_range_token(args[i], range_date)) {
-                    min_date = range_date;
-                    continue;
-                }
-                std::string category = normalize_time_category(args[i]);
-                if (category.empty()) {
-                    std::cout << json_error("unknown game type or range: " + args[i] +
-                                             " (expected bullet, blitz, rapid, classical, daily, "
-                                             "14d/30d/60d/90d/180d, or all)") << "\n";
-                    return 1;
-                }
-                category_filter.push_back(category);
+            std::string parse_error = parse_category_and_range_args(args, 1, category_filter, min_date);
+            if (!parse_error.empty()) {
+                std::cout << json_error(parse_error) << "\n";
+                return 1;
             }
             std::cout << to_json(archive.compute_stats(category_filter, min_date)) << "\n";
+        } else if (cmd == "rating") {
+            std::vector<std::string> category_filter;
+            std::string min_date;
+            std::string parse_error = parse_category_and_range_args(args, 1, category_filter, min_date);
+            if (!parse_error.empty()) {
+                std::cout << json_error(parse_error) << "\n";
+                return 1;
+            }
+            std::cout << to_json(archive.rating_history(category_filter, min_date)) << "\n";
         } else if (cmd == "fetch") {
             if (args.size() < 3) {
-                std::cout << json_error("usage: fetch chesscom <user> [year month] | fetch lichess <user> [days]") << "\n";
+                std::cout << json_error("usage: fetch chesscom <user> [year month|full] | fetch lichess <user> [days|full]") << "\n";
                 return 1;
             }
             const std::string& site = args[1];
             const std::string& username = args[2];
+            bool full = args.size() >= 4 && args.back() == "full";
             if (site == "chesscom") {
                 int year = -1, month = -1;
-                if (args.size() >= 5) {
+                if (!full && args.size() >= 5) {
                     year = std::stoi(args[3]);
                     month = std::stoi(args[4]);
                 }
-                std::cout << to_json(fetch_chesscom_results(archive, username, year, month)) << "\n";
+                std::cout << to_json(fetch_chesscom_results(archive, username, year, month, full)) << "\n";
             } else if (site == "lichess") {
                 int days = -1;
-                if (args.size() >= 4) days = std::stoi(args[3]);
-                std::vector<FetchResult> results{fetch_lichess_result(archive, username, days)};
+                if (!full && args.size() >= 4) days = std::stoi(args[3]);
+                std::vector<FetchResult> results{fetch_lichess_result(archive, username, days, full)};
                 std::cout << to_json(results) << "\n";
             } else {
                 std::cout << json_error("unknown fetch site: " + site) << "\n";
@@ -708,28 +776,20 @@ int main(int argc, char* argv[]) {
             int id;
             if (iss >> id) cmd_review(archive, id);
             else std::cout << "[Error] usage: review <id>\n\n";
-        } else if (cmd == "stats") {
+        } else if (cmd == "stats" || cmd == "rating") {
+            std::vector<std::string> tokens;
+            std::string token;
+            while (iss >> token) tokens.push_back(token);
             std::vector<std::string> category_filter;
             std::string min_date;
-            std::string token;
-            bool bad_token = false;
-            while (iss >> token) {
-                std::string range_date;
-                if (parse_range_token(token, range_date)) {
-                    min_date = range_date;
-                    continue;
-                }
-                std::string category = normalize_time_category(token);
-                if (category.empty()) {
-                    std::cout << "[Error] unknown game type or range '" << token
-                              << "' (expected bullet, blitz, rapid, classical, daily, "
-                                 "14d/30d/60d/90d/180d, or all)\n\n";
-                    bad_token = true;
-                    break;
-                }
-                category_filter.push_back(category);
+            std::string parse_error = parse_category_and_range_args(tokens, 0, category_filter, min_date);
+            if (!parse_error.empty()) {
+                std::cout << "[Error] " << parse_error << "\n\n";
+            } else if (cmd == "stats") {
+                cmd_stats(archive, category_filter, min_date);
+            } else {
+                cmd_rating(archive, category_filter, min_date);
             }
-            if (!bad_token) cmd_stats(archive, category_filter, min_date);
         } else if (cmd == "opening") {
             std::string query;
             std::getline(iss, query);
@@ -753,21 +813,30 @@ int main(int argc, char* argv[]) {
         } else if (cmd == "fetch") {
             std::string site, username;
             iss >> site >> username;
+            std::vector<std::string> rest;
+            std::string tok;
+            while (iss >> tok) rest.push_back(tok);
+            bool full = !rest.empty() && rest.back() == "full";
             if (site.empty() || username.empty()) {
-                std::cout << "[Error] usage: fetch chesscom <username> [year month]  |  fetch lichess <username> [days]\n\n";
+                std::cout << "[Error] usage: fetch chesscom <username> [year month|full]  |  fetch lichess <username> [days|full]\n\n";
             } else if (site == "chesscom") {
-                int year, month;
-                bool has_year = static_cast<bool>(iss >> year);
-                bool has_month = has_year && static_cast<bool>(iss >> month);
-                if (has_year && !has_month) {
-                    std::cout << "[Error] usage: fetch chesscom <username> [year month] (both or neither)\n\n";
+                if (full) {
+                    cmd_fetch_chesscom(archive, username, -1, -1, /*full=*/true);
+                } else if (rest.size() == 2) {
+                    cmd_fetch_chesscom(archive, username, std::stoi(rest[0]), std::stoi(rest[1]));
+                } else if (rest.empty()) {
+                    cmd_fetch_chesscom(archive, username, -1, -1);
                 } else {
-                    cmd_fetch_chesscom(archive, username, has_month ? year : -1, has_month ? month : -1);
+                    std::cout << "[Error] usage: fetch chesscom <username> [year month] (both or neither)\n\n";
                 }
             } else if (site == "lichess") {
-                int days = -1;
-                bool has_days = static_cast<bool>(iss >> days);
-                cmd_fetch_lichess(archive, username, has_days ? days : -1);
+                if (full) {
+                    cmd_fetch_lichess(archive, username, -1, /*full=*/true);
+                } else if (rest.size() == 1) {
+                    cmd_fetch_lichess(archive, username, std::stoi(rest[0]));
+                } else {
+                    cmd_fetch_lichess(archive, username, -1);
+                }
             } else {
                 std::cout << "[Error] unknown fetch site '" << site << "' (expected chesscom or lichess)\n\n";
             }

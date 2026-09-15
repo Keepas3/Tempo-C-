@@ -51,6 +51,7 @@ inline std::string to_json(const GameSummary& g) {
       << ", \"opening\": " << json_str(g.opening)
       << ", \"site\": " << json_str(g.site)
       << ", \"time_category\": " << json_str(g.time_category)
+      << ", \"your_elo\": " << (g.your_elo ? std::to_string(*g.your_elo) : "null")
       << "}";
     return o.str();
 }
@@ -127,6 +128,8 @@ inline std::string to_json(const TimeControlStat& t) {
       << ", \"games\": " << t.games
       << ", \"avg_seconds_per_move\": " << t.avg_seconds_per_move
       << ", \"time_trouble_moves\": " << t.time_trouble_moves
+      << ", \"current_rating\": " << t.current_rating
+      << ", \"rating_as_of\": " << json_str(t.rating_as_of)
       << "}";
     return o.str();
 }
@@ -139,6 +142,29 @@ inline std::string to_json(const std::vector<TimeControlStat>& stats) {
         o << to_json(stats[i]);
     }
     o << "]";
+    return o.str();
+}
+
+inline std::string to_json(const RatingPoint& p) {
+    std::ostringstream o;
+    o << "{\"game_id\": " << p.game_id
+      << ", \"date\": " << json_str(p.date)
+      << ", \"time_category\": " << json_str(p.time_category)
+      << ", \"rating\": " << p.rating
+      << ", \"opponent\": " << json_str(p.opponent)
+      << ", \"result\": " << json_str(p.result_display)
+      << "}";
+    return o.str();
+}
+
+inline std::string to_json(const std::vector<RatingPoint>& points) {
+    std::ostringstream o;
+    o << "{\"points\": [";
+    for (size_t i = 0; i < points.size(); ++i) {
+        if (i) o << ", ";
+        o << to_json(points[i]);
+    }
+    o << "]}";
     return o.str();
 }
 

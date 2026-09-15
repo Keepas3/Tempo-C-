@@ -243,6 +243,15 @@ class CommandPanel(QWidget):
         self._opening_results_start: QTextCursor | None = None
         self._opening_results_end: QTextCursor | None = None
 
+        # Last /rating result, following the exact same pattern as /stats
+        # above (re-rendered in place on Range-combo changes) plus the same
+        # "show more" truncation toggle /opening uses for its history table.
+        self._rating_data: dict | None = None
+        self._rating_filter: list[str] = []
+        self._rating_show_all = False
+        self._rating_start: QTextCursor | None = None
+        self._rating_end: QTextCursor | None = None
+
         # /explorer repertoire browser: which color and how deep into the
         # move tree the current block shows, so drilling into a move or
         # clicking a breadcrumb can re-query and replace the block in place
@@ -316,6 +325,9 @@ class CommandPanel(QWidget):
         elif text == "showmoregames":
             self._opening_results_show_all = not self._opening_results_show_all
             self._replace_opening_results_block()
+        elif text == "showmorerating":
+            self._rating_show_all = not self._rating_show_all
+            self._replace_rating_block()
         elif text.startswith("explorer:"):
             color, _sep, seq_text = text[len("explorer:"):].partition(":")
             sequence = unquote(seq_text).split() if seq_text else []
@@ -525,6 +537,11 @@ class CommandPanel(QWidget):
         self._opening_results = data["games"]
         self._opening_results_show_all = False
 
+    def _refresh_rating_data(self, args: list[str]) -> None:
+        self._rating_data = self.cli.rating(*args, self._range_token())
+        self._rating_filter = list(args)
+        self._rating_show_all = False
+
     def _on_range_changed(self) -> None:
         self._range_days = self.range_combo.currentData()
         if self._stats_data is not None:
@@ -533,6 +550,9 @@ class CommandPanel(QWidget):
         if self._opening_results is not None and self._last_opening_query is not None:
             self._refresh_opening_data(self._last_opening_query)
             self._replace_opening_results_block()
+        if self._rating_data is not None:
+            self._refresh_rating_data(self._rating_filter)
+            self._replace_rating_block()
 
     def _dispatch(self, cmd: str, args: list[str]) -> None:
         if cmd == "help" or cmd == "":
@@ -545,12 +565,17 @@ class CommandPanel(QWidget):
             self._refresh_stats_data(args)
             self.game_type_popup.reset()  # next time the dropdown opens, start with nothing checked
             self._render_stats_block()
+        elif cmd == "rating":
+            self._refresh_rating_data(args)
+            self._render_rating_block()
         elif cmd == "clear":
             self.output.clear()
             self._stats_start = None
             self._stats_end = None
             self._opening_results_start = None
             self._opening_results_end = None
+            self._rating_start = None
+            self._rating_end = None
             self._explorer_start = None
             self._explorer_end = None
             self._llm_start = None
@@ -914,22 +939,30 @@ class CommandPanel(QWidget):
         # No date/day-count args here -- the Range combo above already
         # filters /stats and /opening by date after the fact, so /fetch
         # just always pulls the user's full history instead of also making
-        # you think about a separate date range at fetch time.
-        if len(args) != 2:
-            self._print_error("usage: /fetch chesscom <user>  |  /fetch lichess <user>")
+        # you think about a separate date range at fetch time. The one
+        # exception is "full", which re-downloads everything (not just what's
+        # new) so it can backfill rating onto games imported before that
+        # feature existed -- see Archive::insert_game's duplicate path.
+        if len(args) == 3 and args[2].lower() == "full":
+            full = True
+        elif len(args) == 2:
+            full = False
+        else:
+            self._print_error("usage: /fetch chesscom <user> [full]  |  /fetch lichess <user> [full]")
             return
         site, username = args[0], args[1]
 
         if site == "chesscom":
-            fetch_fn = lambda: self.cli.fetch_chesscom(username)
+            fetch_fn = lambda: self.cli.fetch_chesscom(username, full=full)
         elif site == "lichess":
-            fetch_fn = lambda: self.cli.fetch_lichess(username)
+            fetch_fn = lambda: self.cli.fetch_lichess(username, full=full)
         else:
             self._print_error(f"unknown fetch site '{site}' (expected chesscom or lichess)")
             return
 
+        wait_hint = "this can take several minutes" if full else "this can take a few seconds"
         self._print(f'<span style="color:{MUTED_COLOR}">Fetching from {_esc(site)} for {_esc(username)}... '
-                    f'(this can take a few seconds)</span>')
+                    f'({wait_hint})</span>')
 
         # Run off the GUI thread -- with multiple profile tabs live at once,
         # a blocking fetch here would freeze every tab, not just this one.
@@ -1012,6 +1045,14 @@ class CommandPanel(QWidget):
         html = self._opening_range_banner() + self._format_games(
             self._opening_results, truncate=DEFAULT_GAMES_SHOWN, show_all=self._opening_results_show_all)
         self._opening_results_end = self._replace_tracked_block(self._opening_results_start, self._opening_results_end, html)
+
+    def _render_rating_block(self) -> None:
+        self._rating_start, self._rating_end = self._insert_tracked_block(self._format_rating(self._rating_data))
+
+    def _replace_rating_block(self) -> None:
+        if self._rating_start is None or self._rating_end is None or self._rating_data is None:
+            return
+        self._rating_end = self._replace_tracked_block(self._rating_start, self._rating_end, self._format_rating(self._rating_data))
 
     def _refresh_explorer_data(self, color: str, sequence: list[str]) -> None:
         self._explorer_color = color
@@ -1179,16 +1220,27 @@ class CommandPanel(QWidget):
         ]
         parts.append(_table(["", "Record", "Win rate"], color_rows))
 
-        if s["avg_seconds_per_move"] >= 0:
+        by_time_control = s.get("by_time_control", [])
+        rated_categories = [t for t in by_time_control if t.get("current_rating", -1) >= 0]
+        if rated_categories:
+            rating_rows = [[_esc(t["category"]), f'<b>{t["current_rating"]}</b>', _esc(t["rating_as_of"])] for t in rated_categories]
+            parts.append(_table(["Type", "Current rating", "As of"], rating_rows))
+
+        if s["avg_seconds_per_move"] >= 0 or rated_categories:
             parts.append(_section("Time management"))
-            overall_time_row = [["Overall", str(total), f'{s["avg_seconds_per_move"]:.1f}', str(s["time_trouble_moves"])]]
+            no_data = f'<span style="color:{MUTED_COLOR}">n/a</span>'
+            overall_time_row = [["Overall", str(total),
+                                  f'{s["avg_seconds_per_move"]:.1f}' if s["avg_seconds_per_move"] >= 0 else no_data,
+                                  str(s["time_trouble_moves"]) if s["avg_seconds_per_move"] >= 0 else no_data,
+                                  no_data]]
             by_tc_rows = [
                 [t["category"], str(t["games"]),
-                 f'{t["avg_seconds_per_move"]:.1f}' if t["avg_seconds_per_move"] >= 0 else '<span style="color:{}">n/a</span>'.format(MUTED_COLOR),
-                 str(t["time_trouble_moves"])]
-                for t in s.get("by_time_control", [])
+                 f'{t["avg_seconds_per_move"]:.1f}' if t["avg_seconds_per_move"] >= 0 else no_data,
+                 str(t["time_trouble_moves"]) if t["avg_seconds_per_move"] >= 0 else no_data,
+                 str(t["current_rating"]) if t.get("current_rating", -1) >= 0 else no_data]
+                for t in by_time_control
             ]
-            parts.append(_table(["Time control", "Games", "Avg. sec/move", "Moves under 10s"],
+            parts.append(_table(["Time control", "Games", "Avg. sec/move", "Moves under 10s", "Rating"],
                                  overall_time_row + by_tc_rows))
 
         if s["top_openings_white"]:
@@ -1198,6 +1250,73 @@ class CommandPanel(QWidget):
         if s["top_openings_black"]:
             parts.append(_section("Openings faced (Black)"))
             parts.append(self._openings_table(s["top_openings_black"], "black"))
+
+        return "".join(parts)
+
+    def _format_rating(self, data: dict) -> str:
+        points: list[dict] = data.get("points", [])
+        parts = []
+
+        if self._rating_filter or self._range_days is not None:
+            filter_parts = []
+            if self._rating_filter:
+                filter_parts.append(", ".join(t.capitalize() for t in self._rating_filter))
+            if self._range_days is not None:
+                filter_parts.append(f"last {self._range_days} days")
+            parts.append(f'<div style="color:{HEADER_COLOR}">Filtered to: {_esc(", ".join(filter_parts))}</div>')
+
+        if not points:
+            parts.append(
+                f'<span style="color:{MUTED_COLOR}">No rating data yet -- games need a WhiteElo/BlackElo tag to '
+                f'show up here. New fetches include it automatically; for existing games, try '
+                f'<code>/fetch chesscom &lt;user&gt; full</code> or <code>/fetch lichess &lt;user&gt; full</code> '
+                f'to backfill it (this can take several minutes).</span>'
+            )
+            return "".join(parts)
+
+        # "Current" per category is just the last (most recent) point seen
+        # for that category in this same chronological list -- one source of
+        # truth, matching how the backend's own cmd_rating derives it.
+        current_by_category: dict[str, dict] = {}
+        first_by_category: dict[str, dict] = {}
+        for p in points:
+            category = p["time_category"]
+            current_by_category[category] = p
+            first_by_category.setdefault(category, p)
+
+        parts.append(_section("Current rating"))
+        current_rows = []
+        for category, p in current_by_category.items():
+            first = first_by_category[category]
+            delta = p["rating"] - first["rating"]
+            if delta > 0:
+                delta_html = f'<span style="color:{WIN_COLOR}">+{delta}</span>'
+            elif delta < 0:
+                delta_html = f'<span style="color:{LOSS_COLOR}">{delta}</span>'
+            else:
+                delta_html = f'<span style="color:{MUTED_COLOR}">&plusmn;0</span>'
+            current_rows.append([_esc(category), f'<b>{p["rating"]}</b>', delta_html, _esc(p["date"])])
+        parts.append(_table(["Type", "Rating", "Change", "As of"], current_rows))
+
+        parts.append(_section("History"))
+        truncate = DEFAULT_GAMES_SHOWN
+        recent_first = list(reversed(points))
+        visible = recent_first if self._rating_show_all else recent_first[:truncate]
+        history_rows = []
+        for p in visible:
+            result_html = f'<span style="color:{_result_color(p["result"])}"><b>{_esc(p["result"])}</b></span>'
+            cells = [_esc(p["date"]), _esc(p["time_category"]), str(p["rating"]), _esc(p["opponent"]), result_html]
+            history_rows.append([_game_link(p["game_id"], cell) for cell in cells])
+        parts.append(_table(["Date", "Type", "Rating", "Opponent", "Result"], history_rows))
+
+        if len(recent_first) > truncate:
+            if self._rating_show_all:
+                toggle_label = "Show fewer &#9652;"
+            else:
+                remaining = len(recent_first) - truncate
+                toggle_label = f"Show {remaining} more game{'s' if remaining != 1 else ''} &#9662;"
+            parts.append(f'<div style="margin-top:6px;">'
+                          f'<a href="showmorerating" style="color:{HEADER_COLOR}; text-decoration:none;">{toggle_label}</a></div>')
 
         return "".join(parts)
 

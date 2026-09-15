@@ -16,8 +16,9 @@ from colors import DRAW_COLOR, LOSS_COLOR, MUTED_COLOR, WIN_COLOR
 from db_reader import DbReader
 
 GAME_ID_ROLE = 1000
-COLUMNS = ["Game", "Color", "Time", "Type", "Site", "Result"]
+COLUMNS = ["Game", "Color", "Time", "Type", "Site", "Result", "Elo"]
 RESULT_COLUMN = 5
+ELO_COLUMN = 6
 
 _RESULT_COLOR = {"Win": WIN_COLOR, "Loss": LOSS_COLOR, "Draw": DRAW_COLOR}
 
@@ -29,8 +30,9 @@ RESULT_ORDER = {"Win": 0, "Draw": 1, "Loss": 2, "?": 3}
 # when switching to it from a different column). Game defaults to
 # descending (most recent first, matching the initial unsorted load); the
 # rest default to ascending (White before Black / lowest time / earliest
-# category / A-Z / best result first).
-DEFAULT_ASCENDING = {0: False, 1: True, 2: True, 3: True, 4: True, 5: True}
+# category / A-Z / best result first). Elo defaults descending (highest
+# rating first), matching how chess sites usually show it.
+DEFAULT_ASCENDING = {0: False, 1: True, 2: True, 3: True, 4: True, 5: True, 6: False}
 
 
 def _abbrev_date(date: str) -> str:
@@ -53,6 +55,8 @@ def _sort_key(column: int, game) -> object:
         return game.site
     if column == 5:
         return RESULT_ORDER.get(game.result, len(RESULT_ORDER))
+    if column == ELO_COLUMN:
+        return game.your_elo if game.your_elo is not None else 0
     return game.date  # column 0 (or anything unrecognized): "YYYY.MM.DD" sorts correctly as text
 
 
@@ -81,6 +85,7 @@ class GameBrowser(QTreeWidget):
         self.setColumnWidth(3, 70)
         self.setColumnWidth(4, 80)
         self.setColumnWidth(5, 60)
+        self.setColumnWidth(6, 55)
         self.header().setSortIndicatorShown(True)
         # Without this, sectionClicked never fires -- clicking a header does
         # nothing (the header just looks clickable because of the sort
@@ -149,12 +154,19 @@ class GameBrowser(QTreeWidget):
                 year_item.addChild(month_item)
 
                 games_sorted = sorted(months[month], key=lambda g: _sort_key(self._sort_column, g), reverse=reverse)
+                if self._sort_column == ELO_COLUMN:
+                    # Second, stable pass: push games with no rating data to
+                    # the end regardless of sort direction, rather than
+                    # having them land wherever their placeholder 0 key
+                    # happened to sort in either direction.
+                    games_sorted.sort(key=lambda g: g.your_elo is None)
                 for game in games_sorted:
                     label = f"{_abbrev_date(game.date)}  vs {game.opponent}"
                     full_label = f"{game.date}  vs {game.opponent}"
                     color_display = game.your_color.capitalize()
+                    elo_display = str(game.your_elo) if game.your_elo is not None else ""
                     game_item = QTreeWidgetItem(
-                        [label, color_display, game.time_label, game.time_category, game.site, game.result])
+                        [label, color_display, game.time_label, game.time_category, game.site, game.result, elo_display])
                     game_item.setData(0, GAME_ID_ROLE, game.id)
                     game_item.setToolTip(0, full_label)  # full year on hover
                     result_color = _RESULT_COLOR.get(game.result, MUTED_COLOR)

@@ -134,6 +134,19 @@ inline std::string derive_your_color(const std::map<std::string, std::string>& t
     return "";
 }
 
+// Parses a PGN Elo tag value into an int, tolerant of the ways it can fail
+// to be a plain rating: absent (empty string, e.g. an unrated game) or "?"
+// (lichess's own placeholder for unrated games) both fall through to
+// nullopt rather than throwing.
+inline std::optional<int> parse_optional_int(const std::string& s) {
+    if (s.empty()) return std::nullopt;
+    try {
+        return std::stoi(s);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
 // Builds a Game from accumulated tags + raw movetext, validating every SAN
 // token against the legal move list as it replays from the start position.
 // Throws std::runtime_error (with the offending token) on the first illegal move.
@@ -156,6 +169,8 @@ inline Game finalize_game(const std::map<std::string, std::string>& tags, const 
         game.opening = lookup_eco_name(game.eco); // fallback for exports (e.g. chess.com) with no Opening tag
     }
     game.time_control = get("TimeControl");
+    game.white_elo = parse_optional_int(get("WhiteElo"));
+    game.black_elo = parse_optional_int(get("BlackElo"));
     game.your_color = derive_your_color(tags, your_username);
 
     std::vector<MoveRecord> tokens;

@@ -1,4 +1,5 @@
 #pragma once
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -15,6 +16,7 @@ struct Game {
     std::string event, site, date, white, black, result;
     std::string eco, opening, time_control;
     std::string your_color; // "white" or "black"
+    std::optional<int> white_elo, black_elo; // from WhiteElo/BlackElo PGN tags; nullopt if absent/unrated/unparseable
     std::vector<MoveRecord> moves;
 };
 
@@ -34,6 +36,17 @@ inline std::string game_to_pgn(const Game& g) {
     if (!g.eco.empty()) tag("ECO", g.eco);
     if (!g.opening.empty()) tag("Opening", g.opening);
     if (!g.time_control.empty()) tag("TimeControl", g.time_control);
+    // Deliberately NOT emitting WhiteElo/BlackElo here, even though they're
+    // on Game now: this reconstructed string is also the exact value stored
+    // in games.pgn and used as half of the de-duplication key (db.h's
+    // UNIQUE(site, date, white, black, result, pgn)). Games imported before
+    // this feature existed have pgn text with no Elo tags; if a later
+    // re-fetch (which DOES have real WhiteElo/BlackElo from the source)
+    // changed what this function emits, the reconstructed pgn would no
+    // longer match the old stored row, turning every "full" backfill
+    // re-fetch into a flood of duplicate rows instead of updates. Elo lives
+    // in its own white_elo/black_elo columns instead, set directly from
+    // Game (see insert_game) rather than round-tripped through this string.
     pgn += "\n";
 
     for (size_t i = 0; i < g.moves.size(); ++i) {
