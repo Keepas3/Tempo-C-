@@ -1,6 +1,6 @@
 """Claude tool-use surface for the chat panel's LLM assistant: tool schemas,
 the system prompt, and a ToolExecutor that dispatches tool calls into the
-existing data layer (TempoCli, DbReader, AnalysisCache, Bookmarks,
+existing data layer (TempoCli, DbReader, AnalysisCache, Bookmarks, Notes,
 EngineManager) plus one new piece (game_search.py).
 
 Every tool returns a small, pre-aggregated dict -- aggregation happens here
@@ -28,6 +28,7 @@ from engine import BATCH_DEPTH, BATCH_SETTING_KEY, ENGINE_ID, EngineManager
 from engine_analysis_core import analyze_missing_plies
 from db_reader import DbReader
 from game_search import GameSearchFilter, game_row_to_compact_dict, search_games as _filter_games
+from notes import Notes
 from review_data import build_stockfish_review_payload
 from tempo_cli import TempoCli, TempoCliError
 
@@ -73,6 +74,7 @@ class ToolContext:
     cache: AnalysisCache
     engine: EngineManager
     bookmarks: Bookmarks
+    notes: Notes
     get_current_fen: Callable[[], str]
     on_status: Callable[[str], None]
 
@@ -212,6 +214,15 @@ _BASE_TOOLS: list[dict] = [
         "input_schema": {
             "type": "object",
             "properties": {"limit": {"type": "integer", "description": f"Max results (server-capped at {llm_settings.MAX_BOOKMARKS})."}},
+        },
+    },
+    {
+        "name": "get_game_notes",
+        "description": "The user's own saved notes on a game (an overall note) and on specific moves within it, if any exist.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"game_id": {"type": "integer"}},
+            "required": ["game_id"],
         },
     },
 ]
@@ -423,6 +434,13 @@ class ToolExecutor:
             {"id": b.id, "fen": b.fen, "note": b.note, "source_game_id": b.source_game_id, "source_ply": b.source_ply}
             for b in marks
         ]}
+
+    def _tool_get_game_notes(self, inp: dict) -> dict:
+        game_id = inp["game_id"]
+        return {
+            "game_note": self.ctx.notes.get_game_note(game_id),
+            "move_notes": self.ctx.notes.get_move_notes(game_id),  # {ply (1-based): text}
+        }
 
     def _tool_get_best_move_in_current_position(self, inp: dict) -> dict:
         fen = self.ctx.get_current_fen()

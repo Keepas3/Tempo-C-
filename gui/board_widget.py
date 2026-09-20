@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import chess
 import chess.svg
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtSvgWidgets import QSvgWidget
 
@@ -26,6 +26,7 @@ ARROW_COLORS = {
     "arrow green": "#4caf5090",  # light green, ~56% opacity -- the engine's best move
     "arrow yellow": "#4caf5055",  # same green, fainter -- MultiPV's 2nd-best line
     "arrow blue": "#4caf5030",  # same green, faintest -- MultiPV's 3rd-best line
+    "arrow red": "#d2352990",  # chess.com-style right-click-drag annotation arrows
 }
 # Thins the arrow's shaft -- chess.svg draws it at a fixed 20% of square
 # size by default (quite thick), with no public parameter to adjust it;
@@ -71,6 +72,19 @@ class BoardWidget(QSvgWidget):
         self._secondary_move_arrows: list[chess.Move] = []
         self.orientation: chess.Color = chess.WHITE
 
+        # Right-click-drag annotation arrows (chess.com-style): held as
+        # (from, to) pairs rather than chess.Move, since these are freehand
+        # markup, not legal/illegal moves -- drawing one to/from an empty
+        # square or in a way no piece could actually move is valid annotation
+        # the same way it is on chess.com. _right_drag_start is the square
+        # the current right-button press started on, if any (None between
+        # drags); it never persists across a render.
+        self._user_arrows: list[tuple[chess.Square, chess.Square]] = []
+        self._right_drag_start: chess.Square | None = None
+        # A right-click shouldn't pop up Qt/OS's native context menu -- that
+        # would fight with press-drag-release for the same mouse button.
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+
         self._render()
 
     # --- Loading / navigation -------------------------------------------------
@@ -89,6 +103,7 @@ class BoardWidget(QSvgWidget):
         self.on_mainline = True
         self.selected_square = None
         self._last_move = last_move
+        self._user_arrows = []  # navigating away invalidates any drawn annotations, same as chess.com
         self._render()
         self.position_changed.emit()
 
@@ -143,6 +158,7 @@ class BoardWidget(QSvgWidget):
         self._last_move = move
         self.on_mainline = False
         self.selected_square = None
+        self._user_arrows = []
         self._render()
         self.position_changed.emit()
         return True
@@ -183,12 +199,11 @@ class BoardWidget(QSvgWidget):
 
     # --- Mouse interaction (click-to-select, click-to-move) -------------------
 
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        pos = event.position()
+    def _square_at(self, pos) -> chess.Square | None:
         col = int(pos.x() // self.square_size)
         row = int(pos.y() // self.square_size)
         if not (0 <= col <= 7 and 0 <= row <= 7):
-            return
+            return None
         # Matches chess.svg.board()'s own orientation-dependent coordinate
         # formula (x = file if White-POV else 7-file; y = 7-rank if
         # White-POV else rank) so clicks land on the square actually drawn
@@ -197,8 +212,39 @@ class BoardWidget(QSvgWidget):
             file_idx, rank_idx = col, 7 - row
         else:
             file_idx, rank_idx = 7 - col, row
-        square = chess.square(file_idx, rank_idx)
+        return chess.square(file_idx, rank_idx)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.RightButton:
+            # Just remember where the drag started -- the arrow itself is
+            # only committed on release (see mouseReleaseEvent), exactly
+            # like chess.com: a plain right-click with no drag draws nothing.
+            self._right_drag_start = self._square_at(event.position())
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        square = self._square_at(event.position())
+        if square is None:
+            return
         self._handle_square_click(square)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() != Qt.MouseButton.RightButton:
+            super().mouseReleaseEvent(event)
+            return
+        start = self._right_drag_start
+        self._right_drag_start = None
+        if start is None:
+            return
+        end = self._square_at(event.position())
+        if end is None or end == start:
+            return
+        arrow = (start, end)
+        if arrow in self._user_arrows:
+            self._user_arrows.remove(arrow)  # drawing the same arrow again toggles it off
+        else:
+            self._user_arrows.append(arrow)
+        self._render()
 
     def _handle_square_click(self, square: chess.Square) -> None:
         if self.selected_square is None:
@@ -219,6 +265,7 @@ class BoardWidget(QSvgWidget):
             self._last_move = move
             self.on_mainline = False  # any manual move branches off the real game
             self.selected_square = None
+            self._user_arrows = []
             self._render()
             self.position_changed.emit()
         else:
@@ -257,6 +304,12 @@ class BoardWidget(QSvgWidget):
                 continue  # already drawn (e.g. as the best move) -- don't double up
             arrows.append(chess.svg.Arrow(move.from_square, move.to_square, color=color))
             drawn_squares.add((move.from_square, move.to_square))
+        # User-drawn (right-click-drag) annotation arrows always render, even
+        # over an engine arrow on the same squares -- unlike the engine
+        # arrows above, these are the user's own explicit markup, not a
+        # redundant duplicate to dedupe away.
+        for from_sq, to_sq in self._user_arrows:
+            arrows.append(chess.svg.Arrow(from_sq, to_sq, color="red"))
         fill: dict[chess.Square, str] = {}
         if self.selected_square is not None:
             fill[self.selected_square] = SELECTED_SQUARE_COLOR

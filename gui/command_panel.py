@@ -43,6 +43,7 @@ from engine_batch_worker import EngineBatchWorker
 from fetch_worker import FetchWorker
 from llm_tools import build_tools
 from llm_worker import LlmWorker
+from notes import Notes
 from review_data import build_basic_review_payload, build_moves_only_payload, build_stockfish_review_payload
 from tempo_cli import TempoCli, TempoCliError
 from colors import DRAW_COLOR, ERROR_COLOR, HEADER_COLOR, LOSS_COLOR, MUTED_COLOR, WIN_COLOR
@@ -118,7 +119,7 @@ class CommandPanel(QWidget):
 
     def __init__(
         self, db: DbReader, cli: TempoCli, cache: AnalysisCache, engine: EngineManager,
-        bookmarks: Bookmarks, get_current_fen: Callable[[], str], parent=None,
+        bookmarks: Bookmarks, notes: Notes, get_current_fen: Callable[[], str], parent=None,
     ):
         super().__init__(parent)
         self.db = db
@@ -126,6 +127,7 @@ class CommandPanel(QWidget):
         self.cache = cache
         self.engine = engine
         self.bookmarks = bookmarks
+        self.notes = notes
         self.get_current_fen = get_current_fen
         self._review_worker: EngineBatchWorker | None = None
         # Workers that have been asked to cancel but haven't emitted
@@ -318,6 +320,15 @@ class CommandPanel(QWidget):
                 self.move_requested.emit(int(game_id_str), int(ply_str))
             except ValueError:
                 return
+        elif text.startswith("movenote:"):
+            try:
+                game_id_str, ply_str = text[len("movenote:"):].split(":")
+                game_id, ply = int(game_id_str), int(ply_str)
+            except ValueError:
+                return
+            note_text = self.notes.get_move_notes(game_id).get(ply)
+            if note_text:
+                self._print(f'<span style="color:{MUTED_COLOR}">Note on game #{game_id}, ply {ply}:</span> {_esc(note_text)}')
         elif text.startswith("showmore:"):
             color_key = text[len("showmore:"):]
             self._show_all_openings[color_key] = not self._show_all_openings.get(color_key, False)
@@ -606,7 +617,7 @@ class CommandPanel(QWidget):
                 return
             game_id = int(args[0])
             data = self.cli.show(game_id)
-            self._print(self._format_game_header(data))
+            self._print(self._format_game_header(data, self.notes.get_game_note(game_id)))
             self.game_requested.emit(game_id)
         elif cmd == "review":
             if not args:
@@ -622,6 +633,10 @@ class CommandPanel(QWidget):
             self._run_review(game_id)
         elif cmd == "fetch":
             self._dispatch_fetch(args)
+        elif cmd == "note":
+            self._dispatch_note(args)
+        elif cmd == "movenote":
+            self._dispatch_movenote(args)
         else:
             self._print_error(f"unknown command '/{cmd}'. Type /help for a list.")
 
@@ -637,7 +652,7 @@ class CommandPanel(QWidget):
             return
         try:
             data = self.cli.show(game_id)
-            self._print(self._format_game_header(data))
+            self._print(self._format_game_header(data, self.notes.get_game_note(game_id)))
         except TempoCliError as e:
             self._print_error(str(e))
 
@@ -766,7 +781,7 @@ class CommandPanel(QWidget):
         total_plies = len(detail.moves)
         cache_rows = self.cache.get_full(game_id, total_plies, ENGINE_ID, version, BATCH_SETTING_KEY)
         if cache_rows is not None:
-            payload = build_stockfish_review_payload(detail, cache_rows, version, BATCH_DEPTH)
+            payload = build_stockfish_review_payload(detail, cache_rows, version, BATCH_DEPTH, self.notes)
             self._emit_review(payload, game_id)
             return
 
@@ -779,7 +794,7 @@ class CommandPanel(QWidget):
         missing = self.cache.get_missing_plies(game_id, total_plies, ENGINE_ID, version, BATCH_SETTING_KEY)
         sans = [m.san for m in detail.moves]
 
-        self._emit_review(build_moves_only_payload(detail, f"Analyzing with {version}... (0/{len(missing)})"), game_id)
+        self._emit_review(build_moves_only_payload(detail, f"Analyzing with {version}... (0/{len(missing)})", self.notes), game_id)
 
         worker = EngineBatchWorker(self.db.db_path, sans, self.engine, self.cache, game_id, version, missing, self)
 
@@ -802,13 +817,13 @@ class CommandPanel(QWidget):
             # replace that often, especially on a long game.
             if done != total and done % 5 != 0:
                 return
-            self._emit_review(build_moves_only_payload(detail, f"Analyzing with {version}... ({done}/{total})"), game_id)
+            self._emit_review(build_moves_only_payload(detail, f"Analyzing with {version}... ({done}/{total})", self.notes), game_id)
 
         def render_from_cache() -> bool:
             rows = self.cache.get_full(game_id, total_plies, ENGINE_ID, version, BATCH_SETTING_KEY)
             if rows is None:
                 return False
-            payload = build_stockfish_review_payload(detail, rows, version, BATCH_DEPTH)
+            payload = build_stockfish_review_payload(detail, rows, version, BATCH_DEPTH, self.notes)
             self._emit_review(payload, game_id)
             return True
 
@@ -862,7 +877,7 @@ class CommandPanel(QWidget):
         except TempoCliError as e:
             self._print_error(str(e))
             return
-        self._emit_review(build_basic_review_payload(data), game_id)
+        self._emit_review(build_basic_review_payload(data, game_id, self.notes), game_id)
 
     # --- LLM assistant (free-text questions) --------------------------------
 
@@ -879,7 +894,7 @@ class CommandPanel(QWidget):
 
         worker = LlmWorker(
             llm_settings.api_key(), build_tools(),
-            self.db, self.cli, self.cache, self.engine, self.bookmarks, self.get_current_fen,
+            self.db, self.cli, self.cache, self.engine, self.bookmarks, self.notes, self.get_current_fen,
             self._llm_history, question, self,
         )
         worker.status.connect(self._on_llm_status)
@@ -974,6 +989,54 @@ class CommandPanel(QWidget):
     def _on_fetch_succeeded(self, data: dict) -> None:
         self._print(self._format_fetch_results(data["results"]))
         self._refresh_last_fetch_row()
+
+    def _dispatch_note(self, args: list[str]) -> None:
+        # /note <id> [text...] -- empty text clears the note (see
+        # Notes.set_game_note). No quoting support, same as every other
+        # free-text command here (e.g. /opening) -- the remaining args are
+        # just rejoined with spaces.
+        if not args:
+            self._print_error("usage: /note <id> [text...]")
+            return
+        try:
+            game_id = int(args[0])
+        except ValueError:
+            self._print_error(f"'{args[0]}' isn't a valid game id")
+            return
+        text = " ".join(args[1:])
+        self.notes.set_game_note(game_id, text)
+        self._print(f'<span style="color:{MUTED_COLOR}">Note {"cleared" if not text else "saved"} for game #{game_id}.</span>')
+        self._refresh_notes_in_current_review(game_id)
+
+    def _dispatch_movenote(self, args: list[str]) -> None:
+        # /movenote <id> <ply> [text...] -- ply matches the "ply:<id>:<ply>"
+        # scheme already used for jump-to-move chat links (1-based, the
+        # position AFTER that move).
+        if len(args) < 2:
+            self._print_error("usage: /movenote <id> <ply> [text...]")
+            return
+        try:
+            game_id, ply = int(args[0]), int(args[1])
+        except ValueError:
+            self._print_error("usage: /movenote <id> <ply> [text...] -- id and ply must be numbers")
+            return
+        text = " ".join(args[2:])
+        self.notes.set_move_note(game_id, ply, text)
+        self._print(f'<span style="color:{MUTED_COLOR}">Move note {"cleared" if not text else "saved"} for game #{game_id}, ply {ply}.</span>')
+        self._refresh_notes_in_current_review(game_id)
+
+    def _refresh_notes_in_current_review(self, game_id: int) -> None:
+        """If `game_id`'s /review table is the one currently on screen,
+        patch its note fields from a fresh read and re-render that block in
+        place -- so /note or /movenote is visible immediately without
+        needing to re-run /review."""
+        if self._last_review_data is None or self._last_review_game_id != game_id:
+            return
+        self._last_review_data["game_note"] = self.notes.get_game_note(game_id)
+        self._last_review_data["move_notes"] = {
+            ply - 1: text for ply, text in self.notes.get_move_notes(game_id).items()
+        }
+        self._emit_review(self._last_review_data, game_id)
 
     def _insert_tracked_block(self, html: str) -> tuple[QTextCursor, QTextCursor]:
         """Inserts `html` as a distinct block and returns (start, end)
@@ -1398,7 +1461,7 @@ class CommandPanel(QWidget):
                       f'<span style="color:{MUTED_COLOR}">(click a move to drill in, or a breadcrumb to jump back)</span></div>')
         return "".join(parts)
 
-    def _format_game_header(self, g: dict) -> str:
+    def _format_game_header(self, g: dict, note: str | None = None) -> str:
         result_html = f'<span style="color:{_result_color(g.get("result", ""))}"><b>{_esc(g.get("result", ""))}</b></span>' \
             if g.get("result") in ("Win", "Loss", "Draw") else _esc(g.get("result", ""))
         header = (f'<b>{_esc(g["white"])} vs {_esc(g["black"])}</b>  '
@@ -1406,6 +1469,9 @@ class CommandPanel(QWidget):
                   f'<span style="color:{MUTED_COLOR}">[{_esc(g.get("site", "Unknown"))}]</span>')
         if g.get("opening"):
             header += f'<br><span style="color:{MUTED_COLOR}">Opening:</span> {_esc(g["opening"])} ({_esc(g.get("eco", ""))})'
+        if note:
+            header += (f'<div style="margin-top:4px; padding:4px 8px; background-color:#2d2d2d; '
+                       f'border-left:3px solid {HEADER_COLOR};">{_esc(note)}</div>')
         return header
 
     _SEVERITY_COLORS = {
@@ -1418,6 +1484,7 @@ class CommandPanel(QWidget):
         mates = data.get("mates", {})
         best_moves = data.get("best_moves", {})
         severities = data.get("severities", {})
+        move_notes = data.get("move_notes", {})
         engine_label = data.get("engine_label")
 
         # Advanced one move at a time as move_link() is called (always in
@@ -1475,6 +1542,14 @@ class CommandPanel(QWidget):
             elif best_san is not None:
                 link += f' <span style="color:{WIN_COLOR}; font-size:smaller;" title="Good move">&#10003;</span>'
 
+            note_text = move_notes.get(idx)
+            if note_text:
+                # Hover for the full text via title=; also clickable (see
+                # _on_anchor_clicked's "movenote:" case) so it's readable
+                # without hovering too.
+                link += (f' <a href="movenote:{game_id}:{ply}" title="{_esc(note_text)}" '
+                         f'style="color:{HEADER_COLOR}; text-decoration:none; font-size:smaller;">note</a>')
+
             replay.push_san(moved_san)  # advance to AFTER this move, ready for the next call
             # A named anchor at every ply (not just the highlighted one) so
             # ProfileView can always scrollToAnchor() the current move into
@@ -1518,4 +1593,4 @@ class CommandPanel(QWidget):
                 f'&nbsp;&nbsp;&nbsp;Black {_acc_span(accuracy["black"])}</div>'
             )
 
-        return self._format_game_header(g) + banner + accuracy_html + _table(["#", "White", "Black"], rows)
+        return self._format_game_header(g, data.get("game_note")) + banner + accuracy_html + _table(["#", "White", "Black"], rows)

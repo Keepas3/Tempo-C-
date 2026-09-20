@@ -12,7 +12,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import QHeaderView, QTreeWidget, QTreeWidgetItem
 
-from colors import DRAW_COLOR, LOSS_COLOR, MUTED_COLOR, WIN_COLOR
+from colors import DRAW_COLOR, LOSS_COLOR, MUTED_COLOR, TEXT_COLOR, WIN_COLOR
 from db_reader import DbReader
 
 GAME_ID_ROLE = 1000
@@ -35,12 +35,13 @@ RESULT_ORDER = {"Win": 0, "Draw": 1, "Loss": 2, "?": 3}
 DEFAULT_ASCENDING = {0: False, 1: True, 2: True, 3: True, 4: True, 5: True, 6: False}
 
 
-def _abbrev_date(date: str) -> str:
-    """"2026.09.05" -> "26.09.05" -- saves horizontal space in the row title;
-    the full year is already shown once on the tree's Year grouping node."""
+def _day_only(date: str) -> str:
+    """"2026.09.05" -> "05" -- the year and month are already shown once each
+    on the tree's Year/Month grouping nodes, so repeating them on every row
+    underneath is redundant; only the day actually varies row to row."""
     parts = date.split(".")
-    if len(parts) == 3 and len(parts[0]) == 4:
-        return f"{parts[0][2:]}.{parts[1]}.{parts[2]}"
+    if len(parts) == 3:
+        return parts[2]
     return date
 
 
@@ -145,12 +146,14 @@ class GameBrowser(QTreeWidget):
         for year in sorted(self._tree_data, reverse=True):
             year_label = str(year) if year else "Unknown date"
             year_item = QTreeWidgetItem([year_label])
+            year_item.setForeground(0, QBrush(QColor(TEXT_COLOR)))
             self.addTopLevelItem(year_item)
             months = self._tree_data[year]
             for month in sorted(months, reverse=True):
                 month_name = calendar.month_name[month] if 1 <= month <= 12 else "Unknown"
                 month_label = f"{month_name} ({len(months[month])})"
                 month_item = QTreeWidgetItem([month_label])
+                month_item.setForeground(0, QBrush(QColor(TEXT_COLOR)))
                 year_item.addChild(month_item)
 
                 games_sorted = sorted(months[month], key=lambda g: _sort_key(self._sort_column, g), reverse=reverse)
@@ -161,14 +164,23 @@ class GameBrowser(QTreeWidget):
                     # happened to sort in either direction.
                     games_sorted.sort(key=lambda g: g.your_elo is None)
                 for game in games_sorted:
-                    label = f"{_abbrev_date(game.date)}  vs {game.opponent}"
+                    label = f"{_day_only(game.date)}  vs {game.opponent}"
                     full_label = f"{game.date}  vs {game.opponent}"
                     color_display = game.your_color.capitalize()
                     elo_display = str(game.your_elo) if game.your_elo is not None else ""
                     game_item = QTreeWidgetItem(
                         [label, color_display, game.time_label, game.time_category, game.site, game.result, elo_display])
                     game_item.setData(0, GAME_ID_ROLE, game.id)
-                    game_item.setToolTip(0, full_label)  # full year on hover
+                    game_item.setToolTip(0, full_label)  # full date on hover
+                    # Qt's default item-text color resolves to black here (no
+                    # palette is set; the app just inherits Windows' dark
+                    # mode), which is unreadable against the dark background
+                    # -- give every column an explicit, visible color instead
+                    # of leaving it to that default. Result keeps its own
+                    # win/loss/draw color instead of the plain default.
+                    for col in range(len(COLUMNS)):
+                        if col != RESULT_COLUMN:
+                            game_item.setForeground(col, QBrush(QColor(TEXT_COLOR)))
                     result_color = _RESULT_COLOR.get(game.result, MUTED_COLOR)
                     game_item.setForeground(RESULT_COLUMN, QBrush(QColor(result_color)))
                     month_item.addChild(game_item)

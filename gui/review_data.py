@@ -19,13 +19,22 @@ Normalized shape:
               # lichess-style per-color game accuracy %. The whole key is
               # None (not per-color) for "basic"/"pending" sources, which
               # have no per-ply Stockfish data to derive it from.
+  "game_note": str | None,         # the user's own free-text note on this game, if any
+  "move_notes": {ply-1: str},      # the user's own per-move notes, 0-based indexed like mates/severities/best_moves
 }
 """
 from __future__ import annotations
 
 from analysis_cache import AnalysisRow
 from db_reader import GameDetail
+from notes import Notes
 from win_probability import classify_delta, game_accuracy, mate_to_cp_equivalent, move_accuracy_from_cp
+
+
+def _move_notes_by_idx(notes: Notes | None, game_id: int) -> dict[int, str]:
+    if notes is None:
+        return {}
+    return {ply - 1: text for ply, text in notes.get_move_notes(game_id).items()}
 
 
 def _game_dict_from_cli(cli_game: dict) -> dict:
@@ -41,9 +50,11 @@ def _game_dict_from_detail(detail: GameDetail) -> dict:
     }
 
 
-def build_basic_review_payload(cli_review_data: dict) -> dict:
+def build_basic_review_payload(cli_review_data: dict, game_id: int, notes: Notes | None = None) -> dict:
     """Wraps today's tempo.exe --json review output unchanged -- the basic
-    fallback path stays pixel-for-pixel identical to current behavior."""
+    fallback path stays pixel-for-pixel identical to current behavior.
+    `game_id` is needed explicitly (unlike the other two builders) since
+    the C++ Game JSON this wraps carries no id of its own."""
     return {
         "game": _game_dict_from_cli(cli_review_data["game"]),
         "evals": cli_review_data["evals"],
@@ -53,10 +64,12 @@ def build_basic_review_payload(cli_review_data: dict) -> dict:
         "source": "basic",
         "engine_label": "basic evaluator (no search) -- download Stockfish above the board for real analysis",
         "accuracy": None,
+        "game_note": notes.get_game_note(game_id) if notes else None,
+        "move_notes": _move_notes_by_idx(notes, game_id),
     }
 
 
-def build_moves_only_payload(game_detail: GameDetail, status_text: str) -> dict:
+def build_moves_only_payload(game_detail: GameDetail, status_text: str, notes: Notes | None = None) -> dict:
     """Just the recorded move list, no evaluation at all yet -- shown
     immediately so /review never makes you wait to see at least the moves
     while a Stockfish batch analysis (which can take a while for an
@@ -73,11 +86,14 @@ def build_moves_only_payload(game_detail: GameDetail, status_text: str) -> dict:
         "engine_label": None,
         "status_text": status_text,
         "accuracy": None,
+        "game_note": notes.get_game_note(game_detail.id) if notes else None,
+        "move_notes": _move_notes_by_idx(notes, game_detail.id),
     }
 
 
 def build_stockfish_review_payload(
     game_detail: GameDetail, cache_rows: list[AnalysisRow], engine_version: str, depth: int,
+    notes: Notes | None = None,
 ) -> dict:
     evals: list[int] = []
     mates: dict[int, int] = {}
@@ -110,6 +126,8 @@ def build_stockfish_review_payload(
         "source": "stockfish",
         "engine_label": f"{engine_version} (depth {depth})",
         "accuracy": accuracy,
+        "game_note": notes.get_game_note(game_detail.id) if notes else None,
+        "move_notes": _move_notes_by_idx(notes, game_detail.id),
     }
 
 

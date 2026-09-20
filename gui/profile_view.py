@@ -39,6 +39,7 @@ from eval_bar import EvalBar
 from explorer_panel import ExplorerPanel
 from fetch_worker import FetchWorker
 from game_browser import GameBrowser
+from notes import Notes
 from profiles import ProfileRecord
 from tempo_cli import TempoCli
 
@@ -121,11 +122,12 @@ class ProfileView(QWidget):
         self.db = DbReader(db_path)
         self.cli = TempoCli(db_path, profile.username)
         self.bookmarks = Bookmarks(db_path)
+        self.notes = Notes(db_path)
         self.cache = AnalysisCache(db_path)
         self.engine = EngineManager()
 
         self.command_panel = CommandPanel(
-            self.db, self.cli, self.cache, self.engine, self.bookmarks,
+            self.db, self.cli, self.cache, self.engine, self.bookmarks, self.notes,
             get_current_fen=lambda: self.board.fen(),
         )
         self.board = BoardWidget()
@@ -213,12 +215,15 @@ class ProfileView(QWidget):
         browser_layout.addWidget(self.browser)
 
         # Game list on top, opening explorer below -- both are board-position-
-        # driven archive views, sharing the right-hand column.
-        right_splitter = QSplitter(Qt.Orientation.Vertical)
-        right_splitter.addWidget(browser_container)
-        right_splitter.addWidget(self.explorer_panel)
-        right_splitter.setStretchFactor(0, 2)
-        right_splitter.setStretchFactor(1, 1)
+        # driven archive views, sharing the right-hand column. Stored on
+        # self so the collapse toggle button (built in _build_center_panel,
+        # which needs this to already exist -- see below) can show/hide the
+        # whole column.
+        self.right_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.right_splitter.addWidget(browser_container)
+        self.right_splitter.addWidget(self.explorer_panel)
+        self.right_splitter.setStretchFactor(0, 2)
+        self.right_splitter.setStretchFactor(1, 1)
 
         center = self._build_center_panel()
         self._update_move_counter()  # initial "Start" label -- otherwise blank until the first position_changed
@@ -226,7 +231,7 @@ class ProfileView(QWidget):
         splitter = QSplitter()
         splitter.addWidget(self.command_panel)
         splitter.addWidget(center)
-        splitter.addWidget(right_splitter)
+        splitter.addWidget(self.right_splitter)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
         splitter.setStretchFactor(2, 2)
@@ -244,6 +249,10 @@ class ProfileView(QWidget):
         self.board_size_btn = QPushButton("Larger board")
         self.bookmark_btn = QPushButton("Bookmark position")
         self.view_bookmarks_btn = QPushButton("View bookmarks")
+        # Lives here (not in browser_controls, inside the column it toggles)
+        # so it's still reachable to re-open the archive column once that
+        # column itself is hidden. Starts visible, so starts on "Hide".
+        self.archive_toggle_btn = QPushButton("◂ Hide archive")
 
         self.prev_btn.clicked.connect(self.board.prev_ply)
         self.next_btn.clicked.connect(self.board.next_ply)
@@ -253,6 +262,7 @@ class ProfileView(QWidget):
         self.board_size_btn.clicked.connect(self._on_toggle_board_size)
         self.bookmark_btn.clicked.connect(self._on_bookmark)
         self.view_bookmarks_btn.clicked.connect(self._on_view_bookmarks)
+        self.archive_toggle_btn.clicked.connect(self._on_toggle_archive)
 
         nav_row = QHBoxLayout()
         nav_row.addWidget(self.prev_btn)
@@ -260,6 +270,8 @@ class ProfileView(QWidget):
         nav_row.addWidget(self.mainline_btn)
         nav_row.addWidget(self.flip_btn)
         nav_row.addWidget(self.board_size_btn)
+        nav_row.addStretch(1)
+        nav_row.addWidget(self.archive_toggle_btn)
 
         bookmark_row = QHBoxLayout()
         bookmark_row.addWidget(self.bookmark_btn)
@@ -433,6 +445,14 @@ class ProfileView(QWidget):
         self.board.set_board_size(new_size)
         self.eval_bar.set_height(new_size)
         self.board_size_btn.setText("Smaller board" if enlarged else "Larger board")
+
+    def _on_toggle_archive(self) -> None:
+        # QSplitter reclaims a hidden child's space automatically (and
+        # restores it on show()) -- no manual size bookkeeping needed, just
+        # toggle visibility of the whole right-hand column.
+        now_visible = not self.right_splitter.isVisible()
+        self.right_splitter.setVisible(now_visible)
+        self.archive_toggle_btn.setText("◂ Hide archive" if now_visible else "▸ Show archive")
 
     def _update_nav_buttons(self) -> None:
         on_main = self.board.on_mainline

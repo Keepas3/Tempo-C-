@@ -12,6 +12,8 @@ COMMANDS = [
     ("/list", "[n]", "List the n most recent games (default 20)"),
     ("/show", "<id>", "Show a game's info and load it on the board"),
     ("/review", "<id>", "Replay a game with eval annotations, loaded on the board"),
+    ("/note", "<id> [text...]", "Add/replace a note on a game (empty text clears it)"),
+    ("/movenote", "<id> <ply> [text...]", "Add/replace a note on a specific move (empty text clears it)"),
     ("/stats", "[type...]", "Win rate, opening, and time-management stats (optionally filtered by game type)"),
     ("/rating", "[type...]", "Current rating and rating history (same filters as /stats)"),
     ("/opening", "<query>", "Win/loss record for an opening (name substring or ECO code)"),

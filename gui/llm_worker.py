@@ -23,6 +23,7 @@ from bookmarks import Bookmarks
 from db_reader import DbReader
 from engine import EngineManager
 from llm_tools import SYSTEM_PROMPT, ToolContext, ToolExecutor
+from notes import Notes
 from tempo_cli import TempoCli
 
 _STATUS_TEXT = {
@@ -37,6 +38,7 @@ _STATUS_TEXT = {
     "get_repertoire_stats": "Checking your repertoire...",
     "list_bookmarks": "Checking bookmarks...",
     "get_best_move_in_current_position": "Analyzing the current position...",
+    "get_game_notes": "Checking notes...",
 }
 
 
@@ -50,7 +52,7 @@ class LlmWorker(QThread):
     def __init__(
         self, api_key: str, tools: list[dict],
         db: DbReader, cli: TempoCli, cache: AnalysisCache, engine: EngineManager,
-        bookmarks: Bookmarks, get_current_fen: Callable[[], str],
+        bookmarks: Bookmarks, notes: Notes, get_current_fen: Callable[[], str],
         history: list[dict], user_message: str, parent=None,
     ) -> None:
         super().__init__(parent)
@@ -67,7 +69,7 @@ class LlmWorker(QThread):
         # signal here does -- calling a GUI-thread slot directly from a tool
         # handler running on this thread would violate Qt's thread affinity.
         ctx = ToolContext(
-            db=db, cli=cli, cache=cache, engine=engine, bookmarks=bookmarks,
+            db=db, cli=cli, cache=cache, engine=engine, bookmarks=bookmarks, notes=notes,
             get_current_fen=get_current_fen, on_status=self.status.emit,
         )
         self._executor = ToolExecutor(ctx)
