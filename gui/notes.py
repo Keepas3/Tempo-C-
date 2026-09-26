@@ -48,6 +48,17 @@ class Notes:
         finally:
             conn.close()
 
+    def get_all_game_notes(self) -> dict[int, str]:
+        """Every game-level note at once, keyed by game_id -- for the archive
+        browser's Notes column, so rendering the whole tree costs one query
+        instead of one per row."""
+        conn = self._connect()
+        try:
+            rows = conn.execute("SELECT game_id, note FROM game_notes;").fetchall()
+            return {game_id: note for game_id, note in rows}
+        finally:
+            conn.close()
+
     def set_game_note(self, game_id: int, text: str) -> None:
         """Empty/whitespace-only text deletes the note instead of storing an
         empty string -- lets "/note <id>" with no trailing text act as

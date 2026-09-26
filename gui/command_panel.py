@@ -1007,6 +1007,7 @@ class CommandPanel(QWidget):
         self.notes.set_game_note(game_id, text)
         self._print(f'<span style="color:{MUTED_COLOR}">Note {"cleared" if not text else "saved"} for game #{game_id}.</span>')
         self._refresh_notes_in_current_review(game_id)
+        self.archive_updated.emit()  # so the archive browser's Notes column picks up the change immediately
 
     def _dispatch_movenote(self, args: list[str]) -> None:
         # /movenote <id> <ply> [text...] -- ply matches the "ply:<id>:<ply>"

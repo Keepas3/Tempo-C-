@@ -131,7 +131,7 @@ class ProfileView(QWidget):
             get_current_fen=lambda: self.board.fen(),
         )
         self.board = BoardWidget()
-        self.browser = GameBrowser(self.db)
+        self.browser = GameBrowser(self.db, self.notes)
         self.explorer_panel = ExplorerPanel()
 
         self.browser.game_selected.connect(self.load_game)

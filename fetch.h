@@ -20,9 +20,16 @@ inline bool is_valid_username(const std::string& name) {
 // Runs curl to fetch `url` into `out_path`, optionally with extra headers.
 // Returns true only on a clean HTTP success (curl's -f makes it fail, rather
 // than writing an error page, on 4xx/5xx responses).
+//
+// Always sends a User-Agent -- curl's own default is a bare "curl/<version>"
+// string, and chess.com's API started outright 403-ing requests with no (or
+// a generic/bot-looking) User-Agent header. A real browser-style UA is the
+// simplest fix and costs nothing for lichess, which never required one.
 inline bool fetch_url_to_file(const std::string& url, const std::string& out_path,
                                const std::vector<std::string>& extra_headers = {}) {
-    std::string cmd = "curl -s -S -f -L --max-time 30 -o \"" + out_path + "\"";
+    std::string cmd = "curl -s -S -f -L --max-time 30 "
+                       "-H \"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) TempoArchive/1.0\" "
+                       "-o \"" + out_path + "\"";
     for (const std::string& header : extra_headers) {
         cmd += " -H \"" + header + "\"";
     }

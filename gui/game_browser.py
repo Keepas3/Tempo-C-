@@ -14,11 +14,14 @@ from PySide6.QtWidgets import QHeaderView, QTreeWidget, QTreeWidgetItem
 
 from colors import DRAW_COLOR, LOSS_COLOR, MUTED_COLOR, TEXT_COLOR, WIN_COLOR
 from db_reader import DbReader
+from notes import Notes
 
 GAME_ID_ROLE = 1000
-COLUMNS = ["Game", "Color", "Time", "Type", "Site", "Result", "Elo"]
+COLUMNS = ["Game", "Color", "Time", "Type", "Site", "Result", "Elo", "Notes"]
 RESULT_COLUMN = 5
 ELO_COLUMN = 6
+NOTES_COLUMN = 7
+NOTE_TRUNCATE_CHARS = 28  # keeps the column narrow -- the full text is always in the tooltip
 
 _RESULT_COLOR = {"Win": WIN_COLOR, "Loss": LOSS_COLOR, "Draw": DRAW_COLOR}
 
@@ -32,7 +35,14 @@ RESULT_ORDER = {"Win": 0, "Draw": 1, "Loss": 2, "?": 3}
 # rest default to ascending (White before Black / lowest time / earliest
 # category / A-Z / best result first). Elo defaults descending (highest
 # rating first), matching how chess sites usually show it.
-DEFAULT_ASCENDING = {0: False, 1: True, 2: True, 3: True, 4: True, 5: True, 6: False}
+DEFAULT_ASCENDING = {0: False, 1: True, 2: True, 3: True, 4: True, 5: True, 6: False, 7: True}
+
+
+def _truncate_note(note: str) -> str:
+    note = " ".join(note.split())  # collapse embedded newlines/extra whitespace to keep the row single-line
+    if len(note) <= NOTE_TRUNCATE_CHARS:
+        return note
+    return note[:NOTE_TRUNCATE_CHARS - 1].rstrip() + "…"
 
 
 def _day_only(date: str) -> str:
@@ -45,7 +55,7 @@ def _day_only(date: str) -> str:
     return date
 
 
-def _sort_key(column: int, game) -> object:
+def _sort_key(column: int, game, notes_by_id: dict[int, str]) -> object:
     if column == 1:
         return COLOR_ORDER.get(game.your_color, len(COLOR_ORDER))
     if column == 2:
@@ -58,15 +68,18 @@ def _sort_key(column: int, game) -> object:
         return RESULT_ORDER.get(game.result, len(RESULT_ORDER))
     if column == ELO_COLUMN:
         return game.your_elo if game.your_elo is not None else 0
+    if column == NOTES_COLUMN:
+        return notes_by_id.get(game.id, "")
     return game.date  # column 0 (or anything unrecognized): "YYYY.MM.DD" sorts correctly as text
 
 
 class GameBrowser(QTreeWidget):
     game_selected = Signal(int)
 
-    def __init__(self, db: DbReader, parent=None):
+    def __init__(self, db: DbReader, notes: Notes, parent=None):
         super().__init__(parent)
         self.db = db
+        self.notes = notes
         self._items_by_id: dict[int, QTreeWidgetItem] = {}
         self._tree_data: dict[int, dict[int, list]] = {}
         self._sort_column = 0
@@ -87,6 +100,7 @@ class GameBrowser(QTreeWidget):
         self.setColumnWidth(4, 80)
         self.setColumnWidth(5, 60)
         self.setColumnWidth(6, 55)
+        self.setColumnWidth(7, 130)
         self.header().setSortIndicatorShown(True)
         # Without this, sectionClicked never fires -- clicking a header does
         # nothing (the header just looks clickable because of the sort
@@ -142,6 +156,9 @@ class GameBrowser(QTreeWidget):
         self.clear()
         self._items_by_id = {}
         reverse = not self._sort_ascending
+        # One query for every game's note rather than one per row -- the
+        # tree can easily have hundreds of games.
+        notes_by_id = self.notes.get_all_game_notes()
 
         for year in sorted(self._tree_data, reverse=True):
             year_label = str(year) if year else "Unknown date"
@@ -156,22 +173,32 @@ class GameBrowser(QTreeWidget):
                 month_item.setForeground(0, QBrush(QColor(TEXT_COLOR)))
                 year_item.addChild(month_item)
 
-                games_sorted = sorted(months[month], key=lambda g: _sort_key(self._sort_column, g), reverse=reverse)
+                games_sorted = sorted(months[month], key=lambda g: _sort_key(self._sort_column, g, notes_by_id), reverse=reverse)
                 if self._sort_column == ELO_COLUMN:
                     # Second, stable pass: push games with no rating data to
                     # the end regardless of sort direction, rather than
                     # having them land wherever their placeholder 0 key
                     # happened to sort in either direction.
                     games_sorted.sort(key=lambda g: g.your_elo is None)
+                elif self._sort_column == NOTES_COLUMN:
+                    # Same idea: games with no note at all sort to the end
+                    # regardless of direction, rather than empty strings
+                    # winning every ascending sort by virtue of being "".
+                    games_sorted.sort(key=lambda g: g.id not in notes_by_id)
                 for game in games_sorted:
                     label = f"{_day_only(game.date)}  vs {game.opponent}"
                     full_label = f"{game.date}  vs {game.opponent}"
                     color_display = game.your_color.capitalize()
                     elo_display = str(game.your_elo) if game.your_elo is not None else ""
+                    note = notes_by_id.get(game.id, "")
+                    notes_display = _truncate_note(note)
                     game_item = QTreeWidgetItem(
-                        [label, color_display, game.time_label, game.time_category, game.site, game.result, elo_display])
+                        [label, color_display, game.time_label, game.time_category, game.site, game.result,
+                         elo_display, notes_display])
                     game_item.setData(0, GAME_ID_ROLE, game.id)
                     game_item.setToolTip(0, full_label)  # full date on hover
+                    if note:
+                        game_item.setToolTip(NOTES_COLUMN, note)  # full text on hover, since the cell itself is truncated
                     # Qt's default item-text color resolves to black here (no
                     # palette is set; the app just inherits Windows' dark
                     # mode), which is unreadable against the dark background
