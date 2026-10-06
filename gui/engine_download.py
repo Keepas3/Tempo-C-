@@ -12,6 +12,7 @@ every major chess GUI uses. See README.md for the disclosure note.
 """
 from __future__ import annotations
 
+import hashlib
 import shutil
 import tempfile
 import urllib.request
@@ -29,6 +30,12 @@ from engine import ENGINE_DIR, ENGINE_EXE_PATH, save_settings
 RELEASE_TAG = "sf_19"
 ASSET_NAME = "stockfish-windows-x86-64-universal.zip"
 DOWNLOAD_URL = f"https://github.com/official-stockfish/Stockfish/releases/download/{RELEASE_TAG}/{ASSET_NAME}"
+# The official release's own published digest for ASSET_NAME (from GitHub's
+# release API, "digest" field on this exact asset) -- pinned here so a
+# compromised release asset or a MITM with a trusted local root CA can't
+# swap in a different binary silently. Update this alongside RELEASE_TAG/
+# ASSET_NAME whenever bumping to a newer Stockfish release.
+ASSET_SHA256 = "3c8bf1f9ea66a09350a40df4f632288285ac206d99f33ab5842c408fc30b48a7"
 
 
 class EngineDownloadWorker(QThread):
@@ -42,12 +49,33 @@ class EngineDownloadWorker(QThread):
             zip_path = staging_dir / "stockfish.zip"
             self._download(DOWNLOAD_URL, zip_path)
 
+            actual_sha256 = self._sha256(zip_path)
+            if actual_sha256 != ASSET_SHA256:
+                self.failed.emit(
+                    f"downloaded file's SHA-256 doesn't match the pinned official release digest "
+                    f"(expected {ASSET_SHA256}, got {actual_sha256}) -- refusing to run it"
+                )
+                return
+
             if not zipfile.is_zipfile(zip_path):
                 self.failed.emit("downloaded file is not a valid zip archive")
                 return
 
             extract_dir = staging_dir / "extracted"
+            extract_dir_resolved = extract_dir.resolve()
             with zipfile.ZipFile(zip_path) as zf:
+                # Defense-in-depth against "zip slip": a malicious archive
+                # (e.g. if the pinned GitHub release were ever compromised,
+                # or a MITM with a trusted local root CA) could otherwise
+                # smuggle a `../`-prefixed member name to write outside
+                # extract_dir. DOWNLOAD_URL is a fixed, official source
+                # fetched over HTTPS, so this isn't reachable today -- but
+                # it's a one-time check up front, so leaving it out would be
+                # trusting the source unconditionally for no real cost saved.
+                for member in zf.namelist():
+                    if not (extract_dir / member).resolve().is_relative_to(extract_dir_resolved):
+                        self.failed.emit(f"refusing to extract unsafe archive entry: {member!r}")
+                        return
                 zf.extractall(extract_dir)
 
             exe_candidates = list(extract_dir.rglob("*.exe"))
@@ -83,6 +111,13 @@ class EngineDownloadWorker(QThread):
                     f.write(chunk)
                     downloaded += len(chunk)
                     self.progress.emit(downloaded, total)
+
+    def _sha256(self, path: Path) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 256), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     def _verify(self, exe_path: Path) -> str:
         engine = chess.engine.SimpleEngine.popen_uci(str(exe_path))

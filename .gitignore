@@ -13,3 +13,5 @@ gui/engine/
 gui/data/engine.json
 __pycache__/
 *.pyc
+.env
+

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import chess.engine
 from PySide6.QtCore import QThread, Signal
 
 from analysis_cache import AnalysisCache

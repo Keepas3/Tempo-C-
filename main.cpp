@@ -414,7 +414,7 @@ std::vector<FetchResult> fetch_chesscom_results(Archive& archive, const std::str
         int cur_year = local_tm->tm_year + 1900;
         int cur_month = local_tm->tm_mon + 1;
 
-        std::optional<FetchHistoryRow> history = archive.get_last_fetch("chesscom");
+        std::optional<FetchHistoryRow> history = archive.get_last_fetch("chesscom", username);
         if (!history || history->last_covered_year == 0) {
             // No history yet -- unchanged default: current + previous month.
             int prev_year = (cur_month == 1) ? cur_year - 1 : cur_year;
@@ -450,7 +450,7 @@ std::vector<FetchResult> fetch_chesscom_results(Archive& archive, const std::str
         if (y > best_year || (y == best_year && m > best_month)) { best_year = y; best_month = m; }
     }
     if (best_year > 0) {
-        std::optional<FetchHistoryRow> existing = archive.get_last_fetch("chesscom");
+        std::optional<FetchHistoryRow> existing = archive.get_last_fetch("chesscom", username);
         if (existing && existing->last_covered_year > 0) {
             if (existing->last_covered_year > best_year ||
                 (existing->last_covered_year == best_year && existing->last_covered_month > best_month)) {
@@ -458,7 +458,7 @@ std::vector<FetchResult> fetch_chesscom_results(Archive& archive, const std::str
                 best_month = existing->last_covered_month;
             }
         }
-        archive.record_fetch("chesscom", best_year, best_month);
+        archive.record_fetch("chesscom", username, best_year, best_month);
     }
 
     return results;
@@ -495,7 +495,7 @@ FetchResult fetch_lichess_result(Archive& archive, const std::string& username, 
         return r;
     }
 
-    std::optional<FetchHistoryRow> history = (!full && days == -1) ? archive.get_last_fetch("lichess") : std::nullopt;
+    std::optional<FetchHistoryRow> history = (!full && days == -1) ? archive.get_last_fetch("lichess", username) : std::nullopt;
 
     fs::path tmp = fs::temp_directory_path() / "tempo_fetch_lichess.pgn";
     bool ok;
@@ -526,7 +526,7 @@ FetchResult fetch_lichess_result(Archive& archive, const std::string& username, 
     std::error_code ec;
     fs::remove(tmp, ec);
 
-    archive.record_fetch("lichess"); // until is always "now", so an unconditional overwrite is always safe
+    archive.record_fetch("lichess", username); // until is always "now", so an unconditional overwrite is always safe
     return r;
 }
 
@@ -694,8 +694,8 @@ int run_json_command(Archive& archive, const std::vector<std::string>& args) {
                 return 1;
             }
         } else if (cmd == "last_fetch") {
-            std::optional<FetchHistoryRow> chesscom = archive.get_last_fetch("chesscom");
-            std::optional<FetchHistoryRow> lichess = archive.get_last_fetch("lichess");
+            std::optional<FetchHistoryRow> chesscom = archive.get_latest_fetch_any_user("chesscom");
+            std::optional<FetchHistoryRow> lichess = archive.get_latest_fetch_any_user("lichess");
             std::ostringstream o;
             o << "{\"chesscom\": " << (chesscom ? to_json(*chesscom) : "null")
               << ", \"lichess\": " << (lichess ? to_json(*lichess) : "null") << "}";

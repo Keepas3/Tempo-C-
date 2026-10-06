@@ -6,6 +6,7 @@ what used to be MainWindow's whole body, unchanged in behavior.
 from __future__ import annotations
 
 import html
+from datetime import datetime
 
 import chess
 import chess.engine
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QPushButton,
@@ -29,7 +31,7 @@ from PySide6.QtWidgets import (
 from analysis_cache import AnalysisCache
 from board_widget import BOARD_SIZE, BoardWidget
 from bookmarks import Bookmark, Bookmarks
-from colors import HEADER_COLOR, LOSS_COLOR, MUTED_COLOR, WIN_COLOR
+from colors import HEADER_COLOR, LOSS_COLOR, MUTED_COLOR, TEXT_COLOR, WIN_COLOR
 from command_panel import CommandPanel
 from db_reader import DbReader, game_summary_to_row
 import engine as engine_module
@@ -39,6 +41,8 @@ from eval_bar import EvalBar
 from explorer_panel import ExplorerPanel
 from fetch_worker import FetchWorker
 from game_browser import GameBrowser
+from favorites import Favorites
+from game_search import GameSearchFilter, search_games
 from notes import Notes
 from profiles import ProfileRecord
 from tempo_cli import TempoCli
@@ -68,23 +72,83 @@ LARGE_BOARD_SIZE = 640
 BOOKMARK_ID_ROLE = 1000
 
 
+def _format_bookmark_timestamp(created_at: str) -> str:
+    """Bookmarks.add() stores this as datetime.now(timezone.utc).isoformat()
+    -- parse that back into a compact, locale-local, human-readable stamp
+    instead of showing the raw ISO string."""
+    try:
+        dt = datetime.fromisoformat(created_at)
+        return dt.astimezone().strftime("%b %d, %Y %I:%M %p").replace(" 0", " ")
+    except ValueError:
+        return created_at
+
+
+class _BookmarkRowWidget(QWidget):
+    """One bookmark's row: the note as the prominent, word-wrapped line
+    (previously squeezed onto the same single line as the game/ply/date
+    metadata, which is why it was hard to read -- see the docked note
+    below), with that metadata demoted to a second, smaller/muted line.
+
+    A plain QListWidgetItem string can't word-wrap or use two visually
+    distinct lines, so this is a real child widget instead (set via
+    QListWidget.setItemWidget) -- which also means mouse events land on
+    *this* widget first rather than reaching QListWidget's own selection/
+    double-click handling, so both are re-implemented here explicitly
+    (mousePressEvent selects the row, mouseDoubleClickEvent loads it)."""
+
+    def __init__(self, list_widget: QListWidget, item: QListWidgetItem, bookmark: Bookmark, on_double_click):
+        super().__init__()
+        self._list_widget = list_widget
+        self._item = item
+        self.bookmark = bookmark
+        self._on_double_click = on_double_click
+
+        note_text = html.escape(bookmark.note) if bookmark.note else "No note"
+        note_color = TEXT_COLOR if bookmark.note else MUTED_COLOR
+        note_label = QLabel(f'<span style="color:{note_color};">{note_text}</span>')
+        note_label.setWordWrap(True)
+        note_label.setFont(QFont("Segoe UI", 11))
+
+        meta_parts = []
+        if bookmark.source_game_id is not None:
+            meta_parts.append(f"Game #{bookmark.source_game_id}, ply {bookmark.source_ply}")
+        meta_parts.append(_format_bookmark_timestamp(bookmark.created_at))
+        meta_label = QLabel(f'<span style="color:{MUTED_COLOR};">{" &middot;&nbsp; ".join(meta_parts)}</span>')
+        meta_label.setFont(QFont("Segoe UI", 9))
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(3)
+        layout.addWidget(note_label)
+        layout.addWidget(meta_label)
+
+    def mousePressEvent(self, event) -> None:
+        self._list_widget.setCurrentItem(self._item)
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        self._on_double_click(self.bookmark)
+        super().mouseDoubleClickEvent(event)
+
+
 class BookmarksDialog(QDialog):
     def __init__(self, parent, bookmarks: Bookmarks, on_select):
         super().__init__(parent)
         self.setWindowTitle("Bookmarks")
-        self.resize(500, 400)
+        self.resize(560, 440)
         self._bookmarks = bookmarks
         self._on_select = on_select
 
         self.list_widget = QListWidget()
+        self.list_widget.setAlternatingRowColors(True)  # matches the archive browser's zebra striping -- rows this dense need it
+        self.list_widget.setSpacing(2)
         for b in bookmarks.list_all():
-            label = b.note or "(no note)"
-            if b.source_game_id is not None:
-                label = f"{label}  [game #{b.source_game_id}, ply {b.source_ply}]"
-            item = QListWidgetItem(f"{label}   -- {b.created_at}")
+            item = QListWidgetItem()
             item.setData(BOOKMARK_ID_ROLE, b)
             self.list_widget.addItem(item)
-        self.list_widget.itemDoubleClicked.connect(self._on_double_click)
+            row_widget = _BookmarkRowWidget(self.list_widget, item, b, self._on_double_click)
+            self.list_widget.setItemWidget(item, row_widget)
+            item.setSizeHint(row_widget.sizeHint())
 
         delete_btn = QPushButton("Delete selected")
         delete_btn.clicked.connect(self._on_delete)
@@ -94,8 +158,7 @@ class BookmarksDialog(QDialog):
         layout.addWidget(self.list_widget)
         layout.addWidget(delete_btn)
 
-    def _on_double_click(self, item: QListWidgetItem) -> None:
-        bookmark = item.data(BOOKMARK_ID_ROLE)
+    def _on_double_click(self, bookmark: Bookmark) -> None:
         self._on_select(bookmark)
         self.accept()
 
@@ -123,6 +186,7 @@ class ProfileView(QWidget):
         self.cli = TempoCli(db_path, profile.username)
         self.bookmarks = Bookmarks(db_path)
         self.notes = Notes(db_path)
+        self.favorites = Favorites(db_path)
         self.cache = AnalysisCache(db_path)
         self.engine = EngineManager()
 
@@ -131,11 +195,14 @@ class ProfileView(QWidget):
             get_current_fen=lambda: self.board.fen(),
         )
         self.board = BoardWidget()
-        self.browser = GameBrowser(self.db, self.notes)
+        self.browser = GameBrowser(self.db, self.notes, self.favorites)
         self.explorer_panel = ExplorerPanel()
 
         self.browser.game_selected.connect(self.load_game)
+        self.browser.favorite_toggled.connect(self._on_browser_favorite_toggled)
         self.browser.game_selected.connect(self._on_browser_game_selected)
+        self.browser.jump_to_start_requested.connect(lambda _gid: self.go_to_start())
+        self.browser.jump_to_end_requested.connect(lambda _gid: self.go_to_end())
         self.command_panel.game_requested.connect(self.load_game)
         self.command_panel.move_requested.connect(self._on_move_requested)
         self.command_panel.archive_updated.connect(self.browser.refresh)
@@ -208,10 +275,60 @@ class ProfileView(QWidget):
         browser_controls.addWidget(self.show_review_checkbox)
         browser_controls.addStretch(1)
 
+        # Archive query bar: filters the tree by type/result/color/text
+        # together (all four AND'd) instead of only being able to sort by
+        # clicking a column header -- e.g. "Blitz games I lost" is
+        # type=Blitz + result=Loss. Filters over the already-loaded archive
+        # in-memory (game_search.py), so every change re-renders instantly,
+        # no debounce needed. Mutually exclusive with "Live query by board"
+        # above (see _on_archive_filter_changed/_on_live_query_toggled) --
+        # both ultimately drive the same browser.show_filtered(), so having
+        # both active at once would just mean whichever fired last silently
+        # wins; turning one on always turns the other off instead.
+        self.filter_type_combo = QComboBox()
+        self.filter_type_combo.addItem("All types", None)
+        for label in ("Bullet", "Blitz", "Rapid", "Classical", "Daily"):
+            self.filter_type_combo.addItem(label, label)
+
+        self.filter_result_combo = QComboBox()
+        self.filter_result_combo.addItem("All results", None)
+        for label in ("Win", "Loss", "Draw"):
+            self.filter_result_combo.addItem(label, label)
+
+        self.filter_color_combo = QComboBox()
+        self.filter_color_combo.addItem("Either color", None)
+        self.filter_color_combo.addItem("White", "white")
+        self.filter_color_combo.addItem("Black", "black")
+
+        self.filter_text_edit = QLineEdit()
+        self.filter_text_edit.setPlaceholderText("Search opponent/opening/notes...")
+
+        self.filter_favorites_btn = QPushButton("★ Favorites")
+        self.filter_favorites_btn.setCheckable(True)
+        self.filter_favorites_btn.setToolTip("Show only starred games")
+
+        self.filter_clear_btn = QPushButton("Clear")
+
+        self.filter_type_combo.currentIndexChanged.connect(self._on_archive_filter_changed)
+        self.filter_result_combo.currentIndexChanged.connect(self._on_archive_filter_changed)
+        self.filter_color_combo.currentIndexChanged.connect(self._on_archive_filter_changed)
+        self.filter_text_edit.textChanged.connect(self._on_archive_filter_changed)
+        self.filter_favorites_btn.toggled.connect(self._on_archive_filter_changed)
+        self.filter_clear_btn.clicked.connect(self._on_clear_archive_filters)
+
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(self.filter_type_combo)
+        filter_row.addWidget(self.filter_result_combo)
+        filter_row.addWidget(self.filter_color_combo)
+        filter_row.addWidget(self.filter_favorites_btn)
+        filter_row.addWidget(self.filter_text_edit, 1)
+        filter_row.addWidget(self.filter_clear_btn)
+
         browser_container = QWidget()
         browser_layout = QVBoxLayout(browser_container)
         browser_layout.setContentsMargins(0, 0, 0, 0)
         browser_layout.addLayout(browser_controls)
+        browser_layout.addLayout(filter_row)
         browser_layout.addWidget(self.browser)
 
         # Game list on top, opening explorer below -- both are board-position-
@@ -249,6 +366,13 @@ class ProfileView(QWidget):
         self.board_size_btn = QPushButton("Larger board")
         self.bookmark_btn = QPushButton("Bookmark position")
         self.view_bookmarks_btn = QPushButton("View bookmarks")
+        # Distinct from a bookmark's own (position-specific) note -- this is
+        # one note per whole game, e.g. "Ponziani opening with exchange in
+        # the center", shown in /show and /review and searchable from the
+        # archive's query bar (see game_search.py's `text` filter).
+        self.game_note_btn = QPushButton("Add/edit game note")
+        self.favorite_btn = QPushButton("☆ Favorite")
+        self.favorite_btn.setToolTip("Star the loaded game (also togglable from the archive's ★ column)")
         # Lives here (not in browser_controls, inside the column it toggles)
         # so it's still reachable to re-open the archive column once that
         # column itself is hidden. Starts visible, so starts on "Hide".
@@ -262,6 +386,8 @@ class ProfileView(QWidget):
         self.board_size_btn.clicked.connect(self._on_toggle_board_size)
         self.bookmark_btn.clicked.connect(self._on_bookmark)
         self.view_bookmarks_btn.clicked.connect(self._on_view_bookmarks)
+        self.game_note_btn.clicked.connect(self._on_edit_game_note)
+        self.favorite_btn.clicked.connect(self._on_toggle_favorite)
         self.archive_toggle_btn.clicked.connect(self._on_toggle_archive)
 
         nav_row = QHBoxLayout()
@@ -276,6 +402,8 @@ class ProfileView(QWidget):
         bookmark_row = QHBoxLayout()
         bookmark_row.addWidget(self.bookmark_btn)
         bookmark_row.addWidget(self.view_bookmarks_btn)
+        bookmark_row.addWidget(self.game_note_btn)
+        bookmark_row.addWidget(self.favorite_btn)
 
         self.status_label = QLabel("No game loaded.")
 
@@ -384,6 +512,11 @@ class ProfileView(QWidget):
         # than back to the branch point.
         self.board.set_ply(0)
 
+    def go_to_end(self) -> None:
+        # The true end of the recorded game, even from a branched sideline
+        # -- mirrors go_to_start's "true start regardless of branch" choice.
+        self.board.set_ply(len(self.board.mainline_sans))
+
     def load_game(self, game_id: int) -> None:
         detail = self.db.load_game(game_id)
         if detail is None:
@@ -408,6 +541,7 @@ class ProfileView(QWidget):
             f"#{game_id}  {detail.white} vs {detail.black}  ({detail.date}, {detail.result})  [{detail.site}]"
         )
         self._update_nav_buttons()
+        self._refresh_favorite_btn()
         self.browser.select_game(game_id)  # keep the browser's selection in sync regardless of how the game was loaded
 
     def _on_browser_game_selected(self, game_id: int) -> None:
@@ -486,6 +620,7 @@ class ProfileView(QWidget):
 
     def _on_live_query_toggled(self, checked: bool) -> None:
         if checked:
+            self._clear_archive_filters()  # mutually exclusive -- see the filter_row comment above
             self._live_query_timer.start()
 
     def _run_live_query(self) -> None:
@@ -511,6 +646,46 @@ class ProfileView(QWidget):
         if generation != self._live_query_generation:
             return
         self.status_label.setText(f"Live query failed: {message}")
+
+    # --- Archive query filter (type/result/color/text) ----------------------
+
+    def _on_archive_filter_changed(self) -> None:
+        time_category = self.filter_type_combo.currentData()
+        result = self.filter_result_combo.currentData()
+        color = self.filter_color_combo.currentData()
+        text = self.filter_text_edit.text().strip() or None
+        favorites_only = self.filter_favorites_btn.isChecked()
+
+        if not (time_category or result or color or text or favorites_only):
+            self.browser.refresh()  # nothing active -- back to the normal unfiltered view
+            return
+
+        if self.live_query_checkbox.isChecked():
+            self.live_query_checkbox.setChecked(False)  # mutually exclusive, see filter_row's comment above
+
+        filt = GameSearchFilter(time_category=time_category, result=result, color=color, text=text,
+                                favorites_only=favorites_only, limit=100000)
+        matches, _total = search_games(self.db, filt, self.notes, self.favorites)
+        self.browser.show_filtered(matches)
+
+    def _clear_archive_filters(self) -> None:
+        # blockSignals so resetting four widgets doesn't re-run the filter
+        # (and re-render the tree) four times on the way to "nothing active"
+        # -- one explicit refresh() at the end is enough.
+        for widget in (self.filter_type_combo, self.filter_result_combo, self.filter_color_combo):
+            widget.blockSignals(True)
+            widget.setCurrentIndex(0)
+            widget.blockSignals(False)
+        self.filter_text_edit.blockSignals(True)
+        self.filter_text_edit.clear()
+        self.filter_text_edit.blockSignals(False)
+        self.filter_favorites_btn.blockSignals(True)
+        self.filter_favorites_btn.setChecked(False)
+        self.filter_favorites_btn.blockSignals(False)
+
+    def _on_clear_archive_filters(self) -> None:
+        self._clear_archive_filters()
+        self.browser.refresh()
 
     # --- Live board-driven opening explorer ---------------------------------
 
@@ -744,6 +919,43 @@ class ProfileView(QWidget):
         dialog = BookmarksDialog(self, self.bookmarks, self._load_bookmark)
         dialog.exec()
 
+    def _refresh_favorite_btn(self) -> None:
+        is_fav = self.current_game_id is not None and self.favorites.is_favorite(self.current_game_id)
+        self.favorite_btn.setText("★ Favorited" if is_fav else "☆ Favorite")
+
+    def _on_toggle_favorite(self) -> None:
+        if self.current_game_id is None:
+            self.status_label.setText("Load a game from the archive first to favorite it.")
+            return
+        self.browser.toggle_favorite(self.current_game_id)  # persists, updates the row's star, emits favorite_toggled
+
+    def _on_browser_favorite_toggled(self, game_id: int, _favorite: bool) -> None:
+        if game_id == self.current_game_id:
+            self._refresh_favorite_btn()
+        if self.filter_favorites_btn.isChecked():
+            self._on_archive_filter_changed()  # un-starring should drop the row from a favorites-only view
+
+    def _on_edit_game_note(self) -> None:
+        """Add or edit the one note attached to the whole currently-loaded
+        game (distinct from a bookmark's own position-specific note) -- the
+        GUI-button equivalent of typing /note <id> <text...> in chat, for
+        whichever game is already on the board instead of by id. Shows the
+        existing note pre-filled (so this doubles as "edit"), and an empty
+        result clears it, matching Notes.set_game_note's own convention."""
+        if self.current_game_id is None:
+            self.status_label.setText("Load a game from the archive first to add a note to it.")
+            return
+        game_id = self.current_game_id
+        existing = self.notes.get_game_note(game_id) or ""
+        text, ok = QInputDialog.getMultiLineText(
+            self, "Game note", f"Note for game #{game_id} (leave empty to clear):", existing)
+        if not ok:
+            return
+        self.notes.set_game_note(game_id, text)
+        self.status_label.setText(f"Note {'cleared' if not text.strip() else 'saved'} for game #{game_id}.")
+        self.browser.refresh()  # picks up the change in the archive's Notes column right away
+        self.command_panel.refresh_notes_in_current_review(game_id)  # updates an already-open /review for this game too
+
     def _load_bookmark(self, bookmark: Bookmark) -> None:
         if bookmark.source_game_id is not None and bookmark.source_ply is not None:
             self.load_game(bookmark.source_game_id)
@@ -757,5 +969,6 @@ class ProfileView(QWidget):
             self.board.selected_square = None
             self.board._render()
             self.current_game_id = None
+            self._refresh_favorite_btn()
             self.status_label.setText(f"Loaded bookmark: {bookmark.note or '(no note)'}")
         self._update_nav_buttons()

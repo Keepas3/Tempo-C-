@@ -151,6 +151,7 @@ class CommandPanel(QWidget):
         self._llm_history: list[dict] = []
         self._llm_start: QTextCursor | None = None
         self._llm_end: QTextCursor | None = None
+        self._llm_msg_id: int | None = None
 
         # The data behind whatever review is currently shown in the chat,
         # kept around so set_review_ply can cheaply re-render with a
@@ -160,6 +161,19 @@ class CommandPanel(QWidget):
         self._last_review_game_id: int | None = None
         self._review_block_start: QTextCursor | None = None
         self._review_block_end: QTextCursor | None = None
+        self._review_block_msg_id: int | None = None
+
+        # Every chat message is an individually-closable block: a small "x"
+        # rendered top-right (see _closable_prefix), wired here to whatever
+        # region of the QTextBrowser document it actually occupies. Keyed by
+        # an incrementing id rather than by cursor alone so a specialized
+        # renderer (stats/review/etc, below) can pass an `on_close` callback
+        # that resets its own *_start/*_end state -- otherwise a stray
+        # update after the user dismissed that block (e.g. a background
+        # analysis still streaming into a closed /review) would silently
+        # re-insert it instead of being a no-op.
+        self._next_msg_id = 1
+        self._closable_blocks: dict[int, tuple[QTextCursor, QTextCursor, Callable[[int], None] | None]] = {}
 
         self.output = QTextBrowser()
         self.output.setReadOnly(True)
@@ -228,6 +242,7 @@ class CommandPanel(QWidget):
         self._expanded_openings: set[str] = set()
         self._stats_start: QTextCursor | None = None
         self._stats_end: QTextCursor | None = None
+        self._stats_msg_id: int | None = None
         # Recent-games lookups are fetched lazily (only when a row is first
         # expanded) and cached here so re-collapsing/re-expanding is instant.
         self._opening_games_cache: dict[tuple[str, str], list[dict]] = {}
@@ -244,6 +259,7 @@ class CommandPanel(QWidget):
         self._opening_results_show_all = False
         self._opening_results_start: QTextCursor | None = None
         self._opening_results_end: QTextCursor | None = None
+        self._opening_results_msg_id: int | None = None
 
         # Last /rating result, following the exact same pattern as /stats
         # above (re-rendered in place on Range-combo changes) plus the same
@@ -253,6 +269,7 @@ class CommandPanel(QWidget):
         self._rating_show_all = False
         self._rating_start: QTextCursor | None = None
         self._rating_end: QTextCursor | None = None
+        self._rating_msg_id: int | None = None
 
         # /explorer repertoire browser: which color and how deep into the
         # move tree the current block shows, so drilling into a move or
@@ -263,6 +280,7 @@ class CommandPanel(QWidget):
         self._explorer_replies: list[dict] | None = None
         self._explorer_start: QTextCursor | None = None
         self._explorer_end: QTextCursor | None = None
+        self._explorer_msg_id: int | None = None
 
         self._print(WELCOME_TEXT)
         self._refresh_last_fetch_row()
@@ -296,12 +314,23 @@ class CommandPanel(QWidget):
         lc = self._format_last_fetch(data.get("lichess"))
         self.last_fetch_label.setText(f"Last fetched — chess.com: {cc}, lichess: {lc}")
 
-    def _print(self, html_fragment: str) -> None:
-        self.output.append(html_fragment)
+    def _print(self, html_fragment: str, on_close: Callable[[int], None] | None = None) -> int:
+        """Prints a one-off message as its own individually-closable block
+        (see _insert_tracked_block) and returns its msg_id -- callers that
+        don't need to reference it again (the vast majority) can just
+        ignore the return value."""
+        _, _, msg_id = self._insert_tracked_block(html_fragment, on_close)
+        return msg_id
 
     def _on_anchor_clicked(self, url) -> None:
         text = url.toString()
-        if text.startswith("opening:"):
+        if text.startswith("closemsg:"):
+            try:
+                msg_id = int(text[len("closemsg:"):])
+            except ValueError:
+                return
+            self._close_block(msg_id)
+        elif text.startswith("opening:"):
             name = unquote(text[len("opening:"):])
             if name in self._expanded_openings:
                 self._expanded_openings.discard(name)
@@ -508,8 +537,7 @@ class CommandPanel(QWidget):
         if not line:
             return
 
-        self._print(f'<hr style="border:none; border-top:1px solid #444; margin:10px 0 4px 0;">'
-                    f'<span style="color:{MUTED_COLOR}">&gt; {_esc(line)}</span>')
+        self._print(f'<span style="color:{MUTED_COLOR}">&gt; {_esc(line)}</span>')
 
         if not line.startswith("/"):
             if not llm_settings.is_available():
@@ -581,16 +609,22 @@ class CommandPanel(QWidget):
             self._render_rating_block()
         elif cmd == "clear":
             self.output.clear()
+            self._closable_blocks = {}  # every cursor in it now points into a wiped document
             self._stats_start = None
             self._stats_end = None
+            self._stats_msg_id = None
             self._opening_results_start = None
             self._opening_results_end = None
+            self._opening_results_msg_id = None
             self._rating_start = None
             self._rating_end = None
+            self._rating_msg_id = None
             self._explorer_start = None
             self._explorer_end = None
+            self._explorer_msg_id = None
             self._llm_start = None
             self._llm_end = None
+            self._llm_msg_id = None
             self.clear_review_state()
             self._print(WELCOME_TEXT)  # clear wipes the whole document -- put the welcome hint back
         elif cmd == "opening":
@@ -645,14 +679,21 @@ class CommandPanel(QWidget):
         selected by clicking it in the archive panel -- mirrors typing the
         command, but without re-emitting game_requested (the caller already
         loaded the game onto the board; re-emitting would loop back here)."""
-        self._print(f'<hr style="border:none; border-top:1px solid #444; margin:10px 0 4px 0;">'
-                    f'<span style="color:{MUTED_COLOR}">Selected game #{game_id} from archive</span>')
         if include_review:
+            # Kept as its own small message (not merged with the review
+            # table below, which is a separate closable block) -- the two
+            # are independently dismissable, e.g. to drop the "Selected
+            # game" notice while keeping the review table on screen.
+            self._print(f'<span style="color:{MUTED_COLOR}">Selected game #{game_id} from archive</span>')
             self._run_review(game_id)
             return
         try:
             data = self.cli.show(game_id)
-            self._print(self._format_game_header(data, self.notes.get_game_note(game_id)))
+            note = self.notes.get_game_note(game_id)
+            self._print(
+                f'<div style="color:{MUTED_COLOR}">Selected game #{game_id} from archive</div>'
+                + self._format_game_header(data, note)
+            )
         except TempoCliError as e:
             self._print_error(str(e))
 
@@ -724,9 +765,11 @@ class CommandPanel(QWidget):
         # move played yet to highlight.
         html = self._format_review(data, game_id)
         if replace_existing:
-            self._review_block_end = self._replace_tracked_block(self._review_block_start, self._review_block_end, html)
+            self._review_block_end = self._replace_tracked_block(
+                self._review_block_start, self._review_block_end, html, self._review_block_msg_id)
         else:
-            self._review_block_start, self._review_block_end = self._insert_tracked_block(html)
+            self._review_block_start, self._review_block_end, self._review_block_msg_id = self._insert_tracked_block(
+                html, on_close=self._on_review_block_closed)
 
     def set_review_ply(self, game_id: int, ply: int) -> None:
         """Re-renders the currently-shown review with `ply` highlighted and
@@ -740,7 +783,8 @@ class CommandPanel(QWidget):
         if self._review_block_start is None or self._review_block_end is None:
             return
         html = self._format_review(self._last_review_data, game_id, current_ply=ply)
-        self._review_block_end = self._replace_tracked_block(self._review_block_start, self._review_block_end, html)
+        self._review_block_end = self._replace_tracked_block(
+            self._review_block_start, self._review_block_end, html, self._review_block_msg_id)
         if ply >= 0:
             # Keeps whichever move is highlighted actually visible as you
             # step through a long game, instead of the highlight silently
@@ -760,6 +804,11 @@ class CommandPanel(QWidget):
         self._last_review_game_id = None
         self._review_block_start = None
         self._review_block_end = None
+        self._review_block_msg_id = None
+
+    def _on_review_block_closed(self, msg_id: int) -> None:
+        if self._review_block_msg_id == msg_id:  # not a stale, already-superseded review block
+            self.clear_review_state()
 
     def _run_review(self, game_id: int) -> None:
         """Renders /review for `game_id`: instant if Stockfish isn't set up
@@ -888,8 +937,8 @@ class CommandPanel(QWidget):
         self._cancel_active_review()
         self._cancel_active_llm_query()
 
-        self._llm_start, self._llm_end = self._insert_tracked_block(
-            f'<span style="color:{MUTED_COLOR}">Thinking...</span>'
+        self._llm_start, self._llm_end, self._llm_msg_id = self._insert_tracked_block(
+            f'<span style="color:{MUTED_COLOR}">Thinking...</span>', on_close=self._on_llm_block_closed
         )
 
         worker = LlmWorker(
@@ -916,10 +965,16 @@ class CommandPanel(QWidget):
         if self._llm_worker is worker:
             self._llm_worker = None
 
+    def _on_llm_block_closed(self, msg_id: int) -> None:
+        if self._llm_msg_id == msg_id:  # not a stale, already-superseded answer block
+            self._llm_start = None
+            self._llm_end = None
+            self._llm_msg_id = None
+
     def _replace_llm_block(self, html_fragment: str) -> None:
         if self._llm_start is None or self._llm_end is None:
             return
-        self._llm_end = self._replace_tracked_block(self._llm_start, self._llm_end, html_fragment)
+        self._llm_end = self._replace_tracked_block(self._llm_start, self._llm_end, html_fragment, self._llm_msg_id)
 
     def _on_llm_status(self, text: str) -> None:
         self._replace_llm_block(f'<span style="color:{MUTED_COLOR}">{_esc(text)}</span>')
@@ -1006,7 +1061,7 @@ class CommandPanel(QWidget):
         text = " ".join(args[1:])
         self.notes.set_game_note(game_id, text)
         self._print(f'<span style="color:{MUTED_COLOR}">Note {"cleared" if not text else "saved"} for game #{game_id}.</span>')
-        self._refresh_notes_in_current_review(game_id)
+        self.refresh_notes_in_current_review(game_id)
         self.archive_updated.emit()  # so the archive browser's Notes column picks up the change immediately
 
     def _dispatch_movenote(self, args: list[str]) -> None:
@@ -1024,13 +1079,15 @@ class CommandPanel(QWidget):
         text = " ".join(args[2:])
         self.notes.set_move_note(game_id, ply, text)
         self._print(f'<span style="color:{MUTED_COLOR}">Move note {"cleared" if not text else "saved"} for game #{game_id}, ply {ply}.</span>')
-        self._refresh_notes_in_current_review(game_id)
+        self.refresh_notes_in_current_review(game_id)
 
-    def _refresh_notes_in_current_review(self, game_id: int) -> None:
+    def refresh_notes_in_current_review(self, game_id: int) -> None:
         """If `game_id`'s /review table is the one currently on screen,
         patch its note fields from a fresh read and re-render that block in
-        place -- so /note or /movenote is visible immediately without
-        needing to re-run /review."""
+        place -- so /note or /movenote (or ProfileView's "Add/edit game
+        note" button) is visible immediately without needing to re-run
+        /review. Public (not a leading-underscore helper) since ProfileView
+        calls this too, not just this class's own /note dispatch."""
         if self._last_review_data is None or self._last_review_game_id != game_id:
             return
         self._last_review_data["game_note"] = self.notes.get_game_note(game_id)
@@ -1039,14 +1096,41 @@ class CommandPanel(QWidget):
         }
         self._emit_review(self._last_review_data, game_id)
 
-    def _insert_tracked_block(self, html: str) -> tuple[QTextCursor, QTextCursor]:
-        """Inserts `html` as a distinct block and returns (start, end)
-        cursors bounding exactly that block, so a later click (expand/
-        collapse, show more) can replace just it in place via
-        _replace_tracked_block instead of re-appending a whole new copy."""
+    def _closable_prefix(self, msg_id: int, include_separator: bool = True) -> str:
+        """A full-width separator line plus a small "x" on its own
+        right-aligned line -- prepended to every message so it reads as
+        that message's own dismiss control (top of its block, right edge)
+        rather than belonging to whatever came before it. `include_separator`
+        is False only for the very first block ever inserted into an empty
+        document (nothing above it to separate from)."""
+        hr = '<hr style="border:none; border-top:1px solid #444; margin:10px 0 4px 0;">' if include_separator else ""
+        return (hr + f'<div align="right"><a href="closemsg:{msg_id}" '
+                f'style="color:{MUTED_COLOR}; text-decoration:none; font-size:small;" '
+                f'title="Dismiss this message">&times;</a></div>')
+
+    def _insert_tracked_block(self, html: str, on_close: Callable[[int], None] | None = None) -> tuple[QTextCursor, QTextCursor, int]:
+        """Inserts `html` as a distinct, individually-closable block (see
+        _closable_prefix) and returns (start, end, msg_id) cursors/id
+        bounding exactly that block, so a later click (expand/collapse,
+        show more, or the close button itself) can replace or remove just
+        it in place via _replace_tracked_block/_close_block instead of
+        touching the rest of the chat. `on_close`, if given, runs once the
+        user actually dismisses this block, receiving this call's own
+        msg_id -- e.g. so a specialized renderer like /stats can reset its
+        own *_start/*_end state, making a later attempt to update an
+        already-closed block a silent no-op instead of resurrecting or
+        corrupting it. Since every /stats (etc) re-run inserts a brand new
+        block rather than reusing the old one, an old, already-superseded
+        block can still be closed later -- on_close is handed the msg_id
+        specifically so it can check "is this actually still the current
+        block" before touching any shared state, instead of a stale close
+        wiping out a newer, still-live block's tracking."""
+        msg_id = self._next_msg_id
+        self._next_msg_id += 1
+        is_first = self.output.document().isEmpty()
         cursor = self.output.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
-        if not self.output.document().isEmpty():
+        if not is_first:
             cursor.insertBlock()
         start = QTextCursor(cursor)
         # Without this, a cursor sitting exactly at a future insertion point
@@ -1054,15 +1138,19 @@ class CommandPanel(QWidget):
         # replace the "start" marker would have silently slid past the block
         # it's supposed to bound -- breaking in-place replacement.
         start.setKeepPositionOnInsert(True)
-        cursor.insertHtml(html)
+        cursor.insertHtml(self._closable_prefix(msg_id, include_separator=not is_first) + html)
         end = QTextCursor(cursor)
         self.output.setTextCursor(cursor)
         self.output.ensureCursorVisible()
-        return start, end
+        self._closable_blocks[msg_id] = (start, end, on_close)
+        return start, end, msg_id
 
-    def _replace_tracked_block(self, start: QTextCursor, end: QTextCursor, html: str) -> QTextCursor:
-        """Replaces the [start, end) region (from a prior _insert_tracked_block)
-        with `html`, returning the new end cursor to keep tracking with."""
+    def _replace_tracked_block(self, start: QTextCursor, end: QTextCursor, html: str, msg_id: int) -> QTextCursor:
+        """Replaces the [start, end) region (from a prior _insert_tracked_block,
+        same msg_id) with `html`, returning the new end cursor to keep
+        tracking with. Regenerates the same close control under the same
+        msg_id, so the block stays individually dismissable across updates
+        (show more, ply highlight, streaming LLM answer, ...)."""
         # Editing the document (even via a cursor that isn't the widget's
         # "active" one) can make QTextBrowser auto-scroll -- observed
         # jumping all the way to the top on a toggle click. Capture and
@@ -1080,56 +1168,120 @@ class CommandPanel(QWidget):
         cursor.setPosition(start.position())
         cursor.setPosition(end.position(), QTextCursor.MoveMode.KeepAnchor)
         cursor.removeSelectedText()
-        cursor.insertHtml(html)
+        cursor.insertHtml(self._closable_prefix(msg_id) + html)
+        new_end = QTextCursor(cursor)
 
         scrollbar.setValue(scroll_pos)
-        return QTextCursor(cursor)
+        if msg_id in self._closable_blocks:
+            _, _, on_close = self._closable_blocks[msg_id]
+            self._closable_blocks[msg_id] = (start, new_end, on_close)
+        return new_end
+
+    def _close_block(self, msg_id: int) -> None:
+        """Removes one message entirely (its own [start, end) content, plus
+        the separator line immediately before it, so no blank line is left
+        behind) and runs whatever on_close callback it was registered
+        with."""
+        entry = self._closable_blocks.pop(msg_id, None)
+        if entry is None:
+            return
+        start, end, on_close = entry
+        scrollbar = self.output.verticalScrollBar()
+        scroll_pos = scrollbar.value()
+
+        # The character immediately before `start` is exactly the block
+        # separator _insert_tracked_block added right before this block's
+        # own content (unless this was the very first block in the
+        # document, at position 0, with nothing before it to consume) --
+        # folding it into the deletion collapses what would otherwise be a
+        # blank line left in this message's place.
+        delete_from = start.position() - 1 if start.position() > 0 else 0
+        cursor = self.output.textCursor()
+        cursor.setPosition(delete_from)
+        cursor.setPosition(end.position(), QTextCursor.MoveMode.KeepAnchor)
+        cursor.removeSelectedText()
+
+        scrollbar.setValue(scroll_pos)
+        if on_close is not None:
+            on_close(msg_id)
+
+    def _on_stats_block_closed(self, msg_id: int) -> None:
+        if self._stats_msg_id == msg_id:  # not a stale, already-superseded block -- see _insert_tracked_block
+            self._stats_start = None
+            self._stats_end = None
+            self._stats_msg_id = None
 
     def _render_stats_block(self) -> None:
-        self._stats_start, self._stats_end = self._insert_tracked_block(self._format_stats(self._stats_data))
+        self._stats_start, self._stats_end, self._stats_msg_id = self._insert_tracked_block(
+            self._format_stats(self._stats_data), on_close=self._on_stats_block_closed)
 
     def _replace_stats_block(self) -> None:
         if self._stats_start is None or self._stats_end is None or self._stats_data is None:
             return
-        self._stats_end = self._replace_tracked_block(self._stats_start, self._stats_end, self._format_stats(self._stats_data))
+        self._stats_end = self._replace_tracked_block(
+            self._stats_start, self._stats_end, self._format_stats(self._stats_data), self._stats_msg_id)
 
     def _opening_range_banner(self) -> str:
         if self._range_days is None:
             return ""
         return f'<div style="color:{HEADER_COLOR}">Range: last {self._range_days} days</div>'
 
+    def _on_opening_results_block_closed(self, msg_id: int) -> None:
+        if self._opening_results_msg_id == msg_id:
+            self._opening_results_start = None
+            self._opening_results_end = None
+            self._opening_results_msg_id = None
+
     def _render_opening_results_block(self) -> None:
         html = self._opening_range_banner() + self._format_games(
             self._opening_results, truncate=DEFAULT_GAMES_SHOWN, show_all=self._opening_results_show_all)
-        self._opening_results_start, self._opening_results_end = self._insert_tracked_block(html)
+        self._opening_results_start, self._opening_results_end, self._opening_results_msg_id = self._insert_tracked_block(
+            html, on_close=self._on_opening_results_block_closed)
 
     def _replace_opening_results_block(self) -> None:
         if self._opening_results_start is None or self._opening_results_end is None or self._opening_results is None:
             return
         html = self._opening_range_banner() + self._format_games(
             self._opening_results, truncate=DEFAULT_GAMES_SHOWN, show_all=self._opening_results_show_all)
-        self._opening_results_end = self._replace_tracked_block(self._opening_results_start, self._opening_results_end, html)
+        self._opening_results_end = self._replace_tracked_block(
+            self._opening_results_start, self._opening_results_end, html, self._opening_results_msg_id)
+
+    def _on_rating_block_closed(self, msg_id: int) -> None:
+        if self._rating_msg_id == msg_id:
+            self._rating_start = None
+            self._rating_end = None
+            self._rating_msg_id = None
 
     def _render_rating_block(self) -> None:
-        self._rating_start, self._rating_end = self._insert_tracked_block(self._format_rating(self._rating_data))
+        self._rating_start, self._rating_end, self._rating_msg_id = self._insert_tracked_block(
+            self._format_rating(self._rating_data), on_close=self._on_rating_block_closed)
 
     def _replace_rating_block(self) -> None:
         if self._rating_start is None or self._rating_end is None or self._rating_data is None:
             return
-        self._rating_end = self._replace_tracked_block(self._rating_start, self._rating_end, self._format_rating(self._rating_data))
+        self._rating_end = self._replace_tracked_block(
+            self._rating_start, self._rating_end, self._format_rating(self._rating_data), self._rating_msg_id)
 
     def _refresh_explorer_data(self, color: str, sequence: list[str]) -> None:
         self._explorer_color = color
         self._explorer_sequence = list(sequence)
         self._explorer_replies = self.cli.explorer(color, sequence)["replies"]
 
+    def _on_explorer_block_closed(self, msg_id: int) -> None:
+        if self._explorer_msg_id == msg_id:
+            self._explorer_start = None
+            self._explorer_end = None
+            self._explorer_msg_id = None
+
     def _render_explorer_block(self) -> None:
-        self._explorer_start, self._explorer_end = self._insert_tracked_block(self._format_explorer())
+        self._explorer_start, self._explorer_end, self._explorer_msg_id = self._insert_tracked_block(
+            self._format_explorer(), on_close=self._on_explorer_block_closed)
 
     def _replace_explorer_block(self) -> None:
         if self._explorer_start is None or self._explorer_end is None or self._explorer_replies is None:
             return
-        self._explorer_end = self._replace_tracked_block(self._explorer_start, self._explorer_end, self._format_explorer())
+        self._explorer_end = self._replace_tracked_block(
+            self._explorer_start, self._explorer_end, self._format_explorer(), self._explorer_msg_id)
 
     def _recent_games_for(self, name: str, color_key: str) -> list[dict]:
         # find_games_by_exact_opening (the C++ side of opening_exact) has no
@@ -1229,14 +1381,21 @@ class CommandPanel(QWidget):
         visible = games if (truncate is None or show_all) else games[:truncate]
 
         header = f'<b>{len(games)} game(s)</b> <span style="color:{MUTED_COLOR}">(click a row to load it on the board)</span>'
-        rows = []
+        # The chat panel is narrow, so a 6-column table wrapped every cell
+        # mid-word; each game is a compact stacked card instead.
+        cards = []
         for g in visible:
             result_html = f'<span style="color:{_result_color(g["result"])}"><b>{_esc(g["result"])}</b></span>'
-            opponent_html = f'{_esc(g["opponent"])} <span style="color:{MUTED_COLOR}">({_esc(g["your_color"])})</span>'
-            opening_html = _esc(g["opening"]) or '<span style="color:#666">-</span>'
-            cells = [f'#{g["id"]}', _esc(g["date"]), opponent_html, result_html, _esc(g["site"]), opening_html]
-            rows.append([_game_link(g["id"], cell) for cell in cells])
-        html = header + _table(["#", "Date", "Opponent", "Result", "Site", "Opening"], rows)
+            muted = lambda s: f'<span style="color:{MUTED_COLOR}">{s}</span>'
+            line1 = (f'<b>#{g["id"]}</b> &nbsp;{result_html} &nbsp;{muted(_esc(g["date"]))}')
+            line2 = f'vs {_esc(g["opponent"])} {muted("(" + _esc(g["your_color"]) + ")")} {muted("&middot; " + _esc(g["site"]))}'
+            line3 = muted(_esc(g["opening"])) if g["opening"] else ""
+            inner = f'<div>{line1}</div><div>{line2}</div>' + (f'<div>{line3}</div>' if line3 else "")
+            cards.append(
+                f'<div style="margin-top:6px; padding-bottom:4px; border-bottom:1px solid #444;">'
+                f'{_game_link(g["id"], inner)}</div>'
+            )
+        html = header + "".join(cards)
 
         if truncate is not None and len(games) > truncate:
             if show_all:

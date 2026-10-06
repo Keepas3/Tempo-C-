@@ -9,18 +9,20 @@ from __future__ import annotations
 import calendar
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QBrush, QColor
-from PySide6.QtWidgets import QHeaderView, QTreeWidget, QTreeWidgetItem
+from PySide6.QtGui import QBrush, QColor, QKeyEvent
+from PySide6.QtWidgets import QHeaderView, QMenu, QTreeWidget, QTreeWidgetItem
 
 from colors import DRAW_COLOR, LOSS_COLOR, MUTED_COLOR, TEXT_COLOR, WIN_COLOR
 from db_reader import DbReader
+from favorites import Favorites
 from notes import Notes
 
 GAME_ID_ROLE = 1000
-COLUMNS = ["Game", "Color", "Time", "Type", "Site", "Result", "Elo", "Notes"]
-RESULT_COLUMN = 5
-ELO_COLUMN = 6
-NOTES_COLUMN = 7
+COLUMNS = ["Game", "★", "Color", "Time", "Type", "Site", "Result", "Elo", "Opening", "Notes"]
+(GAME_COLUMN, FAV_COLUMN, COLOR_COLUMN, TIME_COLUMN, TYPE_COLUMN, SITE_COLUMN,
+ RESULT_COLUMN, ELO_COLUMN, OPENING_COLUMN, NOTES_COLUMN) = range(len(COLUMNS))
+STAR_ON, STAR_OFF = "★", "☆"
+STAR_COLOR = "#f5c518"
 NOTE_TRUNCATE_CHARS = 28  # keeps the column narrow -- the full text is always in the tooltip
 
 _RESULT_COLOR = {"Win": WIN_COLOR, "Loss": LOSS_COLOR, "Draw": DRAW_COLOR}
@@ -35,7 +37,8 @@ RESULT_ORDER = {"Win": 0, "Draw": 1, "Loss": 2, "?": 3}
 # rest default to ascending (White before Black / lowest time / earliest
 # category / A-Z / best result first). Elo defaults descending (highest
 # rating first), matching how chess sites usually show it.
-DEFAULT_ASCENDING = {0: False, 1: True, 2: True, 3: True, 4: True, 5: True, 6: False, 7: True}
+DEFAULT_ASCENDING = {GAME_COLUMN: False, FAV_COLUMN: True, COLOR_COLUMN: True, TIME_COLUMN: True, TYPE_COLUMN: True,
+                     SITE_COLUMN: True, RESULT_COLUMN: True, ELO_COLUMN: False, OPENING_COLUMN: True, NOTES_COLUMN: True}
 
 
 def _truncate_note(note: str) -> str:
@@ -55,19 +58,23 @@ def _day_only(date: str) -> str:
     return date
 
 
-def _sort_key(column: int, game, notes_by_id: dict[int, str]) -> object:
-    if column == 1:
+def _sort_key(column: int, game, notes_by_id: dict[int, str], favorite_ids: set[int]) -> object:
+    if column == FAV_COLUMN:
+        return 0 if game.id in favorite_ids else 1  # ascending = starred first
+    if column == COLOR_COLUMN:
         return COLOR_ORDER.get(game.your_color, len(COLOR_ORDER))
-    if column == 2:
+    if column == TIME_COLUMN:
         return game.time_seconds
-    if column == 3:
+    if column == TYPE_COLUMN:
         return TYPE_ORDER.get(game.time_category, len(TYPE_ORDER))
-    if column == 4:
+    if column == SITE_COLUMN:
         return game.site
-    if column == 5:
+    if column == RESULT_COLUMN:
         return RESULT_ORDER.get(game.result, len(RESULT_ORDER))
     if column == ELO_COLUMN:
         return game.your_elo if game.your_elo is not None else 0
+    if column == OPENING_COLUMN:
+        return game.opening.lower()
     if column == NOTES_COLUMN:
         return notes_by_id.get(game.id, "")
     return game.date  # column 0 (or anything unrecognized): "YYYY.MM.DD" sorts correctly as text
@@ -75,11 +82,24 @@ def _sort_key(column: int, game, notes_by_id: dict[int, str]) -> object:
 
 class GameBrowser(QTreeWidget):
     game_selected = Signal(int)
+    # Up/Down, while a game row (not a Year/Month group node) is current,
+    # jump the already-loaded board straight to that game's first/last
+    # position -- see keyPressEvent. Carries the game id (like game_selected)
+    # so a listener could double-check it matches whatever's actually loaded,
+    # even though in practice the two never desync: this widget only ever
+    # changes which row is "current" via a mouse click (which itself loads
+    # that game), never via keyboard navigation, since Up/Down are fully
+    # repurposed here instead of left as default row-to-row navigation.
+    jump_to_start_requested = Signal(int)
+    jump_to_end_requested = Signal(int)
+    # (game_id, is_favorite) after a star is toggled from this widget.
+    favorite_toggled = Signal(int, bool)
 
-    def __init__(self, db: DbReader, notes: Notes, parent=None):
+    def __init__(self, db: DbReader, notes: Notes, favorites: Favorites, parent=None):
         super().__init__(parent)
         self.db = db
         self.notes = notes
+        self.favorites = favorites
         self._items_by_id: dict[int, QTreeWidgetItem] = {}
         self._tree_data: dict[int, dict[int, list]] = {}
         self._sort_column = 0
@@ -94,13 +114,17 @@ class GameBrowser(QTreeWidget):
         # after the fixed-width columns, instead of a fixed width that
         # truncates opponent names.
         self.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.setColumnWidth(1, 55)
-        self.setColumnWidth(2, 70)
-        self.setColumnWidth(3, 70)
-        self.setColumnWidth(4, 80)
-        self.setColumnWidth(5, 60)
-        self.setColumnWidth(6, 55)
-        self.setColumnWidth(7, 130)
+        self.setColumnWidth(FAV_COLUMN, 32)
+        self.setColumnWidth(COLOR_COLUMN, 55)
+        self.setColumnWidth(TIME_COLUMN, 70)
+        self.setColumnWidth(TYPE_COLUMN, 70)
+        self.setColumnWidth(SITE_COLUMN, 80)
+        self.setColumnWidth(RESULT_COLUMN, 60)
+        self.setColumnWidth(ELO_COLUMN, 55)
+        self.setColumnWidth(OPENING_COLUMN, 170)
+        self.setColumnWidth(NOTES_COLUMN, 130)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._on_context_menu)
         self.header().setSortIndicatorShown(True)
         # Without this, sectionClicked never fires -- clicking a header does
         # nothing (the header just looks clickable because of the sort
@@ -159,6 +183,7 @@ class GameBrowser(QTreeWidget):
         # One query for every game's note rather than one per row -- the
         # tree can easily have hundreds of games.
         notes_by_id = self.notes.get_all_game_notes()
+        favorite_ids = self.favorites.get_all()
 
         for year in sorted(self._tree_data, reverse=True):
             year_label = str(year) if year else "Unknown date"
@@ -167,25 +192,36 @@ class GameBrowser(QTreeWidget):
             self.addTopLevelItem(year_item)
             months = self._tree_data[year]
             for month in sorted(months, reverse=True):
-                month_name = calendar.month_name[month] if 1 <= month <= 12 else "Unknown"
+                # Abbreviated ("Sep" not "September") so the game count after
+                # it never gets Qt-elided off a narrow tree column -- with
+                # the full name, a long month (September, November, ...)
+                # could push "(546)" past the visible width and get cut to
+                # "September ..." with the count invisible.
+                month_name = calendar.month_abbr[month] if 1 <= month <= 12 else "Unknown"
                 month_label = f"{month_name} ({len(months[month])})"
                 month_item = QTreeWidgetItem([month_label])
                 month_item.setForeground(0, QBrush(QColor(TEXT_COLOR)))
+                if 1 <= month <= 12:
+                    month_item.setToolTip(0, f"{calendar.month_name[month]} {year}")  # full name on hover
                 year_item.addChild(month_item)
 
-                games_sorted = sorted(months[month], key=lambda g: _sort_key(self._sort_column, g, notes_by_id), reverse=reverse)
+                games_sorted = sorted(months[month], key=lambda g: _sort_key(self._sort_column, g, notes_by_id, favorite_ids), reverse=reverse)
                 if self._sort_column == ELO_COLUMN:
                     # Second, stable pass: push games with no rating data to
                     # the end regardless of sort direction, rather than
                     # having them land wherever their placeholder 0 key
                     # happened to sort in either direction.
                     games_sorted.sort(key=lambda g: g.your_elo is None)
+                elif self._sort_column == OPENING_COLUMN:
+                    # Games with no recorded opening sort to the end in either direction.
+                    games_sorted.sort(key=lambda g: not g.opening)
                 elif self._sort_column == NOTES_COLUMN:
                     # Same idea: games with no note at all sort to the end
                     # regardless of direction, rather than empty strings
                     # winning every ascending sort by virtue of being "".
                     games_sorted.sort(key=lambda g: g.id not in notes_by_id)
                 for game in games_sorted:
+                    is_fav = game.id in favorite_ids
                     label = f"{_day_only(game.date)}  vs {game.opponent}"
                     full_label = f"{game.date}  vs {game.opponent}"
                     color_display = game.your_color.capitalize()
@@ -193,10 +229,12 @@ class GameBrowser(QTreeWidget):
                     note = notes_by_id.get(game.id, "")
                     notes_display = _truncate_note(note)
                     game_item = QTreeWidgetItem(
-                        [label, color_display, game.time_label, game.time_category, game.site, game.result,
-                         elo_display, notes_display])
+                        [label, STAR_ON if is_fav else STAR_OFF, color_display, game.time_label, game.time_category, game.site, game.result,
+                         elo_display, game.opening, notes_display])
                     game_item.setData(0, GAME_ID_ROLE, game.id)
                     game_item.setToolTip(0, full_label)  # full date on hover
+                    if game.opening:
+                        game_item.setToolTip(OPENING_COLUMN, game.opening)  # full name on hover, since the cell elides
                     if note:
                         game_item.setToolTip(NOTES_COLUMN, note)  # full text on hover, since the cell itself is truncated
                     # Qt's default item-text color resolves to black here (no
@@ -206,8 +244,11 @@ class GameBrowser(QTreeWidget):
                     # of leaving it to that default. Result keeps its own
                     # win/loss/draw color instead of the plain default.
                     for col in range(len(COLUMNS)):
-                        if col != RESULT_COLUMN:
+                        if col not in (RESULT_COLUMN, FAV_COLUMN):
                             game_item.setForeground(col, QBrush(QColor(TEXT_COLOR)))
+                    game_item.setForeground(FAV_COLUMN, QBrush(QColor(STAR_COLOR if is_fav else MUTED_COLOR)))
+                    game_item.setTextAlignment(FAV_COLUMN, Qt.AlignmentFlag.AlignCenter)
+                    game_item.setToolTip(FAV_COLUMN, "Click to toggle favorite")
                     result_color = _RESULT_COLOR.get(game.result, MUTED_COLOR)
                     game_item.setForeground(RESULT_COLUMN, QBrush(QColor(result_color)))
                     month_item.addChild(game_item)
@@ -244,7 +285,65 @@ class GameBrowser(QTreeWidget):
         self.setCurrentItem(item)
         self.scrollToItem(item)
 
-    def _on_item_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
+    def _on_item_clicked(self, item: QTreeWidgetItem, column: int) -> None:
         game_id = item.data(0, GAME_ID_ROLE)
-        if game_id is not None:
-            self.game_selected.emit(game_id)
+        if game_id is None:
+            return
+        if column == FAV_COLUMN:
+            # Starring is its own action -- it must not also load the game
+            # onto the board / print its info into the chat.
+            self.toggle_favorite(game_id)
+            return
+        self.game_selected.emit(game_id)
+
+    def toggle_favorite(self, game_id: int) -> None:
+        self.set_favorite(game_id, not self.favorites.is_favorite(game_id))
+
+    def set_favorite(self, game_id: int, favorite: bool) -> None:
+        self.favorites.set_favorite(game_id, favorite)
+        self._apply_star(game_id, favorite)
+        self.favorite_toggled.emit(game_id, favorite)
+
+    def _apply_star(self, game_id: int, favorite: bool) -> None:
+        """Updates just this row's star in place (no full rebuild, so
+        expansion/scroll/selection are untouched)."""
+        item = self._items_by_id.get(game_id)
+        if item is None:
+            return
+        item.setText(FAV_COLUMN, STAR_ON if favorite else STAR_OFF)
+        item.setForeground(FAV_COLUMN, QBrush(QColor(STAR_COLOR if favorite else MUTED_COLOR)))
+
+    def sync_favorite(self, game_id: int) -> None:
+        """Re-reads one game's favorite state from the db, for when it was
+        changed from somewhere other than this widget (e.g. the board's
+        favorite button)."""
+        self._apply_star(game_id, self.favorites.is_favorite(game_id))
+
+    def _on_context_menu(self, pos) -> None:
+        item = self.itemAt(pos)
+        game_id = item.data(0, GAME_ID_ROLE) if item is not None else None
+        if game_id is None:
+            return
+        menu = QMenu(self)
+        is_fav = self.favorites.is_favorite(game_id)
+        action = menu.addAction("Remove from favorites" if is_fav else "Add to favorites")
+        if menu.exec(self.viewport().mapToGlobal(pos)) is action:
+            self.set_favorite(game_id, not is_fav)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        # Up/Down are repurposed here (jump to the current game's first/last
+        # position) instead of Qt's default row-to-row selection movement --
+        # only while a game row is current, so Up/Down on a Year/Month group
+        # node still does normal tree navigation (there's no "game" to jump
+        # for yet at that level).
+        if event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+            item = self.currentItem()
+            game_id = item.data(0, GAME_ID_ROLE) if item is not None else None
+            if game_id is not None:
+                if event.key() == Qt.Key.Key_Up:
+                    self.jump_to_start_requested.emit(game_id)
+                else:
+                    self.jump_to_end_requested.emit(game_id)
+                event.accept()
+                return
+        super().keyPressEvent(event)

@@ -51,10 +51,6 @@ public:
         return colors[static_cast<int>(Color::White)] | colors[static_cast<int>(Color::Black)];
     }
 
-    Bitboard empty() const {
-        return ~occupied();
-    }
-
     // Returns Piece::None if the given color has no piece on that square
     Piece piece_on(int square, Color c) const {
         Bitboard mask = 1ULL << square;

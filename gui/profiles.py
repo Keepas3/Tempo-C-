@@ -28,6 +28,21 @@ class ProfileRecord:
     def resolved_db_path(self) -> Path:
         return PROJECT_ROOT / self.db_path
 
+    def is_db_path_safe(self) -> bool:
+        """True if db_path resolves to somewhere under PROJECT_ROOT. Guards
+        against a hand-edited (or otherwise externally supplied)
+        profiles.json pointing a profile's "own" archive at an arbitrary
+        file elsewhere on disk -- either via a `../` sequence, or via an
+        absolute db_path outright (pathlib's `/` operator silently discards
+        the left-hand side whenever the right side is already absolute, so
+        resolved_db_path() would return exactly that absolute path with
+        PROJECT_ROOT having no effect at all)."""
+        try:
+            self.resolved_db_path().resolve().relative_to(PROJECT_ROOT.resolve())
+            return True
+        except ValueError:
+            return False
+
 
 @dataclass
 class ProfilesConfig:
@@ -69,7 +84,21 @@ def bootstrap_if_missing() -> ProfilesConfig:
     unchanged path, no migration, no re-fetch."""
     if PROFILES_PATH.exists():
         data = json.loads(PROFILES_PATH.read_text(encoding="utf-8"))
-        profiles = [ProfileRecord(**p) for p in data.get("profiles", [])]
+        profiles = []
+        for p in data.get("profiles", []):
+            record = ProfileRecord(**p)
+            if not record.is_db_path_safe():
+                # profiles.json is a local, user-editable file, not a
+                # remote-attacker-controlled input -- but it's still
+                # untrusted enough (synced dotfiles, a shared project
+                # folder, a future import-profile feature) that a
+                # `db_path` escaping the project directory shouldn't be
+                # silently followed. Skip it rather than open/create a
+                # SQLite file wherever it points.
+                print(f"[Warning] skipping profile '{record.display_name}': "
+                      f"db_path escapes the project directory ({record.db_path!r})")
+                continue
+            profiles.append(record)
         return ProfilesConfig(profiles=profiles, last_active=data.get("last_active"))
 
     username = _default_username()
@@ -106,9 +135,3 @@ def add_profile(config: ProfilesConfig, display_name: str, platform: str, userna
     )
     config.profiles.append(record)
     return record
-
-
-def remove_profile(config: ProfilesConfig, profile_id: str) -> None:
-    config.profiles = [p for p in config.profiles if p.id != profile_id]
-    if config.last_active == profile_id:
-        config.last_active = config.profiles[0].id if config.profiles else None

@@ -9,11 +9,11 @@ whichever side is drawn at the bottom of the board.
 """
 from __future__ import annotations
 
-import math
-
 from PySide6.QtCore import QRect, Qt
 from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import QWidget
+
+from win_probability import win_percent
 
 BAR_WIDTH = 24
 _LABEL_HEIGHT = 16
@@ -26,13 +26,18 @@ _MIDLINE_COLOR = QColor("#999999")
 
 def _white_win_fraction(cp: int | None, mate: int | None) -> float:
     """Converts a White-POV centipawn/mate score into the 0..1 fraction of
-    the bar that should read as White's, via the same logistic curve
-    lichess uses for its own eval bar (Win% = 50 + 50*(2/(1+exp(-0.00368208*cp))-1))."""
+    the bar that should read as White's. Mate is a hard 1.0/0.0 cutoff
+    (visually "fully decided") rather than routed through win_percent's own
+    finite-cp mate approximation, which would land just short of a full
+    bar. A plain cp score reuses win_probability.win_percent -- the same
+    lichess-calibrated logistic curve already used for /review's severity
+    grading and accuracy, instead of a second hardcoded copy of its
+    constant."""
     if mate is not None:
         return 1.0 if mate > 0 else 0.0
     if cp is None:
         return 0.5
-    return 1.0 / (1.0 + math.exp(-0.00368208 * cp))
+    return win_percent(cp) / 100.0
 
 
 def _format_score(cp: int | None, mate: int | None) -> str:

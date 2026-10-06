@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import html
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -21,25 +21,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-HEADER_COLOR = "#7fb3ff"
-MUTED_COLOR = "#888888"
-WIN_COLOR = "#5cb85c"
-LOSS_COLOR = "#e57373"
-DRAW_COLOR = "#b0b0b0"
-ERROR_COLOR = "#e57373"
+from colors import DRAW_COLOR, ERROR_COLOR, LOSS_COLOR, MUTED_COLOR, WIN_COLOR
 
 BAR_WIDTH = 140  # px -- fixed rather than percentage, QTextBrowser's table layout doesn't honor percentage widths
 
 
 def _esc(s) -> str:
     return html.escape(str(s))
-
-
-def _move_label(san: str, ply_index: int) -> str:
-    # Move numbers only precede White's moves (even ply), matching how the
-    # rest of the app (CommandPanel's /moves, /explorer) displays SAN.
-    prefix = f"{ply_index // 2 + 1}." if ply_index % 2 == 0 else ""
-    return prefix + san
 
 
 def _result_bar(wins: int, losses: int, draws: int) -> str:

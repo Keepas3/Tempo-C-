@@ -221,7 +221,6 @@ public:
     // Returns the new row id, or -1 if the game was a duplicate (skipped).
     int insert_game(const Game& g) {
         std::string pgn = game_to_pgn(g);
-        std::string result_for_color = result_relative_to(g.result, g.your_color);
 
         const char* sql =
             "INSERT OR IGNORE INTO games "
@@ -264,7 +263,6 @@ public:
             step_and_finalize(mstmt);
         }
 
-        (void)result_for_color; // reserved for future use (e.g. cached column)
         return game_id;
     }
 
@@ -304,14 +302,31 @@ public:
         step_and_finalize(update_stmt);
     }
 
-    // Returns the recorded fetch state for `platform` ("chesscom"/"lichess"),
-    // or nullopt if that platform has never been fetched for this profile.
-    std::optional<FetchHistoryRow> get_last_fetch(const std::string& platform) {
+    // fetch_history is keyed by a composite "platform:username" string packed
+    // into the existing `platform` TEXT PRIMARY KEY column -- not a separate
+    // username column -- so no ALTER TABLE/migration is needed on archives
+    // created before per-username watermarks existed. `:` can never collide
+    // with a real username since is_valid_username (fetch.h) only allows
+    // alnum/`_`/`-`. Before this, the watermark was shared across every
+    // username ever passed to `fetch` on a given platform, so fetching a
+    // brand-new username (e.g. to study a GM's games) silently inherited and
+    // advanced past an unrelated username's progress instead of starting
+    // fresh. Pre-existing rows (bare "chesscom"/"lichess", no username
+    // suffix) simply stop being matched by any lookup going forward --
+    // harmless unused leftovers, not worth a cleanup pass.
+    static std::string fetch_history_key(const std::string& platform, const std::string& username) {
+        return platform + ":" + username;
+    }
+
+    // Returns the recorded fetch state for `username` on `platform`
+    // ("chesscom"/"lichess"), or nullopt if that exact (platform, username)
+    // pair has never been fetched for this profile.
+    std::optional<FetchHistoryRow> get_last_fetch(const std::string& platform, const std::string& username) {
         const char* sql =
             "SELECT last_fetched_at, last_covered_year, last_covered_month "
             "FROM fetch_history WHERE platform = ?;";
         sqlite3_stmt* stmt = prepare(sql);
-        bind_text(stmt, 1, platform);
+        bind_text(stmt, 1, fetch_history_key(platform, username));
 
         std::optional<FetchHistoryRow> out;
         if (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -325,18 +340,43 @@ public:
         return out;
     }
 
-    // Records that `platform` was just successfully fetched, stamping the
-    // current time. `covered_year`/`covered_month` are chess.com-only (the
-    // calendar month gap-filling should resume from next time); leave at 0
-    // for lichess, stored as NULL. Callers (main.cpp) are responsible for
-    // any "don't regress" merging against the previously recorded value --
-    // this is a plain upsert with no merge logic of its own.
-    void record_fetch(const std::string& platform, int covered_year = 0, int covered_month = 0) {
+    // Most recent fetch on `platform` under *any* username (including legacy
+    // pre-per-username rows keyed by the bare platform name) -- for the GUI's
+    // "Last fetched" status, where the account fetched from may differ from
+    // the profile's own name (e.g. a different lichess handle).
+    std::optional<FetchHistoryRow> get_latest_fetch_any_user(const std::string& platform) {
+        const char* sql =
+            "SELECT last_fetched_at, last_covered_year, last_covered_month "
+            "FROM fetch_history WHERE platform = ? OR platform LIKE ? "
+            "ORDER BY last_fetched_at DESC LIMIT 1;";
+        sqlite3_stmt* stmt = prepare(sql);
+        bind_text(stmt, 1, platform);
+        bind_text(stmt, 2, platform + ":%");
+
+        std::optional<FetchHistoryRow> out;
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            FetchHistoryRow row;
+            row.last_fetched_at = column_text(stmt, 0);
+            row.last_covered_year = (sqlite3_column_type(stmt, 1) == SQLITE_NULL) ? 0 : sqlite3_column_int(stmt, 1);
+            row.last_covered_month = (sqlite3_column_type(stmt, 2) == SQLITE_NULL) ? 0 : sqlite3_column_int(stmt, 2);
+            out = row;
+        }
+        sqlite3_finalize(stmt);
+        return out;
+    }
+
+    // Records that `username` on `platform` was just successfully fetched,
+    // stamping the current time. `covered_year`/`covered_month` are
+    // chess.com-only (the calendar month gap-filling should resume from next
+    // time); leave at 0 for lichess, stored as NULL. Callers (main.cpp) are
+    // responsible for any "don't regress" merging against the previously
+    // recorded value -- this is a plain upsert with no merge logic of its own.
+    void record_fetch(const std::string& platform, const std::string& username, int covered_year = 0, int covered_month = 0) {
         const char* sql =
             "INSERT OR REPLACE INTO fetch_history (platform, last_fetched_at, last_covered_year, last_covered_month) "
             "VALUES (?, datetime('now'), ?, ?);";
         sqlite3_stmt* stmt = prepare(sql);
-        bind_text(stmt, 1, platform);
+        bind_text(stmt, 1, fetch_history_key(platform, username));
         if (covered_year > 0) sqlite3_bind_int(stmt, 2, covered_year); else sqlite3_bind_null(stmt, 2);
         if (covered_month > 0) sqlite3_bind_int(stmt, 3, covered_month); else sqlite3_bind_null(stmt, 3);
         step_and_finalize(stmt);
@@ -866,7 +906,6 @@ private:
             "  ply INTEGER NOT NULL,"
             "  san TEXT NOT NULL,"
             "  clock_seconds INTEGER,"
-            "  eval_cp INTEGER,"
             "  PRIMARY KEY (game_id, ply)"
             ");"
             "CREATE TABLE IF NOT EXISTS fetch_history ("

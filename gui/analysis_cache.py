@@ -4,8 +4,7 @@ cheap in storage (a few numbers per ply), so results are cached here to
 avoid re-running the engine every time an already-analyzed game is
 reviewed. Owned entirely by the GUI -- the CLI never reads or writes this
 table (mirrors bookmarks.py's pattern exactly), and it never touches the
-C++-owned games/moves tables or the vestigial, always-NULL moves.eval_cp
-column.
+C++-owned games/moves tables.
 """
 from __future__ import annotations
 
