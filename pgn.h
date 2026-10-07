@@ -169,6 +169,8 @@ inline Game finalize_game(const std::map<std::string, std::string>& tags, const 
         game.opening = lookup_eco_name(game.eco); // fallback for exports (e.g. chess.com) with no Opening tag
     }
     game.time_control = get("TimeControl");
+    game.utc_time = get("UTCTime");
+    if (game.utc_time.empty()) game.utc_time = get("StartTime");
     game.white_elo = parse_optional_int(get("WhiteElo"));
     game.black_elo = parse_optional_int(get("BlackElo"));
     game.your_color = derive_your_color(tags, your_username);

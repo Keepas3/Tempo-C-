@@ -52,6 +52,7 @@ inline std::string to_json(const GameSummary& g) {
       << ", \"site\": " << json_str(g.site)
       << ", \"time_category\": " << json_str(g.time_category)
       << ", \"your_elo\": " << (g.your_elo ? std::to_string(*g.your_elo) : "null")
+      << ", \"utc_time\": " << json_str(g.utc_time)
       << "}";
     return o.str();
 }

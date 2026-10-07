@@ -15,6 +15,7 @@ struct MoveRecord {
 struct Game {
     std::string event, site, date, white, black, result;
     std::string eco, opening, time_control;
+    std::string utc_time; // "HH:MM:SS" (UTC) the game started, from UTCTime/StartTime; empty if the PGN had neither
     std::string your_color; // "white" or "black"
     std::optional<int> white_elo, black_elo; // from WhiteElo/BlackElo PGN tags; nullopt if absent/unrated/unparseable
     std::vector<MoveRecord> moves;
@@ -47,6 +48,8 @@ inline std::string game_to_pgn(const Game& g) {
     // re-fetch into a flood of duplicate rows instead of updates. Elo lives
     // in its own white_elo/black_elo columns instead, set directly from
     // Game (see insert_game) rather than round-tripped through this string.
+    // utc_time is kept out for the identical reason (its own games.utc_time
+    // column), so adding it didn't change any existing game's dedup key.
     pgn += "\n";
 
     for (size_t i = 0; i < g.moves.size(); ++i) {

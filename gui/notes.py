@@ -61,8 +61,8 @@ class Notes:
 
     def set_game_note(self, game_id: int, text: str) -> None:
         """Empty/whitespace-only text deletes the note instead of storing an
-        empty string -- lets "/note <id>" with no trailing text act as
-        "clear this note" without a separate delete command."""
+        empty string -- lets an emptied note dialog act as "clear this note"
+        without a separate delete action."""
         text = text.strip()
         conn = self._connect()
         try:

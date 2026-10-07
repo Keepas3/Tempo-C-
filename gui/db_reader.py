@@ -29,6 +29,7 @@ class GameRow:
     time_category: str    # e.g. "Bullet", "Blitz", "Rapid", "Classical", "Daily", "Unknown"
     time_seconds: int     # base time in seconds, for numeric sorting (see classify_time_control)
     your_elo: int | None = None  # rating for *your* color in this game, if the PGN carried one
+    utc_time: str = ""    # "HH:MM:SS" UTC start time; "" if unknown (not yet backfilled) -- tie-breaker within a date
 
     @property
     def opponent(self) -> str:
@@ -145,7 +146,7 @@ def game_summary_to_row(data: dict) -> GameRow:
         white=white, black=black, your_color=your_color, result=data["result"],
         opening=data["opening"], site=data["site"],
         time_label=time_label, time_category=data["time_category"], time_seconds=time_seconds,
-        your_elo=data.get("your_elo"),
+        your_elo=data.get("your_elo"), utc_time=data.get("utc_time") or "",
     )
 
 
@@ -190,14 +191,14 @@ class DbReader:
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT id, date, white, black, your_color, result, opening, site, time_control, white_elo, black_elo "
-                "FROM games ORDER BY date DESC, id DESC;"
+                "SELECT id, date, white, black, your_color, result, opening, site, time_control, white_elo, black_elo, utc_time "
+                "FROM games ORDER BY date DESC, COALESCE(utc_time, '') DESC, id DESC;"
             ).fetchall()
         finally:
             conn.close()
 
         tree: dict[int, dict[int, list[GameRow]]] = {}
-        for id_, date, white, black, your_color, result, opening, site, time_control, white_elo, black_elo in rows:
+        for id_, date, white, black, your_color, result, opening, site, time_control, white_elo, black_elo, utc_time in rows:
             year, month = _parse_year_month(date)
             time_label, time_category, time_seconds = classify_time_control(time_control)
             your_elo = white_elo if your_color == "white" else black_elo
@@ -205,7 +206,7 @@ class DbReader:
                 id_, date, year, month, white, black, your_color,
                 result_relative_to(result, your_color), opening,
                 _platform_label(site), time_label, time_category, time_seconds,
-                your_elo,
+                your_elo, utc_time or "",
             )
             tree.setdefault(year, {}).setdefault(month, []).append(game)
         return tree

@@ -24,6 +24,11 @@ class ProfileRecord:
     platform: str  # "chesscom" | "lichess"
     username: str
     db_path: str  # relative to PROJECT_ROOT
+    pinned: bool = False  # a pinned profile's tab has no close button, so it can't be deleted by accident
+    group: str = ""  # tabs sharing a group name sit together and show it as a prefix
+
+    def tab_label(self) -> str:
+        return f"{self.group} · {self.display_name}" if self.group else self.display_name
 
     def resolved_db_path(self) -> Path:
         return PROJECT_ROOT / self.db_path
@@ -42,6 +47,19 @@ class ProfileRecord:
             return True
         except ValueError:
             return False
+
+
+    def owned_data_dir(self) -> Path | None:
+        """The directory that belongs exclusively to this profile -- i.e. the
+        profiles/<id>/ folder add_profile() created for it -- or None if its
+        db lives anywhere else (notably the original root-level
+        tempo_archive.db, which predates per-profile folders and must never
+        be wiped just because its tab was closed)."""
+        profiles_root = (PROJECT_ROOT / "profiles").resolve()
+        folder = self.resolved_db_path().resolve().parent
+        if folder != profiles_root and folder.is_relative_to(profiles_root):
+            return folder
+        return None
 
 
 @dataclass
@@ -112,6 +130,29 @@ def bootstrap_if_missing() -> ProfilesConfig:
     config = ProfilesConfig(profiles=[record], last_active=record.id)
     save_profiles(config)
     return config
+
+
+def group_ordered(profiles: list[ProfileRecord]) -> list[ProfileRecord]:
+    """Same profiles, with every group's members pulled together at the
+    position of the group's first member. Ungrouped profiles and the
+    relative order within each group keep their original order."""
+    ordered: list[ProfileRecord] = []
+    placed_groups: set[str] = set()
+    for p in profiles:
+        if not p.group:
+            ordered.append(p)
+        elif p.group not in placed_groups:
+            placed_groups.add(p.group)
+            ordered.extend(q for q in profiles if q.group == p.group)
+    return ordered
+
+
+def remove_profile(config: ProfilesConfig, profile_id: str) -> None:
+    """Removes a profile from `config` (in memory -- caller still needs to
+    save_profiles). Does not touch any files on disk."""
+    config.profiles = [p for p in config.profiles if p.id != profile_id]
+    if config.last_active == profile_id:
+        config.last_active = config.profiles[0].id if config.profiles else None
 
 
 def add_profile(config: ProfilesConfig, display_name: str, platform: str, username: str) -> ProfileRecord:

@@ -12,11 +12,12 @@ from __future__ import annotations
 import calendar
 import chess
 import html
+import time
 from datetime import datetime, timezone
 from typing import Callable
 from urllib.parse import quote, unquote
 
-from PySide6.QtCore import QEvent, QObject, QRect, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QRect, Qt, QTimer, Signal
 from PySide6.QtGui import QFont, QMouseEvent, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
@@ -24,6 +25,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QProgressBar,
+    QPushButton,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
@@ -74,8 +77,8 @@ def _result_color(result: str) -> str:
 def _game_link(game_id: int, inner_html: str) -> str:
     """Wraps cell content so clicking it loads that game onto the board (via
     the "game:<id>" anchor scheme handled in _on_anchor_clicked) -- used for
-    every game reference shown in chat output (/list, /opening, /stats'
-    "Most recent" rows), not just the dedicated /show and browser click."""
+    every game reference shown in chat output (/opening, /stats' "Most
+    recent" rows), not just the archive click."""
     return f'<a href="game:{game_id}" style="color:inherit; text-decoration:none;">{inner_html}</a>'
 
 
@@ -109,7 +112,7 @@ def _table(headers: list[str], rows: list[list[str]]) -> str:
 
 
 class CommandPanel(QWidget):
-    # Emitted when a game should be loaded onto the board (from /show or /review).
+    # Emitted when a game should be loaded onto the board (from a clicked game link).
     game_requested = Signal(int)
     # Emitted after a fetch adds at least one new game, so the browser can refresh.
     archive_updated = Signal()
@@ -220,9 +223,40 @@ class CommandPanel(QWidget):
         last_fetch_row.addWidget(self.last_fetch_label)
         last_fetch_row.addStretch(1)
 
+        # Fetch progress: hidden until a /fetch starts. A fetch can run for
+        # minutes (a full chess.com history is one request per month), so the
+        # bar, a live status line, and an elapsed-time ticker make it clear
+        # the app is working rather than frozen -- and Cancel stops it.
+        self.fetch_status_label = QLabel("")
+        self.fetch_status_label.setWordWrap(True)
+        self.fetch_progress_bar = QProgressBar()
+        self.fetch_progress_bar.setTextVisible(True)
+        self.fetch_progress_bar.setFixedHeight(16)
+        self.fetch_cancel_btn = QPushButton("Cancel")
+        self.fetch_cancel_btn.clicked.connect(self._on_fetch_cancel_clicked)
+        fetch_bar_row = QHBoxLayout()
+        fetch_bar_row.setContentsMargins(0, 0, 0, 0)
+        fetch_bar_row.addWidget(self.fetch_progress_bar, 1)
+        fetch_bar_row.addWidget(self.fetch_cancel_btn)
+        self.fetch_progress_box = QWidget()
+        fetch_box_layout = QVBoxLayout(self.fetch_progress_box)
+        fetch_box_layout.setContentsMargins(0, 2, 0, 2)
+        fetch_box_layout.setSpacing(2)
+        fetch_box_layout.addWidget(self.fetch_status_label)
+        fetch_box_layout.addLayout(fetch_bar_row)
+        self.fetch_progress_box.hide()
+        self._fetch_worker: FetchWorker | None = None
+        self._fetch_started_at = 0.0
+        self._fetch_desc = ""
+        self._fetch_last_progress = (0, 0, 0, "starting")
+        self._fetch_tick = QTimer(self)
+        self._fetch_tick.setInterval(1000)
+        self._fetch_tick.timeout.connect(self._update_fetch_status)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.addWidget(self.output, stretch=1)
+        layout.addWidget(self.fetch_progress_box)
         layout.addLayout(range_row)
         layout.addLayout(last_fetch_row)
         layout.addWidget(self.input)
@@ -270,17 +304,6 @@ class CommandPanel(QWidget):
         self._rating_start: QTextCursor | None = None
         self._rating_end: QTextCursor | None = None
         self._rating_msg_id: int | None = None
-
-        # /explorer repertoire browser: which color and how deep into the
-        # move tree the current block shows, so drilling into a move or
-        # clicking a breadcrumb can re-query and replace the block in place
-        # (same pattern as _stats_start/_end above).
-        self._explorer_color: str | None = None
-        self._explorer_sequence: list[str] = []
-        self._explorer_replies: list[dict] | None = None
-        self._explorer_start: QTextCursor | None = None
-        self._explorer_end: QTextCursor | None = None
-        self._explorer_msg_id: int | None = None
 
         self._print(WELCOME_TEXT)
         self._refresh_last_fetch_row()
@@ -368,11 +391,6 @@ class CommandPanel(QWidget):
         elif text == "showmorerating":
             self._rating_show_all = not self._rating_show_all
             self._replace_rating_block()
-        elif text.startswith("explorer:"):
-            color, _sep, seq_text = text[len("explorer:"):].partition(":")
-            sequence = unquote(seq_text).split() if seq_text else []
-            self._refresh_explorer_data(color, sequence)
-            self._replace_explorer_block()
 
     def _print_error(self, message: str) -> None:
         self._print(f'<span style="color:{ERROR_COLOR}">[Error] {_esc(message)}</span>')
@@ -596,10 +614,6 @@ class CommandPanel(QWidget):
     def _dispatch(self, cmd: str, args: list[str]) -> None:
         if cmd == "help" or cmd == "":
             self._print(HELP_TEXT)
-        elif cmd == "list":
-            limit = int(args[0]) if args else 20
-            data = self.cli.list_games(limit)
-            self._print(self._format_games(data["games"]))
         elif cmd == "stats":
             self._refresh_stats_data(args)
             self.game_type_popup.reset()  # next time the dropdown opens, start with nothing checked
@@ -619,9 +633,6 @@ class CommandPanel(QWidget):
             self._rating_start = None
             self._rating_end = None
             self._rating_msg_id = None
-            self._explorer_start = None
-            self._explorer_end = None
-            self._explorer_msg_id = None
             self._llm_start = None
             self._llm_end = None
             self._llm_msg_id = None
@@ -639,45 +650,15 @@ class CommandPanel(QWidget):
                 return
             data = self.cli.moves(args)
             self._print(self._format_replies(data["replies"]))
-        elif cmd == "explorer":
-            if not args or args[0].lower() not in ("white", "black"):
-                self._print_error("usage: /explorer <white|black> [san-sequence...]")
-                return
-            self._refresh_explorer_data(args[0].lower(), args[1:])
-            self._render_explorer_block()
-        elif cmd == "show":
-            if not args:
-                self._print_error("usage: /show <id>")
-                return
-            game_id = int(args[0])
-            data = self.cli.show(game_id)
-            self._print(self._format_game_header(data, self.notes.get_game_note(game_id)))
-            self.game_requested.emit(game_id)
-        elif cmd == "review":
-            if not args:
-                self._print_error("usage: /review <id>")
-                return
-            game_id = int(args[0])
-            # game_requested first, then _run_review -- ProfileView.load_game
-            # (which game_requested triggers) clears any stale review panel
-            # content from a previously-loaded game; doing it in this order
-            # means that clear happens before this command's own review is
-            # rendered, not after (which would immediately wipe it again).
-            self.game_requested.emit(game_id)
-            self._run_review(game_id)
         elif cmd == "fetch":
             self._dispatch_fetch(args)
-        elif cmd == "note":
-            self._dispatch_note(args)
-        elif cmd == "movenote":
-            self._dispatch_movenote(args)
         else:
             self._print_error(f"unknown command '/{cmd}'. Type /help for a list.")
 
     def display_selected_game(self, game_id: int, include_review: bool) -> None:
-        """Prints /show (or /review, if `include_review`) info for a game
-        selected by clicking it in the archive panel -- mirrors typing the
-        command, but without re-emitting game_requested (the caller already
+        """Prints a game's header info (plus its review table, if
+        `include_review`) for a game selected by clicking it in the archive
+        panel, without re-emitting game_requested (the caller already
         loaded the game onto the board; re-emitting would loop back here)."""
         if include_review:
             # Kept as its own small message (not merged with the review
@@ -737,13 +718,14 @@ class CommandPanel(QWidget):
         guards against during ordinary use."""
         self._cancel_active_review()
         self._cancel_active_llm_query()
+        self.cancel_fetch()
         for worker in list(self._retiring_review_workers) + list(self._retiring_llm_workers):
             worker.request_cancel()
             worker.wait(2000)
 
     def _emit_review(self, data: dict, game_id: int) -> None:
         """Renders /review's move-by-move table into the chat, in its own
-        tracked block (like /stats, /opening, /explorer -- see
+        tracked block (like /stats and /opening -- see
         _insert_tracked_block) so set_review_ply -- and this method itself,
         called again for the same game as a batch analysis progresses from
         "just the moves" to fully evaluated -- can cheaply update just this
@@ -1022,72 +1004,98 @@ class CommandPanel(QWidget):
             return
         site, username = args[0], args[1]
 
+        if self._fetch_worker is not None and self._fetch_worker.isRunning():
+            self._print_error("a fetch is already running -- wait for it to finish or press Cancel.")
+            return
+
         if site == "chesscom":
-            fetch_fn = lambda: self.cli.fetch_chesscom(username, full=full)
+            fetch_fn = lambda on_progress, cancel: self.cli.fetch_chesscom(
+                username, full=full, on_progress=on_progress, cancel_event=cancel)
         elif site == "lichess":
-            fetch_fn = lambda: self.cli.fetch_lichess(username, full=full)
+            fetch_fn = lambda on_progress, cancel: self.cli.fetch_lichess(
+                username, full=full, on_progress=on_progress, cancel_event=cancel)
         else:
             self._print_error(f"unknown fetch site '{site}' (expected chesscom or lichess)")
             return
 
-        wait_hint = "this can take several minutes" if full else "this can take a few seconds"
-        self._print(f'<span style="color:{MUTED_COLOR}">Fetching from {_esc(site)} for {_esc(username)}... '
-                    f'({wait_hint})</span>')
+        site_label = "chess.com" if site == "chesscom" else "lichess"
+        self._print(f'<span style="color:{MUTED_COLOR}">Fetching from {_esc(site_label)} for {_esc(username)}'
+                    f'{" (full history)" if full else ""}...</span>')
 
         # Run off the GUI thread -- with multiple profile tabs live at once,
         # a blocking fetch here would freeze every tab, not just this one.
-        self._fetch_worker = FetchWorker(fetch_fn)
-        self._fetch_worker.succeeded.connect(self._on_fetch_succeeded)
-        self._fetch_worker.failed.connect(self._print_error)
-        self._fetch_worker.start()
+        self._fetch_desc = f"{site_label} · {username}"
+        self._fetch_started_at = time.monotonic()
+        self._fetch_last_progress = (0, 0, 0, "starting")
+        self.fetch_cancel_btn.setEnabled(True)
+        self.fetch_progress_box.show()
+        self._update_fetch_status()
+        self._fetch_tick.start()
+
+        worker = FetchWorker(fetch_fn, streaming=True)
+        worker.progress.connect(self._on_fetch_progress)
+        worker.succeeded.connect(self._on_fetch_succeeded)
+        worker.failed.connect(self._on_fetch_failed)
+        worker.cancelled.connect(self._on_fetch_cancelled)
+        self._fetch_worker = worker
+        worker.start()
+
+    def _on_fetch_progress(self, done: int, total: int, added: int, label: str) -> None:
+        self._fetch_last_progress = (done, total, added, label)
+        self._update_fetch_status()
+
+    def _update_fetch_status(self) -> None:
+        done, total, added, label = self._fetch_last_progress
+        elapsed = int(time.monotonic() - self._fetch_started_at)
+        clock = f"{elapsed // 60}:{elapsed % 60:02d}"
+        if total > 0:
+            self.fetch_progress_bar.setRange(0, total)
+            self.fetch_progress_bar.setValue(done)
+            self.fetch_progress_bar.setFormat(f"{done} / {total} months")
+            detail = f"{label} · {added} new game{'s' if added != 1 else ''}"
+        else:
+            self.fetch_progress_bar.setRange(0, 0)  # busy/indeterminate -- a single download has no step count
+            detail = label
+        self.fetch_status_label.setText(
+            f'<span style="color:{MUTED_COLOR}">{_esc(self._fetch_desc)} &middot; {_esc(detail)} &middot; {clock}</span>')
+
+    def _finish_fetch_ui(self) -> None:
+        self._fetch_tick.stop()
+        self.fetch_progress_box.hide()
+
+    def _on_fetch_cancel_clicked(self) -> None:
+        if self._fetch_worker is not None and self._fetch_worker.isRunning():
+            self.fetch_cancel_btn.setEnabled(False)
+            self.fetch_status_label.setText(f'<span style="color:{MUTED_COLOR}">Cancelling...</span>')
+            self._fetch_worker.request_cancel()
+
+    def cancel_fetch(self) -> None:
+        """Stops a running fetch, e.g. when this profile's tab is deleted."""
+        if self._fetch_worker is not None and self._fetch_worker.isRunning():
+            self._fetch_worker.request_cancel()
+            self._fetch_worker.wait(3000)
 
     def _on_fetch_succeeded(self, data: dict) -> None:
+        self._finish_fetch_ui()
         self._print(self._format_fetch_results(data["results"]))
         self._refresh_last_fetch_row()
 
-    def _dispatch_note(self, args: list[str]) -> None:
-        # /note <id> [text...] -- empty text clears the note (see
-        # Notes.set_game_note). No quoting support, same as every other
-        # free-text command here (e.g. /opening) -- the remaining args are
-        # just rejoined with spaces.
-        if not args:
-            self._print_error("usage: /note <id> [text...]")
-            return
-        try:
-            game_id = int(args[0])
-        except ValueError:
-            self._print_error(f"'{args[0]}' isn't a valid game id")
-            return
-        text = " ".join(args[1:])
-        self.notes.set_game_note(game_id, text)
-        self._print(f'<span style="color:{MUTED_COLOR}">Note {"cleared" if not text else "saved"} for game #{game_id}.</span>')
-        self.refresh_notes_in_current_review(game_id)
-        self.archive_updated.emit()  # so the archive browser's Notes column picks up the change immediately
+    def _on_fetch_failed(self, message: str) -> None:
+        self._finish_fetch_ui()
+        self._print_error(message)
 
-    def _dispatch_movenote(self, args: list[str]) -> None:
-        # /movenote <id> <ply> [text...] -- ply matches the "ply:<id>:<ply>"
-        # scheme already used for jump-to-move chat links (1-based, the
-        # position AFTER that move).
-        if len(args) < 2:
-            self._print_error("usage: /movenote <id> <ply> [text...]")
-            return
-        try:
-            game_id, ply = int(args[0]), int(args[1])
-        except ValueError:
-            self._print_error("usage: /movenote <id> <ply> [text...] -- id and ply must be numbers")
-            return
-        text = " ".join(args[2:])
-        self.notes.set_move_note(game_id, ply, text)
-        self._print(f'<span style="color:{MUTED_COLOR}">Move note {"cleared" if not text else "saved"} for game #{game_id}, ply {ply}.</span>')
-        self.refresh_notes_in_current_review(game_id)
+    def _on_fetch_cancelled(self) -> None:
+        self._finish_fetch_ui()
+        done, total, added, _label = self._fetch_last_progress
+        self.archive_updated.emit()  # games imported before the cancel are already in the archive
+        self._print(f'<span style="color:{MUTED_COLOR}">Fetch cancelled after {done}'
+                    f'{f" of {total}" if total else ""} step(s) &mdash; {added} game(s) already added were kept.</span>')
 
     def refresh_notes_in_current_review(self, game_id: int) -> None:
         """If `game_id`'s /review table is the one currently on screen,
         patch its note fields from a fresh read and re-render that block in
-        place -- so /note or /movenote (or ProfileView's "Add/edit game
-        note" button) is visible immediately without needing to re-run
-        /review. Public (not a leading-underscore helper) since ProfileView
-        calls this too, not just this class's own /note dispatch."""
+        place -- so ProfileView's note buttons show up immediately without
+        needing to reopen the review. Public since ProfileView calls it."""
         if self._last_review_data is None or self._last_review_game_id != game_id:
             return
         self._last_review_data["game_note"] = self.notes.get_game_note(game_id)
@@ -1261,27 +1269,6 @@ class CommandPanel(QWidget):
             return
         self._rating_end = self._replace_tracked_block(
             self._rating_start, self._rating_end, self._format_rating(self._rating_data), self._rating_msg_id)
-
-    def _refresh_explorer_data(self, color: str, sequence: list[str]) -> None:
-        self._explorer_color = color
-        self._explorer_sequence = list(sequence)
-        self._explorer_replies = self.cli.explorer(color, sequence)["replies"]
-
-    def _on_explorer_block_closed(self, msg_id: int) -> None:
-        if self._explorer_msg_id == msg_id:
-            self._explorer_start = None
-            self._explorer_end = None
-            self._explorer_msg_id = None
-
-    def _render_explorer_block(self) -> None:
-        self._explorer_start, self._explorer_end, self._explorer_msg_id = self._insert_tracked_block(
-            self._format_explorer(), on_close=self._on_explorer_block_closed)
-
-    def _replace_explorer_block(self) -> None:
-        if self._explorer_start is None or self._explorer_end is None or self._explorer_replies is None:
-            return
-        self._explorer_end = self._replace_tracked_block(
-            self._explorer_start, self._explorer_end, self._format_explorer(), self._explorer_msg_id)
 
     def _recent_games_for(self, name: str, color_key: str) -> list[dict]:
         # find_games_by_exact_opening (the C++ side of opening_exact) has no
@@ -1552,74 +1539,6 @@ class CommandPanel(QWidget):
             rows.append([f'<b>{_esc(r["san"])}</b>', str(r["count"]),
                          f'{r["wins"]}W {r["losses"]}L {r["draws"]}D', _win_rate_span(r["wins"], games)])
         return _table(["Move", "Games", "Record", "Win rate"], rows)
-
-    _EXPLORER_BAR_WIDTH = 180  # px -- fixed rather than percentage widths, since QTextBrowser's table layout
-                               # doesn't reliably honor percentage-width cells the way real HTML/CSS does.
-
-    def _explorer_result_bar(self, wins: int, losses: int, draws: int) -> str:
-        total = wins + losses + draws
-        if not total:
-            return ""
-        win_w = round(self._EXPLORER_BAR_WIDTH * wins / total)
-        loss_w = round(self._EXPLORER_BAR_WIDTH * losses / total)
-        draw_w = max(0, self._EXPLORER_BAR_WIDTH - win_w - loss_w)
-
-        def seg(width: int, color: str, pct: float) -> str:
-            if width <= 0:
-                return ""
-            label = f"{pct:.0f}%" if pct >= 8 else ""  # skip the label on slivers too narrow to hold text
-            return (f'<td style="background:{color}; width:{width}px; color:#111; font-size:9px; '
-                    f'text-align:center; padding:1px 0;">{label}</td>')
-
-        win_pct, draw_pct, loss_pct = (100.0 * n / total for n in (wins, draws, losses))
-        segs = seg(win_w, WIN_COLOR, win_pct) + seg(draw_w, DRAW_COLOR, draw_pct) + seg(loss_w, LOSS_COLOR, loss_pct)
-        return f'<table cellspacing="0" cellpadding="0" style="width:{self._EXPLORER_BAR_WIDTH}px;"><tr>{segs}</tr></table>'
-
-    @staticmethod
-    def _explorer_move_label(san: str, ply_index: int) -> str:
-        # Move numbers only precede White's moves (even ply), matching how
-        # /moves and /show already display SAN sequences elsewhere.
-        prefix = f"{ply_index // 2 + 1}." if ply_index % 2 == 0 else ""
-        return prefix + san
-
-    def _format_explorer(self) -> str:
-        color = self._explorer_color
-        sequence = self._explorer_sequence
-        replies = self._explorer_replies or []
-
-        color_label = "White" if color == "white" else "Black"
-        parts = [f'<div><b style="color:{HEADER_COLOR}">Repertoire explorer</b> '
-                 f'<span style="color:{MUTED_COLOR}">-- your moves as {color_label}</span></div>']
-
-        crumbs = [f'<a href="explorer:{color}:" style="color:{HEADER_COLOR}; text-decoration:none;">Start</a>']
-        for i, san in enumerate(sequence):
-            prefix = sequence[: i + 1]
-            href = "explorer:" + color + ":" + quote(" ".join(prefix))
-            label = self._explorer_move_label(san, i)
-            crumbs.append(f'<a href="{href}" style="color:{HEADER_COLOR}; text-decoration:none;">{_esc(label)}</a>')
-        parts.append(f'<div style="margin:4px 0;">{" &rsaquo; ".join(crumbs)}</div>')
-
-        if not replies:
-            parts.append(f'<span style="color:{MUTED_COLOR}">No games reached this position.</span>')
-            return "".join(parts)
-
-        total_games = sum(r["count"] for r in replies)
-        rows = []
-        for r in replies:
-            freq_pct = 100.0 * r["count"] / total_games if total_games else 0.0
-            next_seq = sequence + [r["san"]]
-            href = "explorer:" + color + ":" + quote(" ".join(next_seq))
-            label = self._explorer_move_label(r["san"], len(sequence))
-            link = f'<a href="{href}" style="color:inherit; text-decoration:none;"><b>{_esc(label)}</b></a>'
-            rows.append([
-                link,
-                f'{freq_pct:.0f}% <span style="color:{MUTED_COLOR}">({r["count"]})</span>',
-                self._explorer_result_bar(r["wins"], r["losses"], r["draws"]),
-            ])
-        parts.append(_table(["Move", "Played", "Result"], rows))
-        parts.append(f'<div style="color:{MUTED_COLOR}; margin-top:2px;">{total_games} game(s) reached this position '
-                      f'<span style="color:{MUTED_COLOR}">(click a move to drill in, or a breadcrumb to jump back)</span></div>')
-        return "".join(parts)
 
     def _format_game_header(self, g: dict, note: str | None = None) -> str:
         result_html = f'<span style="color:{_result_color(g.get("result", ""))}"><b>{_esc(g.get("result", ""))}</b></span>' \

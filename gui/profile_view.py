@@ -266,7 +266,7 @@ class ProfileView(QWidget):
         self._live_eval_failure_count = 0
 
         # When checked, selecting a game in the archive also prints /review's
-        # eval-annotated move table (not just /show's header) into the chat.
+        # eval-annotated move table (not just the game header) into the chat.
         # Unchecked by default -- the review table is the heavier of the two.
         self.show_review_checkbox = QCheckBox("Also show move review on select")
 
@@ -368,9 +368,11 @@ class ProfileView(QWidget):
         self.view_bookmarks_btn = QPushButton("View bookmarks")
         # Distinct from a bookmark's own (position-specific) note -- this is
         # one note per whole game, e.g. "Ponziani opening with exchange in
-        # the center", shown in /show and /review and searchable from the
+        # the center", shown in the game header / review and searchable from the
         # archive's query bar (see game_search.py's `text` filter).
         self.game_note_btn = QPushButton("Add/edit game note")
+        self.move_note_btn = QPushButton("Add/edit move note")
+        self.move_note_btn.setToolTip("Note on the move that led to the current position (mainline only)")
         self.favorite_btn = QPushButton("☆ Favorite")
         self.favorite_btn.setToolTip("Star the loaded game (also togglable from the archive's ★ column)")
         # Lives here (not in browser_controls, inside the column it toggles)
@@ -388,6 +390,7 @@ class ProfileView(QWidget):
         self.view_bookmarks_btn.clicked.connect(self._on_view_bookmarks)
         self.game_note_btn.clicked.connect(self._on_edit_game_note)
         self.favorite_btn.clicked.connect(self._on_toggle_favorite)
+        self.move_note_btn.clicked.connect(self._on_edit_move_note)
         self.archive_toggle_btn.clicked.connect(self._on_toggle_archive)
 
         nav_row = QHBoxLayout()
@@ -403,6 +406,7 @@ class ProfileView(QWidget):
         bookmark_row.addWidget(self.bookmark_btn)
         bookmark_row.addWidget(self.view_bookmarks_btn)
         bookmark_row.addWidget(self.game_note_btn)
+        bookmark_row.addWidget(self.move_note_btn)
         bookmark_row.addWidget(self.favorite_btn)
 
         self.status_label = QLabel("No game loaded.")
@@ -545,9 +549,9 @@ class ProfileView(QWidget):
         self.browser.select_game(game_id)  # keep the browser's selection in sync regardless of how the game was loaded
 
     def _on_browser_game_selected(self, game_id: int) -> None:
-        # Only for clicks in the archive panel -- /show and /review typed in
-        # the chat already print their own info before calling load_game,
-        # so this must not also fire for that path (it would double-print).
+        # Only for clicks in the archive panel -- game links clicked in the
+        # chat already show their own context, so this must not also fire
+        # for that path (it would double-print).
         self.command_panel.display_selected_game(game_id, self.show_review_checkbox.isChecked())
 
     def _on_move_requested(self, game_id: int, ply: int) -> None:
@@ -937,11 +941,9 @@ class ProfileView(QWidget):
 
     def _on_edit_game_note(self) -> None:
         """Add or edit the one note attached to the whole currently-loaded
-        game (distinct from a bookmark's own position-specific note) -- the
-        GUI-button equivalent of typing /note <id> <text...> in chat, for
-        whichever game is already on the board instead of by id. Shows the
-        existing note pre-filled (so this doubles as "edit"), and an empty
-        result clears it, matching Notes.set_game_note's own convention."""
+        game (distinct from a bookmark's own position-specific note). Shows
+        the existing note pre-filled (so this doubles as "edit"), and an
+        empty result clears it, matching Notes.set_game_note's convention."""
         if self.current_game_id is None:
             self.status_label.setText("Load a game from the archive first to add a note to it.")
             return
@@ -955,6 +957,25 @@ class ProfileView(QWidget):
         self.status_label.setText(f"Note {'cleared' if not text.strip() else 'saved'} for game #{game_id}.")
         self.browser.refresh()  # picks up the change in the archive's Notes column right away
         self.command_panel.refresh_notes_in_current_review(game_id)  # updates an already-open /review for this game too
+
+    def _on_edit_move_note(self) -> None:
+        """Add/edit/clear the note on the move that led to the current board
+        position of the loaded game (1-based ply, matching Notes' scheme)."""
+        if self.current_game_id is None:
+            self.status_label.setText("Load a game from the archive first to add a move note.")
+            return
+        if not self.board.on_mainline or self.board.mainline_ply < 1:
+            self.status_label.setText("Step to a move in the game's mainline first (not the start or a side line).")
+            return
+        game_id, ply = self.current_game_id, self.board.mainline_ply
+        existing = self.notes.get_move_notes(game_id).get(ply, "")
+        text, ok = QInputDialog.getMultiLineText(
+            self, "Move note", f"Note for game #{game_id}, ply {ply} (leave empty to clear):", existing)
+        if not ok:
+            return
+        self.notes.set_move_note(game_id, ply, text)
+        self.status_label.setText(f"Move note {'cleared' if not text.strip() else 'saved'} for game #{game_id}, ply {ply}.")
+        self.command_panel.refresh_notes_in_current_review(game_id)
 
     def _load_bookmark(self, bookmark: Bookmark) -> None:
         if bookmark.source_game_id is not None and bookmark.source_ply is not None:

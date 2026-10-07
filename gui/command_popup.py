@@ -9,18 +9,12 @@ from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtWidgets import QListWidget, QListWidgetItem
 
 COMMANDS = [
-    ("/list", "[n]", "List the n most recent games (default 20)"),
-    ("/show", "<id>", "Show a game's info and load it on the board"),
-    ("/review", "<id>", "Replay a game with eval annotations, loaded on the board"),
-    ("/note", "<id> [text...]", "Add/replace a note on a game (empty text clears it)"),
-    ("/movenote", "<id> <ply> [text...]", "Add/replace a note on a specific move (empty text clears it)"),
-    ("/stats", "[type...]", "Win rate, opening, and time-management stats (optionally filtered by game type)"),
-    ("/rating", "[type...]", "Current rating and rating history (same filters as /stats)"),
-    ("/opening", "<query>", "Win/loss record for an opening (name substring or ECO code)"),
-    ("/moves", "<sequence>", "What was played after a SAN sequence, e.g. /moves e4 e5 Nf3"),
-    ("/explorer", "<white|black>", "Browse your own repertoire move-by-move, lichess-explorer style"),
-    ("/fetch chesscom", "<user> [full]", "Fetch games from chess.com ('full' re-downloads all history and backfills rating)"),
-    ("/fetch lichess", "<user> [full]", "Fetch games from lichess ('full' re-downloads all history and backfills rating)"),
+    ("/stats", "[type...]", "Win rate, opening & time stats (filter by type)"),
+    ("/rating", "[type...]", "Rating and rating history (same filters)"),
+    ("/opening", "<query>", "Record for an opening (name or ECO code)"),
+    ("/moves", "<sequence>", "Replies after a SAN sequence, e.g. e4 e5 Nf3"),
+    ("/fetch chesscom", "<user> [full]", "Fetch from chess.com ('full' = all history)"),
+    ("/fetch lichess", "<user> [full]", "Fetch from lichess ('full' = all history)"),
     ("/clear", "", "Clear the chat history"),
     ("/help", "", "Show this list"),
 ]

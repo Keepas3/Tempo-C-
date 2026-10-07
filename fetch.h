@@ -37,6 +37,16 @@ inline bool fetch_url_to_file(const std::string& url, const std::string& out_pat
     return std::system(cmd.c_str()) == 0;
 }
 
+// Downloads chess.com's list of months this player actually has games in
+// ({"archives": [".../games/2026/09", ...]}) -- lets a "full" fetch request
+// only real months instead of probing every month back to 2005.
+inline bool fetch_chesscom_archives(const std::string& username, const std::string& out_path) {
+    if (!is_valid_username(username)) return false;
+    std::string lower = username;
+    for (char& c : lower) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    return fetch_url_to_file("https://api.chess.com/pub/player/" + lower + "/games/archives", out_path);
+}
+
 inline bool fetch_chesscom_month(const std::string& username, int year, int month, const std::string& out_path) {
     if (!is_valid_username(username)) return false;
     char month_buf[3];

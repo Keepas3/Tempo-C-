@@ -77,7 +77,8 @@ def _sort_key(column: int, game, notes_by_id: dict[int, str], favorite_ids: set[
         return game.opening.lower()
     if column == NOTES_COLUMN:
         return notes_by_id.get(game.id, "")
-    return game.date  # column 0 (or anything unrecognized): "YYYY.MM.DD" sorts correctly as text
+    # column 0 (or anything unrecognized): "YYYY.MM.DD" then "HH:MM:SS" both sort correctly as text
+    return (game.date, game.utc_time)
 
 
 class GameBrowser(QTreeWidget):
@@ -110,19 +111,21 @@ class GameBrowser(QTreeWidget):
         self.setAlternatingRowColors(True)  # zebra striping -- a dense table of near-identical rows is otherwise easy to lose your place in
         self.setUniformRowHeights(True)
         self.setStyleSheet("QTreeWidget::item { padding: 3px 0; }")  # a bit less cramped than the default row height
-        # Column 0 (the game title) stretches to fill whatever space is left
-        # after the fixed-width columns, instead of a fixed width that
-        # truncates opponent names.
-        self.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.setColumnWidth(FAV_COLUMN, 32)
-        self.setColumnWidth(COLOR_COLUMN, 55)
-        self.setColumnWidth(TIME_COLUMN, 70)
-        self.setColumnWidth(TYPE_COLUMN, 70)
-        self.setColumnWidth(SITE_COLUMN, 80)
-        self.setColumnWidth(RESULT_COLUMN, 60)
-        self.setColumnWidth(ELO_COLUMN, 55)
-        self.setColumnWidth(OPENING_COLUMN, 170)
-        self.setColumnWidth(NOTES_COLUMN, 130)
+        # Every column has a fixed, user-resizable width -- the Game column
+        # used to Stretch, which with nine other columns squeezed it down to
+        # a sliver (cutting off month labels and opponent names). Widths are
+        # sized so the whole row roughly fits the archive panel; anything
+        # beyond that scrolls horizontally instead of cutting the Game
+        # column short.
+        self.setIndentation(14)  # default (20px x2 levels) wastes space the Game column needs
+        self.header().setStretchLastSection(False)
+        self.header().setMinimumSectionSize(24)
+        for column, width in {
+            GAME_COLUMN: 190, FAV_COLUMN: 28, COLOR_COLUMN: 48, TIME_COLUMN: 62, TYPE_COLUMN: 56,
+            SITE_COLUMN: 72, RESULT_COLUMN: 48, ELO_COLUMN: 40, OPENING_COLUMN: 125, NOTES_COLUMN: 90,
+        }.items():
+            self.header().setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
+            self.setColumnWidth(column, width)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._on_context_menu)
         self.header().setSortIndicatorShown(True)
@@ -223,7 +226,8 @@ class GameBrowser(QTreeWidget):
                 for game in games_sorted:
                     is_fav = game.id in favorite_ids
                     label = f"{_day_only(game.date)}  vs {game.opponent}"
-                    full_label = f"{game.date}  vs {game.opponent}"
+                    time_part = f" {game.utc_time[:5]} UTC" if game.utc_time else ""
+                    full_label = f"{game.date}{time_part}  vs {game.opponent}"
                     color_display = game.your_color.capitalize()
                     elo_display = str(game.your_elo) if game.your_elo is not None else ""
                     note = notes_by_id.get(game.id, "")

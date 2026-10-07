@@ -5,6 +5,9 @@
 #include <filesystem>
 #include <chrono>
 #include <ctime>
+#include <fstream>
+#include <iterator>
+#include <algorithm>
 #include "game.h"
 #include "pgn.h"
 #include "db.h"
@@ -349,6 +352,18 @@ struct FetchResult {
     ImportCounts counts;
 };
 
+// Set only in --json mode (the GUI's path): fetches then stream one
+// tab-separated progress line per update to stderr, flushed immediately, so
+// the GUI can show a real progress bar instead of looking frozen during a
+// multi-minute fetch. stdout stays exactly one JSON document, untouched.
+// `total` of 0 means "unknown" (a single lichess download has no steps).
+bool PROGRESS_TO_STDERR = false;
+
+void emit_progress(int done, int total, int added, const std::string& label) {
+    if (!PROGRESS_TO_STDERR) return;
+    std::cerr << "TEMPO_PROGRESS	" << done << '	' << total << '	' << added << '	' << label << std::endl;
+}
+
 FetchResult fetch_chesscom_one_month_result(Archive& archive, const std::string& username, int year, int month) {
     FetchResult r;
     std::ostringstream label;
@@ -370,12 +385,44 @@ FetchResult fetch_chesscom_one_month_result(Archive& archive, const std::string&
     return r;
 }
 
-// EARLIEST_YEAR is chess.com's own founding year -- a "full" re-fetch has no
-// per-user join-date to start from (that would mean hitting the JSON player
-// profile endpoint, which this app otherwise never touches), so it just
-// walks every month from here forward; months before the account existed
-// come back empty and cost one harmless request each.
+// EARLIEST_CHESSCOM_YEAR is chess.com's own founding year -- only the
+// fallback for a "full" fetch when chess.com's archives list (see
+// chesscom_archive_months) can't be fetched: it then walks every month from
+// here forward, and months before the account existed cost one harmless
+// empty request each.
 constexpr int EARLIEST_CHESSCOM_YEAR = 2005;
+
+// Every (year, month) chess.com says `username` has games in, oldest first,
+// or empty if the list couldn't be fetched/parsed. The response is a flat
+// JSON array of ".../games/YYYY/MM" URLs, so a plain scan for that suffix
+// is enough -- no JSON parser needed.
+std::vector<std::pair<int, int>> chesscom_archive_months(const std::string& username) {
+    std::vector<std::pair<int, int>> months;
+    fs::path tmp = fs::temp_directory_path() / "tempo_chesscom_archives.json";
+    if (!fetch_chesscom_archives(username, tmp.string())) {
+        std::error_code ec;
+        fs::remove(tmp, ec);
+        return months;
+    }
+    std::ifstream in(tmp);
+    std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    in.close();
+    std::error_code ec;
+    fs::remove(tmp, ec);
+
+    const std::string marker = "/games/";
+    size_t pos = 0;
+    while ((pos = body.find(marker, pos)) != std::string::npos) {
+        pos += marker.size();
+        int y = 0, m = 0;
+        if (std::sscanf(body.c_str() + pos, "%4d/%2d", &y, &m) == 2 && y >= EARLIEST_CHESSCOM_YEAR && m >= 1 && m <= 12) {
+            months.push_back({y, m});
+        }
+    }
+    std::sort(months.begin(), months.end());
+    months.erase(std::unique(months.begin(), months.end()), months.end());
+    return months;
+}
 
 std::vector<FetchResult> fetch_chesscom_results(Archive& archive, const std::string& username, int year, int month, bool full = false) {
     std::vector<FetchResult> results;
@@ -388,8 +435,8 @@ std::vector<FetchResult> fetch_chesscom_results(Archive& archive, const std::str
         return results;
     }
 
-    // (year, month) attempted alongside each result -- FetchResult itself
-    // doesn't carry it, needed below to compute what to record.
+    // Every (year, month) this call will fetch, decided up front so the
+    // GUI's progress bar knows the total before the first request goes out.
     std::vector<std::pair<int, int>> attempted;
 
     if (full) {
@@ -397,15 +444,17 @@ std::vector<FetchResult> fetch_chesscom_results(Archive& archive, const std::str
         // existed -- re-downloading games insert_game already has just
         // backfills their white_elo/black_elo (see Archive::insert_game's
         // duplicate path) rather than creating duplicate rows.
-        std::time_t tt = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-        std::tm* local_tm = std::localtime(&tt);
-        int cur_year = local_tm->tm_year + 1900;
-        int cur_month = local_tm->tm_mon + 1;
-        for (int y = EARLIEST_CHESSCOM_YEAR; y < cur_year || (y == cur_year); ++y) {
-            int last_month = (y == cur_year) ? cur_month : 12;
-            for (int m = 1; m <= last_month; ++m) {
-                results.push_back(fetch_chesscom_one_month_result(archive, username, y, m));
-                attempted.push_back({y, m});
+        attempted = chesscom_archive_months(username);
+        if (attempted.empty()) {
+            // Archives list unavailable (network/API hiccup) -- fall back to
+            // probing every month; slower, but a "full" fetch never regresses.
+            std::time_t tt = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+            std::tm* local_tm = std::localtime(&tt);
+            int cur_year = local_tm->tm_year + 1900;
+            int cur_month = local_tm->tm_mon + 1;
+            for (int y = EARLIEST_CHESSCOM_YEAR; y <= cur_year; ++y) {
+                int last_month = (y == cur_year) ? cur_month : 12;
+                for (int m = 1; m <= last_month; ++m) attempted.push_back({y, m});
             }
         }
     } else if (year == -1) {
@@ -419,9 +468,7 @@ std::vector<FetchResult> fetch_chesscom_results(Archive& archive, const std::str
             // No history yet -- unchanged default: current + previous month.
             int prev_year = (cur_month == 1) ? cur_year - 1 : cur_year;
             int prev_month = (cur_month == 1) ? 12 : cur_month - 1;
-            results.push_back(fetch_chesscom_one_month_result(archive, username, prev_year, prev_month));
             attempted.push_back({prev_year, prev_month});
-            results.push_back(fetch_chesscom_one_month_result(archive, username, cur_year, cur_month));
             attempted.push_back({cur_year, cur_month});
         } else {
             // Gap-fill every month from the last covered one (re-included,
@@ -430,14 +477,21 @@ std::vector<FetchResult> fetch_chesscom_results(Archive& archive, const std::str
             int y = history->last_covered_year;
             int m = history->last_covered_month;
             while (y < cur_year || (y == cur_year && m <= cur_month)) {
-                results.push_back(fetch_chesscom_one_month_result(archive, username, y, m));
                 attempted.push_back({y, m});
                 if (m == 12) { m = 1; y++; } else { m++; }
             }
         }
     } else {
-        results.push_back(fetch_chesscom_one_month_result(archive, username, year, month));
         attempted.push_back({year, month});
+    }
+
+    int total_added = 0;
+    const int total_months = static_cast<int>(attempted.size());
+    emit_progress(0, total_months, 0, "starting");
+    for (int i = 0; i < total_months; ++i) {
+        results.push_back(fetch_chesscom_one_month_result(archive, username, attempted[i].first, attempted[i].second));
+        if (results.back().ok) total_added += results.back().counts.added;
+        emit_progress(i + 1, total_months, total_added, results.back().source);
     }
 
     // Record the furthest successfully-covered month this call reached,
@@ -498,6 +552,7 @@ FetchResult fetch_lichess_result(Archive& archive, const std::string& username, 
     std::optional<FetchHistoryRow> history = (!full && days == -1) ? archive.get_last_fetch("lichess", username) : std::nullopt;
 
     fs::path tmp = fs::temp_directory_path() / "tempo_fetch_lichess.pgn";
+    emit_progress(0, 0, 0, "downloading from lichess");  // one streamed request -- no step count to report
     bool ok;
     if (full) {
         r.source = "lichess (full history)";
@@ -522,6 +577,7 @@ FetchResult fetch_lichess_result(Archive& archive, const std::string& username, 
         return r;
     }
 
+    emit_progress(0, 0, 0, "importing games");
     r.counts = import_one_file(archive, tmp.string());
     std::error_code ec;
     fs::remove(tmp, ec);
@@ -732,6 +788,7 @@ int main(int argc, char* argv[]) {
     GAMES_DIR = db_parent.empty() ? "games" : (db_parent / "games").string();
 
     if (!args.empty() && args[0] == "--json") {
+        PROGRESS_TO_STDERR = true;
         Archive archive(DB_PATH);
         std::vector<std::string> json_args(args.begin() + 1, args.end());
         return run_json_command(archive, json_args);
