@@ -370,9 +370,10 @@ class ProfileView(QWidget):
         # one note per whole game, e.g. "Ponziani opening with exchange in
         # the center", shown in the game header / review and searchable from the
         # archive's query bar (see game_search.py's `text` filter).
-        self.game_note_btn = QPushButton("Add/edit game note")
-        self.move_note_btn = QPushButton("Add/edit move note")
-        self.move_note_btn.setToolTip("Note on the move that led to the current position (mainline only)")
+        self.game_note_btn = QPushButton("Game note")
+        self.game_note_btn.setToolTip("Add/edit one note for the whole loaded game")
+        self.move_note_btn = QPushButton("Move note")
+        self.move_note_btn.setToolTip("Add/edit a note on the move that led to the current position (mainline only)")
         self.favorite_btn = QPushButton("☆ Favorite")
         self.favorite_btn.setToolTip("Star the loaded game (also togglable from the archive's ★ column)")
         # Lives here (not in browser_controls, inside the column it toggles)

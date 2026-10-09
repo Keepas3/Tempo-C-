@@ -45,7 +45,7 @@ def _game_dict_from_cli(cli_game: dict) -> dict:
 def _game_dict_from_detail(detail: GameDetail) -> dict:
     return {
         "white": detail.white, "black": detail.black, "date": detail.date,
-        "result": detail.result, "site": detail.site, "opening": detail.opening,
+        "result": detail.result, "your_color": detail.your_color, "site": detail.site, "opening": detail.opening,
         "eco": detail.eco, "moves": [{"san": m.san} for m in detail.moves],
     }
 

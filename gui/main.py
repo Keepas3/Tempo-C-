@@ -23,7 +23,7 @@ from profiles import ProfileRecord, ProfilesConfig, bootstrap_if_missing, group_
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Tempo - Game Archive")
+        self.setWindowTitle("Tempo C++ - Game Archive")
 
         self.config: ProfilesConfig = bootstrap_if_missing()
 

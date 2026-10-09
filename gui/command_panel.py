@@ -38,7 +38,7 @@ import markdown_lite
 from analysis_cache import AnalysisCache
 from bookmarks import Bookmarks
 from command_popup import COMMANDS, CommandPopup, GameTypePopup, OpeningPopup
-from db_reader import DbReader
+from db_reader import DbReader, result_relative_to
 from engine import BATCH_DEPTH, BATCH_SETTING_KEY, ENGINE_ID, EngineManager
 from engine import engine_version as current_engine_version
 from engine import is_available as engine_is_available
@@ -1541,8 +1541,12 @@ class CommandPanel(QWidget):
         return _table(["Move", "Games", "Record", "Win rate"], rows)
 
     def _format_game_header(self, g: dict, note: str | None = None) -> str:
-        result_html = f'<span style="color:{_result_color(g.get("result", ""))}"><b>{_esc(g.get("result", ""))}</b></span>' \
-            if g.get("result") in ("Win", "Loss", "Draw") else _esc(g.get("result", ""))
+        # Win/Loss/Draw from your side of the board rather than the raw PGN
+        # score ("0-1" is a win when you played black); falls back to the raw
+        # score only when your color is unknown (e.g. someone else's game).
+        outcome = result_relative_to(g.get("result", ""), g.get("your_color", ""))
+        result_html = f'<span style="color:{_result_color(outcome)}"><b>{_esc(outcome)}</b></span>' \
+            if outcome in ("Win", "Loss", "Draw") else _esc(g.get("result", ""))
         header = (f'<b>{_esc(g["white"])} vs {_esc(g["black"])}</b>  '
                   f'<span style="color:{MUTED_COLOR}">({_esc(g["date"])})</span>  {result_html}  '
                   f'<span style="color:{MUTED_COLOR}">[{_esc(g.get("site", "Unknown"))}]</span>')
