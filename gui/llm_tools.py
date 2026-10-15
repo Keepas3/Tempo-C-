@@ -14,7 +14,7 @@ a schema's `maxItems` alone is only a hint the model could ignore.
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 import chess
@@ -24,11 +24,12 @@ import llm_settings
 from analysis_cache import AnalysisCache
 from bookmarks import Bookmarks
 import engine as engine_module
-from engine import BATCH_DEPTH, BATCH_SETTING_KEY, ENGINE_ID, EngineManager
+from engine import BATCH_DEPTH, BATCH_SETTING_KEY, ENGINE_ID, EngineManager, batch_worker_count
 from engine_analysis_core import analyze_missing_plies
 from db_reader import DbReader
 from game_search import GameSearchFilter, game_row_to_compact_dict, search_games as _filter_games
 from notes import Notes
+from profiles import ProfileRecord
 from review_data import build_stockfish_review_payload
 from tempo_cli import TempoCli, TempoCliError
 
@@ -60,6 +61,15 @@ per-ply evaluation data yourself.
 specific game you already know matters (e.g. to quote a concrete line), \
 never in a loop over many games.
 
+Other profiles: the user can have other players' archives open as separate \
+profiles (e.g. an opponent they are about to face). When they ask how to \
+prepare for, beat, or understand another player, call list_profiles, then \
+scout_profile for that player -- it returns their most common lines, \
+opening results and head-to-head against the user in one cheap call. Use \
+get_repertoire_stats with its `profile` argument to look deeper at what \
+that player plays after a specific move sequence. These tools are \
+read-only; never claim to have changed another profile.
+
 Keep answers concise: light markdown (bold, short bullet lists) is fine, \
 but summarize rather than dumping tables of raw numbers. If your analysis \
 only covers some of the user's relevant games (because deeper coverage \
@@ -77,6 +87,9 @@ class ToolContext:
     notes: Notes
     get_current_fen: Callable[[], str]
     on_status: Callable[[str], None]
+    # Snapshot of the other profiles taken when the question was asked (read-only use
+    # from this worker thread; the live list belongs to the GUI thread).
+    other_profiles: list[ProfileRecord] = field(default_factory=list)
 
 
 def _phase_for_ply(ply: int) -> str:
@@ -204,8 +217,23 @@ _BASE_TOOLS: list[dict] = [
             "properties": {
                 "color": {"type": "string", "enum": ["white", "black"]},
                 "sequence": {"type": "array", "items": {"type": "string"}, "description": "SAN moves so far, e.g. [\"e4\", \"e5\", \"Nf3\"]. Omit for the first move."},
+                "profile": {"type": "string", "description": "Name of another profile (see list_profiles) to explore THEIR games instead of the user's own; `color` is then the color that player had."},
             },
             "required": ["color"],
+        },
+    },
+    {
+        "name": "list_profiles",
+        "description": "The other players' archives available to study (name and username). Call before scout_profile.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "scout_profile",
+        "description": "Scouting summary of another profile's player: recent form, ratings, how often they open with each first move, their most common lines as White and as Black (vs 1.e4 and 1.d4), top openings with results per color, results by time control, and the user's own head-to-head record against them. Takes up to ~15 seconds on very large archives.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"profile": {"type": "string", "description": "Name, id or username of the profile (see list_profiles)."}},
+            "required": ["profile"],
         },
     },
     {
@@ -338,38 +366,32 @@ class ToolExecutor:
         if version is None:
             return _error("Stockfish is not installed")
 
-        engine = self.ctx.engine.spawn_batch_engine()
         results = []
-        try:
-            for i, game_id in enumerate(game_ids, start=1):
-                detail = self.ctx.db.load_game(game_id)
-                if detail is None:
-                    results.append({"game_id": game_id, "status": "error", "error": "not found"})
-                    continue
-                total_plies = len(detail.moves)
-                missing = self.ctx.cache.get_missing_plies(game_id, total_plies, ENGINE_ID, version, BATCH_SETTING_KEY)
-                if not missing:
-                    results.append({"game_id": game_id, "analyzed_plies": 0, "already_cached_plies": total_plies, "status": "ok"})
-                    continue
-                self.ctx.on_status(f"Analyzing game #{game_id} ({i}/{len(game_ids)} games)...")
-                sans = [m.san for m in detail.moves]
+        for i, game_id in enumerate(game_ids, start=1):
+            detail = self.ctx.db.load_game(game_id)
+            if detail is None:
+                results.append({"game_id": game_id, "status": "error", "error": "not found"})
+                continue
+            total_plies = len(detail.moves)
+            missing = self.ctx.cache.get_missing_plies(game_id, total_plies, ENGINE_ID, version, BATCH_SETTING_KEY)
+            if not missing:
+                results.append({"game_id": game_id, "analyzed_plies": 0, "already_cached_plies": total_plies, "status": "ok"})
+                continue
+            self.ctx.on_status(f"Analyzing game #{game_id} ({i}/{len(game_ids)} games)...")
+            sans = [m.san for m in detail.moves]
 
-                def on_progress(done: int, total: int, gid=game_id, idx=i) -> None:
-                    self.ctx.on_status(f"Analyzing game #{gid} ({idx}/{len(game_ids)} games, ply {done}/{total})...")
+            def on_progress(done: int, total: int, gid=game_id, idx=i) -> None:
+                self.ctx.on_status(f"Analyzing game #{gid} ({idx}/{len(game_ids)} games, ply {done}/{total})...")
 
-                analyze_missing_plies(
-                    engine, sans, missing, self.ctx.cache, game_id, version, BATCH_SETTING_KEY, BATCH_DEPTH,
-                    on_progress=on_progress,
-                )
-                results.append({
-                    "game_id": game_id, "analyzed_plies": len(missing),
-                    "already_cached_plies": total_plies - len(missing), "status": "ok",
-                })
-        finally:
-            try:
-                engine.quit()
-            except Exception:
-                pass
+            analyze_missing_plies(
+                self.ctx.engine.spawn_batch_engine, batch_worker_count(),
+                sans, missing, self.ctx.cache, game_id, version, BATCH_SETTING_KEY, BATCH_DEPTH,
+                on_progress=on_progress,
+            )
+            results.append({
+                "game_id": game_id, "analyzed_plies": len(missing),
+                "already_cached_plies": total_plies - len(missing), "status": "ok",
+            })
         return {"games": results}
 
     def _tool_summarize_cached_analysis(self, inp: dict) -> dict:
@@ -424,8 +446,80 @@ class ToolExecutor:
             "skipped_uncached_game_ids": skipped,
         }
 
+    def _resolve_profile(self, query: str) -> ProfileRecord:
+        needle = (query or "").strip().lower()
+        for key in (lambda p: p.display_name, lambda p: p.id, lambda p: p.username):
+            for p in self.ctx.other_profiles:
+                if key(p).lower() == needle:
+                    return p
+        partial = [p for p in self.ctx.other_profiles if needle and needle in p.display_name.lower()]
+        if len(partial) == 1:
+            return partial[0]
+        names = ", ".join(p.display_name for p in self.ctx.other_profiles) or "none"
+        raise RuntimeError(f"no other profile matches '{query}' (available: {names})")
+
     def _tool_get_repertoire_stats(self, inp: dict) -> dict:
-        return self.ctx.cli.explorer(inp["color"], inp.get("sequence") or [])
+        cli = self.ctx.cli
+        if inp.get("profile"):
+            record = self._resolve_profile(inp["profile"])
+            cli = TempoCli(record.resolved_db_path(), record.username)
+        return cli.explorer(inp["color"], inp.get("sequence") or [])
+
+    def _tool_list_profiles(self, inp: dict) -> dict:
+        return {"profiles": [
+            {"name": p.display_name, "username": p.username, "platform": p.platform} for p in self.ctx.other_profiles
+        ]}
+
+    def _tool_scout_profile(self, inp: dict) -> dict:
+        record = self._resolve_profile(inp.get("profile", ""))
+        self.ctx.on_status(f"Scouting {record.display_name}...")
+        scout = TempoCli(record.resolved_db_path(), record.username).scout()
+        if scout["tagged_games"] == 0:
+            return _error(
+                f"none of {record.display_name}'s {scout['total_games']} games are tagged as {record.username}'s "
+                f"(most common player: {scout.get('suggested_username') or 'unknown'}); the user must right-click "
+                f"the profile tab and choose 'Set account username...' first")
+
+        cap = llm_settings.MAX_SCOUT_OPENINGS
+
+        def line(prefix: list[str], steps: list[dict]) -> dict:
+            return {"moves": prefix + [s["san"] for s in steps],
+                    "share_at_each_step_pct": [round(100 * s["count"] / s["total"]) if s["total"] else 0 for s in steps]}
+
+        def moves(replies: list[dict]) -> list[dict]:
+            total = sum(r["count"] for r in replies) or 1
+            return [{"san": r["san"], "played_pct": round(100 * r["count"] / total), "games": r["count"],
+                     "score_pct": round(100 * (r["wins"] + 0.5 * r["draws"]) / r["count"]) if r["count"] else None}
+                    for r in replies[:4]]
+
+        def openings(items: list[dict]) -> list[dict]:
+            return [{"opening": o["name"], "games": o["games"], "wins": o["wins"], "draws": o["draws"], "losses": o["losses"],
+                     "score_pct": round(100 * (o["wins"] + 0.5 * o["draws"]) / o["games"])} for o in items[:cap]]
+
+        try:
+            h2h = self.ctx.cli.head_to_head(record.username)
+            head_to_head = {"games": h2h["games"], "wins": h2h["wins"], "draws": h2h["draws"], "losses": h2h["losses"]}
+        except TempoCliError:
+            head_to_head = None
+
+        return {
+            "player": record.display_name, "username": scout["subject"],
+            "games": scout["tagged_games"], "first_game": scout["earliest_date"], "last_game": scout["latest_date"],
+            "recent_results_oldest_to_newest": scout["recent"],
+            "ratings": {tc["name"]: tc["rating"] for tc in scout["by_time_control"] if tc["rating"] > 0},
+            "by_time_control": [{"category": tc["name"], "games": tc["games"],
+                                 "score_pct": round(100 * (tc["wins"] + 0.5 * tc["draws"]) / tc["games"])}
+                                for tc in scout["by_time_control"] if tc["games"]],
+            "first_moves_as_white": moves(scout["first_moves_white"]),
+            "replies_as_black_to_e4": moves(scout["replies_vs_e4"]),
+            "replies_as_black_to_d4": moves(scout["replies_vs_d4"]),
+            "most_common_line_as_white": line([], scout["line_white"]),
+            "most_common_line_as_black_vs_e4": line(["e4"], scout["line_black_vs_e4"]),
+            "most_common_line_as_black_vs_d4": line(["d4"], scout["line_black_vs_d4"]),
+            "top_openings_as_white": openings(scout["openings_white"]),
+            "top_openings_as_black": openings(scout["openings_black"]),
+            "your_head_to_head_vs_them": head_to_head,
+        }
 
     def _tool_list_bookmarks(self, inp: dict) -> dict:
         limit = min(int(inp.get("limit", llm_settings.MAX_BOOKMARKS)), llm_settings.MAX_BOOKMARKS)

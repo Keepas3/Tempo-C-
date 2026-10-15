@@ -192,6 +192,62 @@ inline std::string to_json(const NextMoveStat& n) {
     return o.str();
 }
 
+inline std::string to_json(const WdlStat& s) {
+    std::ostringstream o;
+    o << "{\"name\": " << json_str(s.name) << ", \"games\": " << s.games << ", \"wins\": " << s.wins
+      << ", \"draws\": " << s.draws << ", \"losses\": " << s.losses << ", \"rating\": " << s.rating << "}";
+    return o.str();
+}
+
+inline std::string to_json(const LineStep& s) {
+    std::ostringstream o;
+    o << "{\"san\": " << json_str(s.san) << ", \"count\": " << s.count << ", \"total\": " << s.total << "}";
+    return o.str();
+}
+
+template <typename T>
+inline std::string json_array(const std::vector<T>& items) {
+    std::string out = "[";
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (i) out += ", ";
+        out += to_json(items[i]);
+    }
+    return out + "]";
+}
+
+inline std::string to_json(const ScoutReport& r) {
+    std::ostringstream o;
+    o << "{\"subject\": " << json_str(r.subject)
+      << ", \"total_games\": " << r.total_games
+      << ", \"tagged_games\": " << r.tagged_games
+      << ", \"earliest_date\": " << json_str(r.earliest_date)
+      << ", \"latest_date\": " << json_str(r.latest_date)
+      << ", \"suggested_username\": " << json_str(r.suggested_username)
+      << ", \"recent\": " << json_str(r.recent)
+      << ", \"openings_white\": " << json_array(r.openings_white)
+      << ", \"openings_black\": " << json_array(r.openings_black)
+      << ", \"by_time_control\": " << json_array(r.by_time_control)
+      << ", \"first_moves_white\": " << json_array(r.first_moves_white)
+      << ", \"replies_vs_e4\": " << json_array(r.replies_vs_e4)
+      << ", \"replies_vs_d4\": " << json_array(r.replies_vs_d4)
+      << ", \"line_white\": " << json_array(r.line_white)
+      << ", \"line_black_vs_e4\": " << json_array(r.line_black_vs_e4)
+      << ", \"line_black_vs_d4\": " << json_array(r.line_black_vs_d4)
+      << "}";
+    return o.str();
+}
+
+inline std::string to_json(const RetagResult& r) {
+    return "{\"total\": " + std::to_string(r.total) + ", \"tagged\": " + std::to_string(r.tagged) + "}";
+}
+
+inline std::string to_json(const HeadToHead& h) {
+    std::ostringstream o;
+    o << "{\"opponent\": " << json_str(h.opponent) << ", \"games\": " << h.games << ", \"wins\": " << h.wins
+      << ", \"draws\": " << h.draws << ", \"losses\": " << h.losses << ", \"recent\": " << json_array(h.recent) << "}";
+    return o.str();
+}
+
 inline std::string to_json(const std::vector<NextMoveStat>& stats) {
     std::ostringstream o;
     o << "{\"replies\": [";

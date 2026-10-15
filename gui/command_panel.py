@@ -37,7 +37,7 @@ import llm_settings
 import markdown_lite
 from analysis_cache import AnalysisCache
 from bookmarks import Bookmarks
-from command_popup import COMMANDS, CommandPopup, GameTypePopup, OpeningPopup
+from command_popup import COMMANDS, CommandPopup, GameTypePopup, OpeningPopup, ProfilePopup
 from db_reader import DbReader, result_relative_to
 from engine import BATCH_DEPTH, BATCH_SETTING_KEY, ENGINE_ID, EngineManager
 from engine import engine_version as current_engine_version
@@ -47,6 +47,8 @@ from fetch_worker import FetchWorker
 from llm_tools import build_tools
 from llm_worker import LlmWorker
 from notes import Notes
+from profiles import ProfileRecord
+from scout_report import format_scout_report
 from review_data import build_basic_review_payload, build_moves_only_payload, build_stockfish_review_payload
 from tempo_cli import TempoCli, TempoCliError
 from colors import DRAW_COLOR, ERROR_COLOR, HEADER_COLOR, LOSS_COLOR, MUTED_COLOR, WIN_COLOR
@@ -119,12 +121,16 @@ class CommandPanel(QWidget):
     # Emitted when a move is clicked in a /review table, so the board can
     # jump straight to the position right after that move.
     move_requested = Signal(int, int)  # game_id, ply
+    # A "load this line" link in a /scout report was clicked: (profile_id, color the scouted player had, SANs).
+    scout_line_requested = Signal(str, str, list)
 
     def __init__(
         self, db: DbReader, cli: TempoCli, cache: AnalysisCache, engine: EngineManager,
-        bookmarks: Bookmarks, notes: Notes, get_current_fen: Callable[[], str], parent=None,
+        bookmarks: Bookmarks, notes: Notes, get_current_fen: Callable[[], str],
+        get_other_profiles: Callable[[], list[ProfileRecord]] | None = None, parent=None,
     ):
         super().__init__(parent)
+        self.get_other_profiles = get_other_profiles or (lambda: [])
         self.db = db
         self.cli = cli
         self.cache = cache
@@ -155,6 +161,11 @@ class CommandPanel(QWidget):
         self._llm_start: QTextCursor | None = None
         self._llm_end: QTextCursor | None = None
         self._llm_msg_id: int | None = None
+
+        # /scout reports in flight or on screen, keyed by their chat block's msg_id so several
+        # opponents' reports can sit in the chat at once; closing a block drops its entry.
+        self._scout_jobs: dict[int, dict] = {}
+        self._scout_worker: FetchWorker | None = None
 
         # The data behind whatever review is currently shown in the chat,
         # kept around so set_review_ply can cheaply re-render with a
@@ -196,6 +207,9 @@ class CommandPanel(QWidget):
 
         self.opening_popup = OpeningPopup(self.input)
         self.opening_popup.command_chosen.connect(self._apply_opening_selection)
+
+        self.profile_popup = ProfilePopup(self.input)
+        self.profile_popup.command_chosen.connect(self._apply_scout_selection)
 
         self.game_type_popup = GameTypePopup(self.input)
         self.game_type_popup.command_chosen.connect(self._sync_stats_input_from_popup)
@@ -360,6 +374,13 @@ class CommandPanel(QWidget):
             else:
                 self._expanded_openings.add(name)
             self._replace_stats_block()
+        elif text.startswith("scoutline:"):
+            profile_id, _sep, rest = text[len("scoutline:"):].partition(":")
+            color, _sep, seq_text = rest.partition(":")
+            if not any(p.id == profile_id for p in self.get_other_profiles()):
+                self._print_error("that profile no longer exists")
+                return
+            self.scout_line_requested.emit(profile_id, color, unquote(seq_text).split())
         elif text.startswith("game:"):
             try:
                 game_id = int(text[len("game:"):])
@@ -398,6 +419,17 @@ class CommandPanel(QWidget):
     # --- slash-command / opening-name popups --------------------------------
 
     def _on_input_changed(self, text: str) -> None:
+        scout_filter = self._scout_query_text(text)
+        if scout_filter is None:
+            self.profile_popup.hide()
+        else:
+            self.popup.hide()
+            self.opening_popup.hide()
+            self.game_type_popup.hide()
+            self.profile_popup.set_profiles([(p.display_name, p.username) for p in self.get_other_profiles()])
+            self._show_popup(self.profile_popup, scout_filter)
+            return
+
         if self._stats_query_text(text) is not None:
             self.popup.hide()
             self.opening_popup.hide()
@@ -455,6 +487,21 @@ class CommandPanel(QWidget):
             popup.hide()
 
     @staticmethod
+    def _scout_query_text(text: str) -> str | None:
+        """The partial profile name while typing "/scout <name>" (possibly
+        empty, right after "/scout "), or None if `text` isn't in that state."""
+        if not text.lower().startswith("/scout"):
+            return None
+        rest = text[len("/scout"):]
+        if not rest.startswith(" "):
+            return None  # still typing "/scout" itself -- that's the command popup's territory
+        return rest.lstrip(" ")
+
+    def _apply_scout_selection(self, name: str) -> None:
+        self.input.setText(f"/scout {name}")
+        self._on_submit()
+
+    @staticmethod
     def _opening_query_text(text: str) -> str | None:
         """Returns the partial opening-name filter text while typing
         "/opening <name>" (possibly empty, right after "/opening "), or None
@@ -507,6 +554,8 @@ class CommandPanel(QWidget):
             active_popup, apply_fn = self.popup, self._apply_popup_command
         elif self.opening_popup.isVisible():
             active_popup, apply_fn = self.opening_popup, self._apply_opening_selection
+        elif self.profile_popup.isVisible():
+            active_popup, apply_fn = self.profile_popup, self._apply_scout_selection
         elif self.game_type_popup.isVisible():
             # No apply_fn: selection happens via clicks (checkboxes), not
             # Enter, so Enter should fall through to a normal submit instead
@@ -541,7 +590,7 @@ class CommandPanel(QWidget):
         equivalent."""
         global_pos = event.globalPosition().toPoint()
         input_rect = QRect(self.input.mapToGlobal(self.input.rect().topLeft()), self.input.size())
-        for popup in (self.popup, self.opening_popup, self.game_type_popup):
+        for popup in (self.popup, self.opening_popup, self.game_type_popup, self.profile_popup):
             if not popup.isVisible():
                 continue
             if input_rect.contains(global_pos) or popup.geometry().contains(global_pos):
@@ -636,6 +685,7 @@ class CommandPanel(QWidget):
             self._llm_start = None
             self._llm_end = None
             self._llm_msg_id = None
+            self._scout_jobs = {}
             self.clear_review_state()
             self._print(WELCOME_TEXT)  # clear wipes the whole document -- put the welcome hint back
         elif cmd == "opening":
@@ -652,6 +702,8 @@ class CommandPanel(QWidget):
             self._print(self._format_replies(data["replies"]))
         elif cmd == "fetch":
             self._dispatch_fetch(args)
+        elif cmd == "scout":
+            self._dispatch_scout(args)
         else:
             self._print_error(f"unknown command '/{cmd}'. Type /help for a list.")
 
@@ -719,6 +771,7 @@ class CommandPanel(QWidget):
         self._cancel_active_review()
         self._cancel_active_llm_query()
         self.cancel_fetch()
+        self.cancel_scout()
         for worker in list(self._retiring_review_workers) + list(self._retiring_llm_workers):
             worker.request_cancel()
             worker.wait(2000)
@@ -926,7 +979,7 @@ class CommandPanel(QWidget):
         worker = LlmWorker(
             llm_settings.api_key(), build_tools(),
             self.db, self.cli, self.cache, self.engine, self.bookmarks, self.notes, self.get_current_fen,
-            self._llm_history, question, self,
+            self._llm_history, question, self, other_profiles=self.get_other_profiles(),
         )
         worker.status.connect(self._on_llm_status)
         worker.answer_chunk.connect(self._on_llm_answer_chunk)
@@ -1074,6 +1127,96 @@ class CommandPanel(QWidget):
         if self._fetch_worker is not None and self._fetch_worker.isRunning():
             self._fetch_worker.request_cancel()
             self._fetch_worker.wait(3000)
+
+    # --- /scout ---------------------------------------------------------
+
+    def _find_profile(self, query: str) -> ProfileRecord | None:
+        """Resolves what the user typed to one of the other profiles: exact
+        display name, then id, then username (all case-insensitive), then a
+        unique substring of the display name."""
+        needle = query.strip().lower()
+        others = self.get_other_profiles()
+        for key in (lambda p: p.display_name, lambda p: p.id, lambda p: p.username):
+            for p in others:
+                if key(p).lower() == needle:
+                    return p
+        partial = [p for p in others if needle and needle in p.display_name.lower()]
+        return partial[0] if len(partial) == 1 else None
+
+    def _dispatch_scout(self, args: list[str]) -> None:
+        others = self.get_other_profiles()
+        if not others:
+            self._print_error("there are no other profiles to scout -- add one with \"+ New profile\" first.")
+            return
+        names = ", ".join(p.display_name for p in others)
+        if not args:
+            self._print_error(f"usage: /scout <profile>   (available: {names})")
+            return
+        record = self._find_profile(" ".join(args))
+        if record is None:
+            self._print_error(f"no other profile matches '{' '.join(args)}'. Available: {names}")
+            return
+        if self._scout_worker is not None and self._scout_worker.isRunning():
+            self._print_error("a scouting report is already being built -- wait for it to finish.")
+            return
+
+        start, end, msg_id = self._insert_tracked_block(
+            self._scout_placeholder(record, "starting"), on_close=self._on_scout_block_closed)
+        self._scout_jobs[msg_id] = {"start": start, "end": end, "record": record}
+
+        def work(on_progress, cancel):
+            scout = TempoCli(record.resolved_db_path(), record.username).scout(on_progress=on_progress, cancel_event=cancel)
+            # Your own side of the comparison; either failing just drops that section.
+            try:
+                mine = self.cli.stats()
+            except TempoCliError:
+                mine = None
+            try:
+                h2h = self.cli.head_to_head(record.username)
+            except TempoCliError:
+                h2h = None
+            return {"scout": scout, "mine": mine, "h2h": h2h}
+
+        worker = FetchWorker(work, streaming=True)
+        worker.progress.connect(lambda done, total, _added, label, mid=msg_id: self._on_scout_progress(mid, done, total, label))
+        worker.succeeded.connect(lambda data, mid=msg_id: self._on_scout_done(mid, data))
+        worker.failed.connect(lambda message, mid=msg_id: self._on_scout_failed(mid, message))
+        worker.cancelled.connect(lambda mid=msg_id: self._on_scout_failed(mid, "cancelled"))
+        self._scout_worker = worker
+        worker.start()
+
+    @staticmethod
+    def _scout_placeholder(record: ProfileRecord, status: str) -> str:
+        return (f'<span style="color:{MUTED_COLOR}">Scouting {_esc(record.display_name)}... {_esc(status)}</span>')
+
+    def _on_scout_block_closed(self, msg_id: int) -> None:
+        self._scout_jobs.pop(msg_id, None)
+
+    def _replace_scout_block(self, msg_id: int, html_fragment: str) -> None:
+        job = self._scout_jobs.get(msg_id)
+        if job is None:
+            return  # the block was closed (or the chat cleared) while the report was being built
+        job["end"] = self._replace_tracked_block(job["start"], job["end"], html_fragment, msg_id)
+
+    def _on_scout_progress(self, msg_id: int, done: int, total: int, label: str) -> None:
+        job = self._scout_jobs.get(msg_id)
+        if job is not None:
+            status = f"{done}/{total} steps" if total else label
+            self._replace_scout_block(msg_id, self._scout_placeholder(job["record"], status))
+
+    def _on_scout_done(self, msg_id: int, data: dict) -> None:
+        job = self._scout_jobs.get(msg_id)
+        if job is None:
+            return
+        self._replace_scout_block(msg_id, format_scout_report(job["record"], data["scout"], data["mine"], data["h2h"]))
+
+    def _on_scout_failed(self, msg_id: int, message: str) -> None:
+        self._replace_scout_block(msg_id, f'<span style="color:{ERROR_COLOR}">[Error] Scouting failed: {_esc(message)}</span>')
+
+    def cancel_scout(self) -> None:
+        if self._scout_worker is not None and self._scout_worker.isRunning():
+            self._scout_worker.request_cancel()
+            self._scout_worker.wait(3000)
 
     def _on_fetch_succeeded(self, data: dict) -> None:
         self._finish_fetch_ui()

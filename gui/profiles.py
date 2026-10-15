@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -49,17 +50,28 @@ class ProfileRecord:
             return False
 
 
-    def owned_data_dir(self) -> Path | None:
-        """The directory that belongs exclusively to this profile -- i.e. the
-        profiles/<id>/ folder add_profile() created for it -- or None if its
-        db lives anywhere else (notably the original root-level
-        tempo_archive.db, which predates per-profile folders and must never
-        be wiped just because its tab was closed)."""
+    def data_paths(self) -> list[Path]:
+        """Every on-disk path that belongs to this profile and must go when it
+        is deleted. A profile in its own profiles/<id>/ folder owns that whole
+        folder. Any other profile (the original root-level tempo_archive.db)
+        owns just its db file (and a leftover SQLite journal) plus the
+        generated monthly-PGN folders (games/<YYYY>/, games/unknown/) beside
+        it -- not the tracked games/README.md or any .pgn files the user
+        dropped into games/ by hand. Only paths that exist are returned, and
+        nothing outside PROJECT_ROOT ever is."""
+        if not self.is_db_path_safe():
+            return []
+        db = self.resolved_db_path().resolve()
+        folder = db.parent
         profiles_root = (PROJECT_ROOT / "profiles").resolve()
-        folder = self.resolved_db_path().resolve().parent
         if folder != profiles_root and folder.is_relative_to(profiles_root):
-            return folder
-        return None
+            return [folder] if folder.exists() else []
+
+        paths = [db, db.with_name(db.name + "-journal")]
+        games_dir = folder / "games"
+        if games_dir.is_dir():
+            paths += [c for c in games_dir.iterdir() if c.is_dir() and (c.name == "unknown" or c.name.isdigit())]
+        return [p for p in paths if p.exists()]
 
 
 @dataclass
@@ -147,6 +159,50 @@ def group_ordered(profiles: list[ProfileRecord]) -> list[ProfileRecord]:
     return ordered
 
 
+def _remove_path(path: Path) -> None:
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def delete_profile_data(paths: list[Path]) -> tuple[bool, list[str]]:
+    """Erases `paths` all-or-nothing as far as the filesystem allows.
+
+    Step 1 renames every path to "<name>.deleting"; renaming fails right away
+    on Windows if anything inside is still open or locked, and on any failure
+    every rename already done is rolled back, so a locked file leaves the
+    profile completely untouched (returns (False, [reasons])) instead of
+    half-deleted. Step 2 deletes the renamed paths; any that still refuse are
+    reported in the second element (returns (True, [leftover paths])) -- the
+    profile's data is already out of the way by then, so those are just
+    harmless "*.deleting" leftovers to remove by hand."""
+    renamed: list[tuple[Path, Path]] = []
+    try:
+        for path in paths:
+            target = path.with_name(path.name + ".deleting")
+            if target.exists():  # leftover from an earlier attempt
+                _remove_path(target)
+            path.rename(target)
+            renamed.append((path, target))
+    except OSError as e:
+        problems = [f"{path}: {e}"]
+        for original, target in reversed(renamed):
+            try:
+                target.rename(original)
+            except OSError as rollback_error:
+                problems.append(f"could not restore {original}: {rollback_error}")
+        return False, problems
+
+    leftovers = []
+    for _original, target in renamed:
+        try:
+            _remove_path(target)
+        except OSError as e:
+            leftovers.append(f"{target}: {e}")
+    return True, leftovers
+
+
 def remove_profile(config: ProfilesConfig, profile_id: str) -> None:
     """Removes a profile from `config` (in memory -- caller still needs to
     save_profiles). Does not touch any files on disk."""
@@ -163,7 +219,9 @@ def add_profile(config: ProfilesConfig, display_name: str, platform: str, userna
     slug = _slugify(username)
     profile_id = slug
     n = 2
-    while profile_id in existing_ids:
+    # Also skip ids whose folder already exists on disk: a leftover folder
+    # (e.g. from a failed delete) must never be silently adopted by a new profile.
+    while profile_id in existing_ids or (PROJECT_ROOT / "profiles" / profile_id).exists():
         profile_id = f"{slug}-{n}"
         n += 1
 

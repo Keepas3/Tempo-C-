@@ -707,6 +707,31 @@ int run_json_command(Archive& archive, const std::vector<std::string>& args) {
             }
             std::vector<std::string> sequence(args.begin() + 2, args.end());
             std::cout << to_json(archive.opponent_replies(sequence, args[1])) << "\n";
+        } else if (cmd == "retag") {
+            if (args.size() < 2 || !is_valid_username(args[1])) {
+                std::cout << json_error("usage: retag <username>") << "\n";
+                return 1;
+            }
+            std::cout << to_json(archive.retag_games(args[1])) << "\n";
+        } else if (cmd == "scout") {
+            // Aggregates for this archive's owner (--user): used to study an
+            // opponent whose games live in their own profile.
+            // Optional part ("stats", "white", "e4", "d4"; default "all") lets
+            // the GUI run the slow move-tree walks as parallel processes.
+            std::string part = args.size() >= 2 ? args[1] : "all";
+            if (part != "all" && part != "stats" && part != "white" && part != "e4" && part != "d4") {
+                std::cout << json_error("usage: scout [all|stats|white|e4|d4]") << "\n";
+                return 1;
+            }
+            std::cout << to_json(archive.scout(CURRENT_USERNAME, part, [](int done, int total, const std::string& label) {
+                emit_progress(done, total, 0, label);
+            })) << "\n";
+        } else if (cmd == "head_to_head") {
+            if (args.size() < 2) {
+                std::cout << json_error("usage: head_to_head <opponent>") << "\n";
+                return 1;
+            }
+            std::cout << to_json(archive.head_to_head(args[1])) << "\n";
         } else if (cmd == "stats") {
             std::vector<std::string> category_filter;
             std::string min_date;

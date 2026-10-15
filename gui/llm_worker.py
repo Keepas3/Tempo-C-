@@ -24,6 +24,7 @@ from db_reader import DbReader
 from engine import EngineManager
 from llm_tools import SYSTEM_PROMPT, ToolContext, ToolExecutor
 from notes import Notes
+from profiles import ProfileRecord
 from tempo_cli import TempoCli
 
 _STATUS_TEXT = {
@@ -39,6 +40,8 @@ _STATUS_TEXT = {
     "list_bookmarks": "Checking bookmarks...",
     "get_best_move_in_current_position": "Analyzing the current position...",
     "get_game_notes": "Checking notes...",
+    "list_profiles": "Checking available profiles...",
+    "scout_profile": "Scouting the opponent...",
 }
 
 
@@ -54,6 +57,7 @@ class LlmWorker(QThread):
         db: DbReader, cli: TempoCli, cache: AnalysisCache, engine: EngineManager,
         bookmarks: Bookmarks, notes: Notes, get_current_fen: Callable[[], str],
         history: list[dict], user_message: str, parent=None,
+        other_profiles: list[ProfileRecord] | None = None,
     ) -> None:
         super().__init__(parent)
         self._api_key = api_key
@@ -71,6 +75,7 @@ class LlmWorker(QThread):
         ctx = ToolContext(
             db=db, cli=cli, cache=cache, engine=engine, bookmarks=bookmarks, notes=notes,
             get_current_fen=get_current_fen, on_status=self.status.emit,
+            other_profiles=list(other_profiles or []),
         )
         self._executor = ToolExecutor(ctx)
 

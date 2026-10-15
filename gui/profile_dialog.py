@@ -8,7 +8,9 @@ pumping events -- the progress dialog stays responsive -- while it runs.
 """
 from __future__ import annotations
 
+import os
 import shutil
+from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import Qt
@@ -17,6 +19,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QLabel,
     QLineEdit,
     QMessageBox,
     QProgressDialog,
@@ -64,6 +67,66 @@ class ProfileDialog(QDialog):
         username = self.username_edit.text().strip()
         display_name = self.display_name_edit.text().strip() or username
         return display_name, platform, username
+
+
+def _path_size(path: Path) -> int:
+    if path.is_file():
+        return path.stat().st_size
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += (Path(root) / name).stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def _human_size(n: int) -> str:
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{n} B"
+
+
+class DeleteProfileDialog(QDialog):
+    """Irreversible-action gate: lists exactly what will be erased and keeps
+    Delete disabled until the profile's name has been typed out."""
+
+    def __init__(self, parent: QWidget, record: ProfileRecord, paths: list[Path]) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Delete profile")
+        self._expected = record.display_name
+
+        if paths:
+            lines = [f"\u2022 {p}  ({_human_size(_path_size(p))})" for p in paths]
+            what = "This permanently erases (games, notes, favorites, bookmarks and analysis):\n" + "\n".join(lines)
+        else:
+            what = "No files were found on disk for this profile; only the tab will be removed."
+        info = QLabel(f'Delete the profile "{record.display_name}"?\n\n{what}\n\nThis cannot be undone.')
+        info.setWordWrap(True)
+        info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText(f'Type "{record.display_name}" to confirm')
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        self.delete_btn = self.buttons.addButton("Delete", QDialogButtonBox.ButtonRole.DestructiveRole)
+        self.delete_btn.setEnabled(False)
+        self.name_edit.textChanged.connect(lambda text: self.delete_btn.setEnabled(text == self._expected))
+        self.delete_btn.clicked.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(info)
+        layout.addWidget(self.name_edit)
+        layout.addWidget(self.buttons)
+        self.setMinimumWidth(480)
+
+
+def confirm_profile_delete(parent: QWidget, record: ProfileRecord, paths: list[Path]) -> bool:
+    return DeleteProfileDialog(parent, record, paths).exec() == QDialog.DialogCode.Accepted
 
 
 def start_new_profile_flow(parent: QWidget, config: ProfilesConfig, on_complete: Callable[[ProfileRecord | None], None]) -> None:

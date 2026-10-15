@@ -13,6 +13,7 @@ from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QRadioButton,
@@ -67,6 +68,8 @@ class ExplorerPanel(QWidget):
     color_changed = Signal(str)
     # SAN of a clicked move row -- ProfileView plays it on the board.
     move_clicked = Signal(str)
+    # Whose games to explore: "" = this profile's own, otherwise another profile's id.
+    source_changed = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -83,11 +86,25 @@ class ExplorerPanel(QWidget):
         self._color_group.addButton(self.black_radio)
         self.white_radio.toggled.connect(self._on_radio_toggled)
 
+        # "Games from": this profile's own archive, or another profile's (e.g. an
+        # opponent you are preparing for) -- the White/Black radios then mean the
+        # color THEY played. Hidden until there is another profile to pick.
+        self.source_label = QLabel("from:")
+        self.source_combo = QComboBox()
+        self.source_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.source_combo.addItem("My games", "")
+        self.source_combo.currentIndexChanged.connect(lambda _i: self.source_changed.emit(self.selected_source()))
+        self.source_label.hide()
+        self.source_combo.hide()
+
         controls = QHBoxLayout()
         controls.addWidget(self.checkbox)
         controls.addWidget(QLabel("as:"))
         controls.addWidget(self.white_radio)
         controls.addWidget(self.black_radio)
+        controls.addSpacing(10)
+        controls.addWidget(self.source_label)
+        controls.addWidget(self.source_combo)
         controls.addStretch(1)
 
         self.output = QTextBrowser()
@@ -121,6 +138,37 @@ class ExplorerPanel(QWidget):
     def is_enabled(self) -> bool:
         return self.checkbox.isChecked()
 
+    def selected_source(self) -> str:
+        return self.source_combo.currentData() or ""
+
+    def selected_source_label(self) -> str:
+        return self.source_combo.currentText() if self.selected_source() else ""
+
+    def set_sources(self, others: list[tuple[str, str]]) -> None:
+        """Replaces the list of other profiles (id, label) to pick from. Keeps the current
+        choice if it still exists; otherwise falls back to "My games" and says so (e.g. the
+        selected profile was just deleted)."""
+        previous = self.selected_source()
+        self.source_combo.blockSignals(True)
+        self.source_combo.clear()
+        self.source_combo.addItem("My games", "")
+        for profile_id, label in others:
+            self.source_combo.addItem(label, profile_id)
+        index = self.source_combo.findData(previous)
+        self.source_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.source_combo.blockSignals(False)
+        visible = bool(others)
+        self.source_label.setVisible(visible)
+        self.source_combo.setVisible(visible)
+        if self.selected_source() != previous:
+            self.source_changed.emit(self.selected_source())
+
+    def set_source(self, profile_id: str) -> None:
+        """Programmatic switch (e.g. from a /scout line link); emits source_changed."""
+        index = self.source_combo.findData(profile_id)
+        if index >= 0:
+            self.source_combo.setCurrentIndex(index)
+
     def selected_color(self) -> str:
         return "white" if self.white_radio.isChecked() else "black"
 
@@ -133,7 +181,7 @@ class ExplorerPanel(QWidget):
         radio.setChecked(True)
         radio.blockSignals(False)
 
-    def render(self, replies: list[dict]) -> None:
+    def render(self, replies: list[dict], source_label: str = "") -> None:
         if not replies:
             self.output.setHtml(f'<span style="color:{MUTED_COLOR}">No games reached this position.</span>')
             return
@@ -148,7 +196,9 @@ class ExplorerPanel(QWidget):
                 f'{freq_pct:.0f}% <span style="color:{MUTED_COLOR}">({r["count"]})</span>',
                 _result_bar(r["wins"], r["losses"], r["draws"]),
             ])
-        html_out = (_table(["Move", "Played", "Result"], rows)
+        who = (f'<div style="color:{MUTED_COLOR}; margin-top:2px;">Games from <b>{_esc(source_label)}</b></div>'
+               if source_label else "")
+        html_out = (who + _table(["Move", "Played", "Result"], rows)
                     + f'<div style="color:{MUTED_COLOR}; margin-top:2px;">{total_games} game(s) reached this position '
                       f'<span style="color:{MUTED_COLOR}">(click a move to play it)</span></div>')
         self.output.setHtml(html_out)

@@ -12,7 +12,7 @@ from pathlib import Path
 from PySide6.QtCore import QThread, Signal
 
 from analysis_cache import AnalysisCache
-from engine import BATCH_DEPTH, BATCH_SETTING_KEY, EngineManager
+from engine import BATCH_DEPTH, BATCH_SETTING_KEY, EngineManager, batch_worker_count
 from engine_analysis_core import analyze_missing_plies
 
 
@@ -44,14 +44,9 @@ class EngineBatchWorker(QThread):
 
     def run(self) -> None:
         try:
-            engine = self._engine_manager.spawn_batch_engine()
-        except Exception as e:
-            self.failed.emit(str(e))
-            return
-
-        try:
             completed = analyze_missing_plies(
-                engine, self._sans, self._plies_to_analyze, self._cache, self._game_id,
+                self._engine_manager.spawn_batch_engine, batch_worker_count(),
+                self._sans, self._plies_to_analyze, self._cache, self._game_id,
                 self._engine_version, BATCH_SETTING_KEY, BATCH_DEPTH,
                 on_progress=self.progress.emit,
                 should_cancel=lambda: self._cancel_requested,
@@ -62,8 +57,3 @@ class EngineBatchWorker(QThread):
                 self.cancelled.emit()
         except Exception as e:
             self.failed.emit(str(e))
-        finally:
-            try:
-                engine.quit()
-            except Exception:
-                pass

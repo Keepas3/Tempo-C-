@@ -13,6 +13,7 @@ COMMANDS = [
     ("/rating", "[type...]", "Rating and rating history (same filters)"),
     ("/opening", "<query>", "Record for an opening (name or ECO code)"),
     ("/moves", "<sequence>", "Replies after a SAN sequence, e.g. e4 e5 Nf3"),
+    ("/scout", "<profile>", "Study another profile: openings, habits, weak spots"),
     ("/fetch chesscom", "<user> [full]", "Fetch from chess.com ('full' = all history)"),
     ("/fetch lichess", "<user> [full]", "Fetch from lichess ('full' = all history)"),
     ("/clear", "", "Clear the chat history"),
@@ -124,6 +125,25 @@ class OpeningPopup(_BasePopup):
         matches = [o for o in self._openings if needle in o[0].lower()] if needle else list(self._openings)
         labels = [f"{name}  ({count} game{'s' if count != 1 else ''})" for name, count in matches]
         data = [name for name, _count in matches]
+        return self._set_rows(labels, data, lines_per_item=1)
+
+
+class ProfilePopup(_BasePopup):
+    """Lists the other profiles that can be scouted, filtered by substring as
+    you type after "/scout ". The chosen value is the profile's display name."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._profiles: list[tuple[str, str]] = []  # (display name, username)
+
+    def set_profiles(self, profiles: list[tuple[str, str]]) -> None:
+        self._profiles = profiles
+
+    def refresh(self, filter_text: str) -> bool:
+        needle = filter_text.strip().lower()
+        matches = [p for p in self._profiles if needle in p[0].lower() or needle in p[1].lower()]
+        labels = [f"{name}  ({username})" if username.lower() != name.lower() else name for name, username in matches]
+        data = [name for name, _username in matches]
         return self._set_rows(labels, data, lines_per_item=1)
 
 

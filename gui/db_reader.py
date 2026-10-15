@@ -211,6 +211,20 @@ class DbReader:
             tree.setdefault(year, {}).setdefault(month, []).append(game)
         return tree
 
+    def most_common_player(self) -> str | None:
+        """The player name appearing in the most games (as White or Black) --
+        for an archive of one person's games that is, almost always, the
+        account the games belong to. Used to suggest a profile's username."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT name FROM (SELECT white AS name FROM games UNION ALL SELECT black FROM games) "
+                "WHERE name != '' GROUP BY name ORDER BY COUNT(*) DESC LIMIT 1;"
+            ).fetchone()
+        finally:
+            conn.close()
+        return row[0] if row else None
+
     def load_game(self, game_id: int) -> GameDetail | None:
         conn = self._connect()
         try:

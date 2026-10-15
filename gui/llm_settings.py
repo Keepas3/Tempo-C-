@@ -20,6 +20,7 @@ MAX_BATCH_ANALYSIS_GAMES = 6
 MAX_COVERAGE_CHECK_GAMES = 10
 MAX_SUMMARIZE_GAMES = 20
 MAX_BOOKMARKS = 20
+MAX_SCOUT_OPENINGS = 8   # per color, in scout_profile's reply
 
 
 def is_available() -> bool:

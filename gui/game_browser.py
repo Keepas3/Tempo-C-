@@ -317,12 +317,6 @@ class GameBrowser(QTreeWidget):
         item.setText(FAV_COLUMN, STAR_ON if favorite else STAR_OFF)
         item.setForeground(FAV_COLUMN, QBrush(QColor(STAR_COLOR if favorite else MUTED_COLOR)))
 
-    def sync_favorite(self, game_id: int) -> None:
-        """Re-reads one game's favorite state from the db, for when it was
-        changed from somewhere other than this widget (e.g. the board's
-        favorite button)."""
-        self._apply_star(game_id, self.favorites.is_favorite(game_id))
-
     def _on_context_menu(self, pos) -> None:
         item = self.itemAt(pos)
         game_id = item.data(0, GAME_ID_ROLE) if item is not None else None

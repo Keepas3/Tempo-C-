@@ -11,6 +11,7 @@ import json
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable
 
@@ -68,6 +69,8 @@ class TempoCli:
                 cwd=PROJECT_ROOT,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",  # tempo.exe emits UTF-8; the Windows default (cp1252) garbles names like "Maróczy"
+                errors="replace",
                 timeout=timeout,
             )
         except subprocess.TimeoutExpired as e:
@@ -196,3 +199,47 @@ class TempoCli:
 
     def last_fetch_status(self) -> dict:
         return self.run("last_fetch")
+
+    def retag(self, username: str) -> dict:
+        """Recomputes every game's your_color from `username` (see
+        Archive::retag_games). Rewrites every row of a large archive, so it
+        gets a generous timeout."""
+        return self.run("retag", username, timeout=300)
+
+    def head_to_head(self, opponent: str) -> dict:
+        return self.run("head_to_head", opponent)
+
+    def scout(self, on_progress=None, cancel_event=None) -> dict:
+        """Scouting aggregates for this archive's owner. The stats pass and
+        the three move-tree walks (as White, as Black vs 1.e4, vs 1.d4) run
+        as four tempo.exe processes in parallel -- on a 140k-game archive
+        that is ~12s instead of ~28s run back to back -- and are merged into
+        the same shape a single `scout` call would return."""
+        parts = ("stats", "white", "e4", "d4")
+        progress = {part: (0, 0) for part in parts}
+        lock = threading.Lock()
+
+        def report(part: str):
+            def _on(done: int, total: int, _added: int, label: str) -> None:
+                with lock:
+                    progress[part] = (done, total)
+                    done_sum = sum(d for d, _t in progress.values())
+                    total_sum = sum(t for _d, t in progress.values())
+                if on_progress is not None:
+                    on_progress(done_sum, total_sum, 0, label)
+            return _on
+
+        def run_part(part: str) -> dict:
+            return self.run_streaming("scout", part, on_progress=report(part), cancel_event=cancel_event, timeout=600)
+
+        with ThreadPoolExecutor(max_workers=len(parts)) as pool:
+            futures = {part: pool.submit(run_part, part) for part in parts}
+            results = {part: f.result() for part, f in futures.items()}
+
+        merged = dict(results["stats"])
+        for part, keys in (("white", ("first_moves_white", "line_white")),
+                           ("e4", ("replies_vs_e4", "line_black_vs_e4")),
+                           ("d4", ("replies_vs_d4", "line_black_vs_d4"))):
+            for key in keys:
+                merged[key] = results[part][key]
+        return merged

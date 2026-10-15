@@ -11,6 +11,7 @@
 #include <chrono>
 #include <ctime>
 #include <optional>
+#include <functional>
 #include "sqlite3.h"
 #include "game.h"
 
@@ -56,6 +57,50 @@ struct NextMoveStat {
     std::string san;
     int count = 0;
     int wins = 0, losses = 0, draws = 0;
+};
+
+// Win/draw/loss tally for one bucket (an opening name, a time category, ...)
+// from the archive owner's own point of view. `rating` is the latest known
+// rating in that bucket (-1 if none) -- only meaningful for time categories.
+struct WdlStat {
+    std::string name;
+    int games = 0, wins = 0, draws = 0, losses = 0;
+    int rating = -1;
+};
+
+// One step of a "most common line": the move played most often at this
+// point, how many games played it, and how many games reached this point.
+struct LineStep {
+    std::string san;
+    int count = 0;
+    int total = 0;
+};
+
+// Everything the scouting report needs about the archive's owner (the
+// "subject"), computed with SQL aggregates so it stays fast on archives with
+// 100k+ games -- no full scan of the moves table.
+struct ScoutReport {
+    std::string subject;
+    int total_games = 0;
+    int tagged_games = 0;       // games where the subject's color is known
+    std::string earliest_date, latest_date;
+    std::string suggested_username; // only set when tagged_games == 0: the archive's most common player name
+    std::string recent;         // last 20 results oldest->newest, e.g. "WWLDW"
+    std::vector<WdlStat> openings_white, openings_black, by_time_control;
+    std::vector<NextMoveStat> first_moves_white, replies_vs_e4, replies_vs_d4;
+    std::vector<LineStep> line_white, line_black_vs_e4, line_black_vs_d4;
+};
+
+struct RetagResult {
+    int total = 0;
+    int tagged = 0;
+};
+
+// The owner's record against one named opponent, plus their most recent games.
+struct HeadToHead {
+    std::string opponent;
+    int games = 0, wins = 0, draws = 0, losses = 0;
+    std::vector<GameSummary> recent;
 };
 
 // One platform's fetch history, for computing the next incremental /fetch
@@ -546,59 +591,179 @@ public:
     // matches are considered -- used by the repertoire explorer to show
     // your own move choices consistently (ply parity always lines up with
     // your_color once the games are restricted this way).
+    //
+    // Done as one SQL join chain (games -> moves at ply 0..k-1 -> moves at
+    // ply k) instead of loading the whole moves table into memory: on a
+    // 140k-game / 12.7M-move archive the old full scan could not finish
+    // inside the GUI's timeout, while this takes about a second. CROSS JOIN
+    // pins the join order to "games first, then primary-key lookups into
+    // moves" -- left to itself SQLite starts from a scan of all moves.
     std::vector<NextMoveStat> opponent_replies(const std::vector<std::string>& sequence,
                                                 const std::string& color_filter = "") {
-        std::map<int, std::pair<std::string, std::string>> game_info; // game_id -> (your_color, result)
-        {
-            sqlite3_stmt* stmt = prepare("SELECT id, your_color, result FROM games;");
-            while (sqlite3_step(stmt) == SQLITE_ROW) {
-                int id = sqlite3_column_int(stmt, 0);
-                std::string your_color = column_text(stmt, 1);
-                if (!color_filter.empty() && your_color != color_filter) continue;
-                game_info[id] = {your_color, column_text(stmt, 2)};
-            }
-            sqlite3_finalize(stmt);
+        // SQLite caps a join at 64 tables; the chain below uses sequence.size() + 2.
+        constexpr size_t MAX_SEQUENCE_PLIES = 40;
+        if (sequence.size() > MAX_SEQUENCE_PLIES) {
+            throw std::runtime_error("move sequence too long (max 40 plies)");
         }
 
-        std::map<int, std::map<int, std::string>> moves_by_game; // game_id -> (ply -> san)
-        {
-            sqlite3_stmt* stmt = prepare("SELECT game_id, ply, san FROM moves ORDER BY game_id, ply;");
-            while (sqlite3_step(stmt) == SQLITE_ROW) {
-                int game_id = sqlite3_column_int(stmt, 0);
-                if (!color_filter.empty() && game_info.find(game_id) == game_info.end()) continue;
-                int ply = sqlite3_column_int(stmt, 1);
-                moves_by_game[game_id][ply] = column_text(stmt, 2);
-            }
-            sqlite3_finalize(stmt);
+        std::string sql = "SELECT mk.san, g.your_color, g.result, COUNT(*) FROM games g";
+        for (size_t i = 0; i < sequence.size(); ++i) {
+            std::string m = "m" + std::to_string(i);
+            sql += " CROSS JOIN moves " + m + " ON " + m + ".game_id = g.id AND " + m + ".ply = " +
+                   std::to_string(i) + " AND " + m + ".san = ?";
         }
+        sql += " CROSS JOIN moves mk ON mk.game_id = g.id AND mk.ply = " + std::to_string(sequence.size());
+        if (!color_filter.empty()) sql += " WHERE g.your_color = ?";
+        sql += " GROUP BY mk.san, g.your_color, g.result;";
+
+        sqlite3_stmt* stmt = prepare(sql.c_str());
+        int param = 1;
+        for (const std::string& san : sequence) bind_text(stmt, param++, san);
+        if (!color_filter.empty()) bind_text(stmt, param++, color_filter);
+
+        std::map<std::string, NextMoveStat> by_move;
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            std::string san = column_text(stmt, 0);
+            std::string color = column_text(stmt, 1);
+            std::string outcome = result_relative_to(column_text(stmt, 2), color);
+            int n = sqlite3_column_int(stmt, 3);
+
+            NextMoveStat& stat = by_move[san];
+            stat.san = san;
+            stat.count += n;
+            if (outcome == "Win") stat.wins += n;
+            else if (outcome == "Loss") stat.losses += n;
+            else if (outcome == "Draw") stat.draws += n;
+        }
+        sqlite3_finalize(stmt);
 
         std::vector<NextMoveStat> out;
-        for (auto& [game_id, ply_moves] : moves_by_game) {
-            if (!matches_move_prefix(ply_moves, sequence)) continue;
+        out.reserve(by_move.size());
+        for (auto& [san, stat] : by_move) out.push_back(stat);
+        std::sort(out.begin(), out.end(), [](const NextMoveStat& a, const NextMoveStat& b) {
+            return a.count != b.count ? a.count > b.count : a.san < b.san;
+        });
+        return out;
+    }
 
-            auto next_it = ply_moves.find(static_cast<int>(sequence.size()));
-            if (next_it == ply_moves.end()) continue; // game ended exactly at the given sequence
+    // Recomputes games.your_color for EVERY game from the given username
+    // (case-insensitive match on the White/Black names). your_color is
+    // otherwise fixed at import time, so an archive fetched under the wrong
+    // username (e.g. a profile named "Danya" holding DanielNaroditsky's
+    // games) would have every game untagged -- and stats/explorer/rating all
+    // skip untagged games. This repairs that without a re-fetch.
+    RetagResult retag_games(const std::string& username) {
+        sqlite3_stmt* stmt = prepare(
+            "UPDATE games SET your_color = CASE "
+            "WHEN lower(white) = lower(?1) THEN 'white' "
+            "WHEN lower(black) = lower(?1) THEN 'black' ELSE '' END;");
+        bind_text(stmt, 1, username);
+        step_and_finalize(stmt);
 
-            auto info_it = game_info.find(game_id);
-            std::string color = info_it != game_info.end() ? info_it->second.first : "";
-            std::string result = info_it != game_info.end() ? info_it->second.second : "";
-            std::string outcome = result_relative_to(result, color);
+        RetagResult r;
+        sqlite3_stmt* count_stmt = prepare("SELECT COUNT(*), SUM(your_color != '') FROM games;");
+        if (sqlite3_step(count_stmt) == SQLITE_ROW) {
+            r.total = sqlite3_column_int(count_stmt, 0);
+            r.tagged = sqlite3_column_int(count_stmt, 1);
+        }
+        sqlite3_finalize(count_stmt);
+        return r;
+    }
 
-            auto stat_it = std::find_if(out.begin(), out.end(),
-                                         [&](const NextMoveStat& s) { return s.san == next_it->second; });
-            if (stat_it == out.end()) {
-                out.push_back({next_it->second, 0, 0, 0, 0});
-                stat_it = std::prev(out.end());
-            }
-            stat_it->count++;
-            if (outcome == "Win") stat_it->wins++;
-            else if (outcome == "Loss") stat_it->losses++;
-            else if (outcome == "Draw") stat_it->draws++;
+    // Scouting aggregates for this archive's owner: what they play, how it
+    // scores, and the most common lines. `on_step(done, total, label)` (if
+    // given) is called as the move-tree walks progress, since each costs a
+    // query on a large archive. `part` limits the work to one piece --
+    // "stats" (aggregates only), "white", "e4" or "d4" (one move-tree walk)
+    // -- so a caller can run the slow walks as parallel processes; "all"
+    // does everything. Fields belonging to skipped parts stay empty.
+    ScoutReport scout(const std::string& subject, const std::string& part = "all",
+                      const std::function<void(int, int, const std::string&)>& on_step = nullptr) {
+        ScoutReport r;
+        r.subject = subject;
+        const bool do_stats = part == "all" || part == "stats";
+        const bool do_white = part == "all" || part == "white";
+        const bool do_e4 = part == "all" || part == "e4";
+        const bool do_d4 = part == "all" || part == "d4";
+
+        if (do_stats) {
+            fill_scout_stats(r);
+            if (r.tagged_games == 0) return r;  // nothing is tagged, so every move-tree walk would come back empty
         }
 
-        std::sort(out.begin(), out.end(),
-                  [](const NextMoveStat& a, const NextMoveStat& b) { return a.count > b.count; });
-        return out;
+        // Greedy "most common line": at each point take whichever move was
+        // played most often in this archive's games (either side's), up to
+        // `depth` plies including any given prefix. The first step's replies
+        // are kept as the headline distribution (top 6).
+        const int depth = 6;
+        const int total_steps = (do_white ? depth : 0) + (do_e4 ? depth - 1 : 0) + (do_d4 ? depth - 1 : 0);
+        int step = 0;
+        auto walk = [&](const std::string& color, std::vector<std::string> sequence,
+                        std::vector<NextMoveStat>& first_replies, std::vector<LineStep>& line, const std::string& label) {
+            const int remaining = depth - static_cast<int>(sequence.size());
+            for (int i = 0; i < remaining; ++i) {
+                if (on_step) on_step(step, total_steps, label);
+                ++step;
+                std::vector<NextMoveStat> replies = opponent_replies(sequence, color);
+                if (replies.empty()) break;
+                int total = 0;
+                for (const NextMoveStat& s : replies) total += s.count;
+                if (line.empty()) {
+                    first_replies = replies;
+                    if (first_replies.size() > 6) first_replies.resize(6);
+                }
+                line.push_back({replies[0].san, replies[0].count, total});
+                sequence.push_back(replies[0].san);
+            }
+        };
+        if (do_white) walk("white", {}, r.first_moves_white, r.line_white, "as White");
+        if (do_e4) walk("black", {"e4"}, r.replies_vs_e4, r.line_black_vs_e4, "as Black vs 1.e4");
+        if (do_d4) walk("black", {"d4"}, r.replies_vs_d4, r.line_black_vs_d4, "as Black vs 1.d4");
+        if (on_step) on_step(total_steps, total_steps, "done");
+        return r;
+    }
+
+    // The owner's record against `opponent` (case-insensitive) and their
+    // most recent games, newest first.
+    HeadToHead head_to_head(const std::string& opponent, int recent_limit = 10) {
+        HeadToHead h;
+        h.opponent = opponent;
+        sqlite3_stmt* stmt = prepare(
+            "SELECT id, date, white, black, your_color, result, opening, site, time_control, white_elo, black_elo, utc_time "
+            "FROM games WHERE your_color != '' AND "
+            "lower(CASE your_color WHEN 'white' THEN black ELSE white END) = lower(?) "
+            "ORDER BY CASE WHEN date GLOB '[0-9][0-9][0-9][0-9].*' THEN 1 ELSE 0 END DESC, "
+            "date DESC, COALESCE(utc_time, '') DESC, id DESC;");
+        bind_text(stmt, 1, opponent);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            std::string white = column_text(stmt, 2);
+            std::string black = column_text(stmt, 3);
+            std::string color = column_text(stmt, 4);
+            std::string outcome = result_relative_to(column_text(stmt, 5), color);
+            h.games++;
+            if (outcome == "Win") h.wins++;
+            else if (outcome == "Loss") h.losses++;
+            else if (outcome == "Draw") h.draws++;
+
+            if (static_cast<int>(h.recent.size()) < recent_limit) {
+                GameSummary s;
+                s.id = sqlite3_column_int(stmt, 0);
+                s.date = column_text(stmt, 1);
+                s.your_color = color;
+                s.result_display = outcome;
+                s.opening = column_text(stmt, 6);
+                s.site = platform_label(column_text(stmt, 7));
+                s.time_category = classify_time_control(column_text(stmt, 8));
+                s.opponent = (color == "white") ? black : white;
+                std::optional<int> white_elo = column_optional_int(stmt, 9);
+                std::optional<int> black_elo = column_optional_int(stmt, 10);
+                s.your_elo = (color == "white") ? white_elo : black_elo;
+                s.utc_time = column_text(stmt, 11);
+                h.recent.push_back(s);
+            }
+        }
+        sqlite3_finalize(stmt);
+        return h;
     }
 
     // For every game whose move list has `sequence` as an exact SAN prefix,
@@ -759,6 +924,85 @@ public:
 
 private:
     sqlite3* db_ = nullptr;
+
+    // The "stats" part of scout(): one chronological pass over the games
+    // table (no moves involved), filling the aggregates in `r`.
+    void fill_scout_stats(ScoutReport& r) {
+        std::map<std::string, WdlStat> openings_white, openings_black, time_controls;
+        std::string recent;
+        {
+            // Chronological (unknown dates first), so the last rating seen
+            // per category is the latest one and `recent` ends on the newest game.
+            sqlite3_stmt* stmt = prepare(
+                "SELECT date, your_color, result, opening, time_control, white_elo, black_elo FROM games "
+                "ORDER BY CASE WHEN date GLOB '[0-9][0-9][0-9][0-9].*' THEN 1 ELSE 0 END ASC, "
+                "date ASC, COALESCE(utc_time, '') ASC, id ASC;");
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                r.total_games++;
+                std::string color = column_text(stmt, 1);
+                if (color != "white" && color != "black") continue;
+                r.tagged_games++;
+
+                std::string date = column_text(stmt, 0);
+                bool known_date = date.size() >= 4 && isdigit(static_cast<unsigned char>(date[0]));
+                if (known_date) {
+                    if (r.earliest_date.empty()) r.earliest_date = date;
+                    r.latest_date = date;
+                }
+
+                std::string outcome = result_relative_to(column_text(stmt, 2), color);
+                auto tally = [&](WdlStat& stat) {
+                    stat.games++;
+                    if (outcome == "Win") stat.wins++;
+                    else if (outcome == "Loss") stat.losses++;
+                    else if (outcome == "Draw") stat.draws++;
+                };
+
+                std::string opening = column_text(stmt, 3);
+                if (!opening.empty()) {
+                    WdlStat& o = (color == "white" ? openings_white : openings_black)[opening];
+                    o.name = opening;
+                    tally(o);
+                }
+
+                std::string category = classify_time_control(column_text(stmt, 4));
+                WdlStat& tc = time_controls[category];
+                tc.name = category;
+                tally(tc);
+                std::optional<int> elo = column_optional_int(stmt, color == "white" ? 5 : 6);
+                if (elo) tc.rating = *elo;
+
+                if (outcome == "Win") recent += 'W';
+                else if (outcome == "Loss") recent += 'L';
+                else if (outcome == "Draw") recent += 'D';
+                if (recent.size() > 20) recent.erase(0, recent.size() - 20);
+            }
+            sqlite3_finalize(stmt);
+        }
+        r.recent = recent;
+
+        auto top_by_games = [](const std::map<std::string, WdlStat>& m, size_t limit) {
+            std::vector<WdlStat> v;
+            for (const auto& [name, stat] : m) v.push_back(stat);
+            std::sort(v.begin(), v.end(), [](const WdlStat& a, const WdlStat& b) {
+                return a.games != b.games ? a.games > b.games : a.name < b.name;
+            });
+            if (v.size() > limit) v.resize(limit);
+            return v;
+        };
+        r.openings_white = top_by_games(openings_white, 15);
+        r.openings_black = top_by_games(openings_black, 15);
+        r.by_time_control = top_by_games(time_controls, 10);
+
+        if (r.tagged_games == 0 && r.total_games > 0) {
+            sqlite3_stmt* stmt = prepare(
+                "SELECT name FROM (SELECT white AS name FROM games UNION ALL SELECT black FROM games) "
+                "WHERE name != '' GROUP BY name ORDER BY COUNT(*) DESC LIMIT 1;");
+            if (sqlite3_step(stmt) == SQLITE_ROW) r.suggested_username = column_text(stmt, 0);
+            sqlite3_finalize(stmt);
+        }
+    }
+
 
     // True if `ply_moves` (a game's ply -> san map) has `sequence` as an
     // exact prefix, starting from ply 0. An empty sequence always matches.

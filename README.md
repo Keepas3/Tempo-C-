@@ -21,13 +21,19 @@ including with an AI assistant that answers questions about your own play.
   Click any column to sort, star favorites, or narrow the list to games that
   reached the position on the board.
 - Multiple profiles as tabs, each with its own database. Right-click a tab
-  to rename, pin, group or delete it.
+  to rename, pin, group, set its account username or delete it. Deleting
+  (confirmed by typing the profile's name) erases all of its data.
 
 **Analysis**
 - Move-by-move review with blunder, mistake and inaccuracy detection, plus
   per-move and per-game accuracy using lichess's published formulas.
 - Live Stockfish evaluation with an advantage bar, best-move arrows and the
   top three lines. Results are cached per game.
+- **Opponent scouting**: load another player's archive as a profile and run
+  `/scout` for what they open with, their most common lines, results per
+  opening, strengths and weaknesses, and how you stack up against them
+  (head to head and your record against their main openings). The opening
+  explorer can also show their games instead of yours as you play a line.
 - Opening explorer for your own repertoire, with a win/draw/loss record for
   each reply you have played.
 - Stats by game type and date range: win rate, openings, time management and
@@ -61,6 +67,7 @@ Then type `/fetch chesscom <username>` (or `lichess`) in the chat panel.
 | `/rating [type...]` | Rating and rating history |
 | `/opening <query>` | Record for an opening (name or ECO code) |
 | `/moves <sequence>` | What was played after a move sequence |
+| `/scout <profile>` | Scouting report on another profile's player |
 | `/clear`, `/help` | Clear the chat, list commands |
 
 Text without a leading `/` goes to the AI assistant. To enable it, set the

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import html
 from datetime import datetime
+from typing import Callable
 
 import chess
 import chess.engine
@@ -176,9 +177,15 @@ class ProfileView(QWidget):
     that profile's own db file (and username, for the command panel's CLI
     calls)."""
 
-    def __init__(self, profile: ProfileRecord, parent=None):
+    def __init__(
+        self, profile: ProfileRecord,
+        other_profiles: Callable[[ProfileRecord], list[ProfileRecord]] | None = None, parent=None,
+    ):
         super().__init__(parent)
         self.profile = profile
+        # Looked up on demand from MainWindow's live profile list, so it always
+        # reflects profiles added/renamed/deleted since this tab was built.
+        self._other_profiles_fn = other_profiles or (lambda _record: [])
         self.current_game_id: int | None = None
 
         db_path = profile.resolved_db_path()
@@ -193,7 +200,11 @@ class ProfileView(QWidget):
         self.command_panel = CommandPanel(
             self.db, self.cli, self.cache, self.engine, self.bookmarks, self.notes,
             get_current_fen=lambda: self.board.fen(),
+            get_other_profiles=self.other_profiles,
         )
+        # (source profile id or "", color, SAN sequence) -> replies, so stepping back and forth
+        # through an opening doesn't re-query a big archive for positions already seen.
+        self._explorer_cache: dict[tuple, list[dict]] = {}
         self.board = BoardWidget()
         self.browser = GameBrowser(self.db, self.notes, self.favorites)
         self.explorer_panel = ExplorerPanel()
@@ -215,6 +226,9 @@ class ProfileView(QWidget):
         self.explorer_panel.enabled_changed.connect(self._on_live_explorer_toggled)
         self.explorer_panel.color_changed.connect(lambda _c: self._live_explorer_timer.start())
         self.explorer_panel.move_clicked.connect(self._on_explorer_move_clicked)
+        self.explorer_panel.source_changed.connect(lambda _s: self._live_explorer_timer.start())
+        self.command_panel.scout_line_requested.connect(self.load_scout_line)
+        self.command_panel.archive_updated.connect(self._explorer_cache.clear)
 
         # Live board-query filter: debounced so rapid navigation doesn't fire
         # a query per click, and threaded (via FetchWorker) so the scan
@@ -541,7 +555,8 @@ class ProfileView(QWidget):
         # looking at the board from the side you actually played.
         self.board.set_orientation(chess.BLACK if detail.your_color == "black" else chess.WHITE)
         self._sync_eval_bar_orientation()
-        self.explorer_panel.set_color(detail.your_color)
+        if not self.explorer_panel.selected_source():  # when exploring an opponent, the radios mean THEIR color
+            self.explorer_panel.set_color(detail.your_color)
         self.status_label.setText(
             f"#{game_id}  {detail.white} vs {detail.black}  ({detail.date}, {detail.result})  [{detail.site}]"
         )
@@ -710,16 +725,38 @@ class ProfileView(QWidget):
         sequence = self.board.current_san_sequence()
         color = self.explorer_panel.selected_color()
 
-        worker = FetchWorker(lambda: self.cli.explorer(color, sequence))
-        worker.succeeded.connect(lambda data: self._on_live_explorer_succeeded(generation, data))
+        source = self.explorer_panel.selected_source()
+        label = self.explorer_panel.selected_source_label()
+        cli = self.cli
+        if source:
+            record = self._other_profile_by_id(source)
+            if record is None:  # the selected profile was deleted since the combo was built
+                self.refresh_other_profiles()
+                return
+            cli = TempoCli(record.resolved_db_path(), record.username)
+
+        key = (source, color, tuple(sequence))
+        cached = self._explorer_cache.get(key)
+        if cached is not None:
+            self.explorer_panel.render(cached, label)
+            return
+
+        def run() -> dict:
+            return cli.explorer(color, sequence)
+
+        worker = FetchWorker(run)
+        worker.succeeded.connect(lambda data: self._on_live_explorer_succeeded(generation, key, label, data))
         worker.failed.connect(lambda msg: self._on_live_explorer_failed(generation, msg))
         self._live_explorer_worker = worker
         worker.start()
 
-    def _on_live_explorer_succeeded(self, generation: int, data: dict) -> None:
+    def _on_live_explorer_succeeded(self, generation: int, key: tuple, label: str, data: dict) -> None:
+        if len(self._explorer_cache) >= 256:
+            self._explorer_cache.clear()
+        self._explorer_cache[key] = data["replies"]  # worth keeping even if a newer position has since taken over
         if generation != self._live_explorer_generation:
             return  # a newer position change has since superseded this query
-        self.explorer_panel.render(data["replies"])
+        self.explorer_panel.render(data["replies"], label)
 
     def _on_live_explorer_failed(self, generation: int, message: str) -> None:
         if generation != self._live_explorer_generation:
@@ -897,6 +934,42 @@ class ProfileView(QWidget):
             self.status_label.setText(
                 f"Live engine eval disabled after {LIVE_EVAL_MAX_FAILURES} repeated errors: {message}")
 
+    # --- other profiles (scouting) ----------------------------------------
+
+    def other_profiles(self) -> list[ProfileRecord]:
+        return self._other_profiles_fn(self.profile)
+
+    def _other_profile_by_id(self, profile_id: str) -> ProfileRecord | None:
+        return next((p for p in self.other_profiles() if p.id == profile_id), None)
+
+    def refresh_other_profiles(self) -> None:
+        """Called by MainWindow whenever the set of profiles changes: updates the
+        explorer's "from:" choices (falling back to "My games" if the selected
+        profile is gone) and drops cached replies that may now be stale."""
+        self._explorer_cache.clear()
+        self.explorer_panel.set_sources([(p.id, p.display_name) for p in self.other_profiles()])
+
+    def load_scout_line(self, profile_id: str, color: str, sans: list[str]) -> None:
+        """From a /scout report's "load this line" link: sets up the board with the line,
+        flipped to the side YOU would play against them, and points the opening explorer
+        at their games so the next likely moves show up as you step through."""
+        if self._other_profile_by_id(profile_id) is None:
+            self.status_label.setText("That profile no longer exists.")
+            return
+        self.current_game_id = None
+        self.command_panel.clear_review_state()
+        self.board.load_game(sans)
+        self.board.set_ply(len(sans))
+        self.board.set_orientation(chess.BLACK if color == "white" else chess.WHITE)
+        self._sync_eval_bar_orientation()
+        self.explorer_panel.set_color(color)
+        self.explorer_panel.checkbox.setChecked(True)
+        self.explorer_panel.set_source(profile_id)
+        self.status_label.setText(f"Scouting line loaded ({color}): {' '.join(sans)}")
+        self._update_nav_buttons()
+        self._refresh_favorite_btn()
+        self._live_explorer_timer.start()
+
     def cleanup(self) -> None:
         """Terminates any live Stockfish subprocess(es) owned by this
         profile tab -- called from MainWindow.closeEvent so no stockfish.exe
@@ -904,8 +977,16 @@ class ProfileView(QWidget):
         for any in-flight batch review worker first -- letting the process
         exit while a QThread is still running is the same fatal-abort
         hazard as overwriting it mid-run (see CommandPanel.cleanup)."""
+        for timer in (self._live_query_timer, self._live_explorer_timer, self._live_eval_timer):
+            timer.stop()
         self.command_panel.cleanup()
         self.engine.quit_all()
+        # Live-query / explorer / eval workers may still be running a tempo.exe
+        # (or an engine call) against this profile's files; wait for them so
+        # nothing holds the db open -- a profile delete removes it right after.
+        for worker in (self._live_query_worker, self._live_explorer_worker, self._live_eval_worker):
+            if worker is not None and worker.isRunning():
+                worker.wait(5000)
 
     def _on_bookmark(self) -> None:
         note, ok = QInputDialog.getText(self, "Bookmark position", "Note (optional):")

@@ -31,6 +31,13 @@ BATCH_SETTING_KEY = "depth18"
 BATCH_DEPTH = 18
 
 
+def batch_worker_count() -> int:
+    """How many single-threaded engines a batch analysis runs at once:
+    about one per physical core (os.cpu_count() counts hyperthreads), capped
+    at 8 -- measured gains flatten out past that while RAM use keeps growing."""
+    return max(1, min(8, (os.cpu_count() or 2) // 2))
+
+
 def _load_settings() -> dict | None:
     if not ENGINE_SETTINGS_PATH.exists():
         return None
@@ -117,14 +124,16 @@ class EngineManager:
         return self._live_engine
 
     def spawn_batch_engine(self) -> chess.engine.SimpleEngine:
-        """A fresh, ephemeral engine for one batch analysis run -- the
-        caller is responsible for calling .quit() on it when done."""
+        """A fresh, ephemeral single-threaded engine for batch analysis --
+        the caller is responsible for calling .quit() on it when done. One
+        thread each because batch analysis runs several of these side by
+        side (see batch_worker_count): independent engines on independent
+        positions scale far better than one engine's own multi-threading."""
         exe_path = resolved_exe_path()
         if exe_path is None:
             raise RuntimeError("Stockfish is not installed")
         engine = chess.engine.SimpleEngine.popen_uci(str(exe_path))
-        threads = max(1, (os.cpu_count() or 2) - 1)
-        engine.configure({"Threads": threads, "Hash": 256})
+        engine.configure({"Threads": 1, "Hash": 32})
         return engine
 
     def quit_all(self) -> None:
