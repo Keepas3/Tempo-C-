@@ -31,6 +31,12 @@ BATCH_SETTING_KEY = "depth18"
 BATCH_DEPTH = 18
 
 
+def setting_key_for(depth: int) -> str:
+    """The analysis-cache key for a search depth (\"depth15\"). The cache treats a stored depth as
+    good enough for any request at that depth or shallower -- see AnalysisCache."""
+    return f"depth{depth}"
+
+
 def batch_worker_count() -> int:
     """How many single-threaded engines a batch analysis runs at once:
     about one per physical core (os.cpu_count() counts hyperthreads), capped

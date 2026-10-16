@@ -45,7 +45,11 @@ including with an AI assistant that answers questions about your own play.
 
 **AI assistant (optional)**
 - Free-text questions about your archive, answered with tool use against
-  your local data instead of guesses, while keeping token use low.
+  your local data instead of guesses. A **Fast / Balanced / Detailed**
+  selector trades analysis depth, games covered and model strength for
+  speed and token cost. Every Stockfish result is saved and reused (a deeper
+  analysis also satisfies shallower questions), and `/analyze` can
+  pre-analyze your recent games in the background so answers come back fast.
 
 ## Quick start (Windows)
 
@@ -68,11 +72,13 @@ Then type `/fetch chesscom <username>` (or `lichess`) in the chat panel.
 | `/opening <query>` | Record for an opening (name or ECO code) |
 | `/moves <sequence>` | What was played after a move sequence |
 | `/scout <profile>` | Scouting report on another profile's player |
+| `/analyze [n] [white\|black]` | Analyze your recent games in the background so AI answers are instant |
 | `/clear`, `/help` | Clear the chat, list commands |
 
 Text without a leading `/` goes to the AI assistant. To enable it, set the
-`ANTHROPIC_API_KEY` environment variable before launching; the key is read
-from the environment only and never written to disk.
+`ANTHROPIC_API_KEY` environment variable, or put `ANTHROPIC_API_KEY=...` in
+`gui/.env` (gitignored), before launching. The key is only ever read, never
+written to disk by the app.
 
 ## Engine (optional)
 

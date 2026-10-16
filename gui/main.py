@@ -12,8 +12,8 @@ import sys
 
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtWidgets import (
-    QApplication, QInputDialog, QLineEdit, QMainWindow, QMenu, QMessageBox, QProgressDialog, QPushButton, QTabBar,
-    QTabWidget,
+    QApplication, QInputDialog, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressDialog, QPushButton,
+    QTabBar, QTabWidget, QTextEdit,
 )
 
 from fetch_worker import FetchWorker
@@ -317,8 +317,24 @@ class MainWindow(QMainWindow):
                 view.cleanup()
         super().closeEvent(event)
 
+    @staticmethod
+    def _keyboard_belongs_to_text_entry() -> bool:
+        """True while the user could be typing: a modal dialog (game note,
+        bookmark note, rename, ...) or a menu is open, or any editable text
+        field -- single-line OR multi-line -- has focus. The Left/Right/R
+        board hotkeys must never fire then, or typing an "r" would reset the
+        board instead of appearing in the text. Read-only text (the chat
+        output) doesn't count: hotkeys keep working while it has focus."""
+        app = QApplication.instance()
+        if app.activeModalWidget() is not None or app.activePopupWidget() is not None:
+            return True
+        focus = app.focusWidget()
+        if isinstance(focus, QLineEdit):
+            return True
+        return isinstance(focus, (QTextEdit, QPlainTextEdit)) and not focus.isReadOnly()
+
     def eventFilter(self, obj, event) -> bool:
-        if event.type() == QEvent.Type.KeyPress and not isinstance(QApplication.focusWidget(), QLineEdit):
+        if event.type() == QEvent.Type.KeyPress and not self._keyboard_belongs_to_text_entry():
             active = self.tabs.currentWidget()
             if isinstance(active, ProfileView):
                 if event.key() == Qt.Key.Key_Left:

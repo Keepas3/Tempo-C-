@@ -23,6 +23,7 @@ import chess.engine
 
 from analysis_cache import AnalysisCache
 from engine import ENGINE_ID
+from win_probability import MATE_NOW_CP
 
 
 def analyze_missing_plies(
@@ -75,7 +76,18 @@ def analyze_missing_plies(
                     ply = pending.get_nowait()
                 except queue.Empty:
                     return
-                info = engine.analyse(boards[ply], chess.engine.Limit(depth=depth))
+                position = boards[ply]
+                if position.is_game_over():
+                    # The game ended on this move. Stockfish reports a mated position as "mate 0", which
+                    # has no sign, so it can't say WHO is winning -- a checkmating move then looked like
+                    # walking into mate and was graded a huge blunder. Score it directly instead:
+                    # the side to move is the one that lost (or it's a draw).
+                    cp = (-MATE_NOW_CP if position.turn == chess.WHITE else MATE_NOW_CP) \
+                        if position.is_checkmate() else 0
+                    cache.store_ply(game_id, ply, ENGINE_ID, engine_version, setting_key, cp, None, None, None)
+                    finished.put(ply)
+                    continue
+                info = engine.analyse(position, chess.engine.Limit(depth=depth))
                 score = info["score"].white()
                 pv = info.get("pv", [])
                 cache.store_ply(

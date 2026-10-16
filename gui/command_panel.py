@@ -38,12 +38,14 @@ import markdown_lite
 from analysis_cache import AnalysisCache
 from bookmarks import Bookmarks
 from command_popup import COMMANDS, CommandPopup, GameTypePopup, OpeningPopup, ProfilePopup
+from bulk_analysis_worker import BulkAnalysisWorker
 from db_reader import DbReader, result_relative_to
 from engine import BATCH_DEPTH, BATCH_SETTING_KEY, ENGINE_ID, EngineManager
 from engine import engine_version as current_engine_version
 from engine import is_available as engine_is_available
 from engine_batch_worker import EngineBatchWorker
 from fetch_worker import FetchWorker
+from game_search import GameSearchFilter, search_games
 from llm_tools import build_tools
 from llm_worker import LlmWorker
 from notes import Notes
@@ -226,9 +228,22 @@ class CommandPanel(QWidget):
         self.range_combo.setCurrentIndex(3)  # "Last 90 days" default
         self.range_combo.currentIndexChanged.connect(self._on_range_changed)
 
+        # Speed / detail of the AI assistant (and /analyze): deeper Stockfish search, more games
+        # per question and a stronger Claude model cost more time and tokens -- see llm_settings.AI_TIERS.
+        self.ai_tier_combo = QComboBox()
+        for tier in llm_settings.AI_TIERS.values():
+            self.ai_tier_combo.addItem(tier.label, userData=tier.key)
+        self.ai_tier_combo.setCurrentIndex(max(0, self.ai_tier_combo.findData(llm_settings.load_tier().key)))
+        self.ai_tier_combo.setToolTip("\n".join(f"{t.label}: {t.blurb}" for t in llm_settings.AI_TIERS.values()))
+        self.ai_tier_combo.currentIndexChanged.connect(
+            lambda _i: llm_settings.save_tier(self.ai_tier_combo.currentData()))
+
         range_row = QHBoxLayout()
         range_row.addWidget(QLabel("Range:"))
         range_row.addWidget(self.range_combo)
+        range_row.addSpacing(12)
+        range_row.addWidget(QLabel("AI:"))
+        range_row.addWidget(self.ai_tier_combo)
         range_row.addStretch(1)
 
         self.last_fetch_label = QLabel("Last fetched: ...")
@@ -260,6 +275,11 @@ class CommandPanel(QWidget):
         fetch_box_layout.addLayout(fetch_bar_row)
         self.fetch_progress_box.hide()
         self._fetch_worker: FetchWorker | None = None
+        # The progress box above serves one long-running job at a time: "fetch" or "analyze".
+        self._active_task: str | None = None
+        self._analyze_worker: BulkAnalysisWorker | None = None
+        self._analyze_progress = (0, 0, 0, 0)
+        self._analyze_desc = ""
         self._fetch_started_at = 0.0
         self._fetch_desc = ""
         self._fetch_last_progress = (0, 0, 0, "starting")
@@ -610,7 +630,8 @@ class CommandPanel(QWidget):
             if not llm_settings.is_available():
                 self._print(
                     f'<span style="color:{MUTED_COLOR}">Claude isn\'t configured -- set the '
-                    f'<code>ANTHROPIC_API_KEY</code> environment variable and restart the app to ask '
+                    f'<code>ANTHROPIC_API_KEY</code> environment variable (or put <code>ANTHROPIC_API_KEY=...</code> '
+                    f'in <code>gui/.env</code>) and restart the app to ask '
                     f'questions here. Try /help for the commands that work today.</span>'
                 )
                 return
@@ -704,6 +725,8 @@ class CommandPanel(QWidget):
             self._dispatch_fetch(args)
         elif cmd == "scout":
             self._dispatch_scout(args)
+        elif cmd == "analyze":
+            self._dispatch_analyze(args)
         else:
             self._print_error(f"unknown command '/{cmd}'. Type /help for a list.")
 
@@ -772,6 +795,7 @@ class CommandPanel(QWidget):
         self._cancel_active_llm_query()
         self.cancel_fetch()
         self.cancel_scout()
+        self.cancel_analysis()
         for worker in list(self._retiring_review_workers) + list(self._retiring_llm_workers):
             worker.request_cancel()
             worker.wait(2000)
@@ -980,6 +1004,7 @@ class CommandPanel(QWidget):
             llm_settings.api_key(), build_tools(),
             self.db, self.cli, self.cache, self.engine, self.bookmarks, self.notes, self.get_current_fen,
             self._llm_history, question, self, other_profiles=self.get_other_profiles(),
+            tier=self.current_ai_tier(),
         )
         worker.status.connect(self._on_llm_status)
         worker.answer_chunk.connect(self._on_llm_answer_chunk)
@@ -1057,8 +1082,8 @@ class CommandPanel(QWidget):
             return
         site, username = args[0], args[1]
 
-        if self._fetch_worker is not None and self._fetch_worker.isRunning():
-            self._print_error("a fetch is already running -- wait for it to finish or press Cancel.")
+        if (self._fetch_worker is not None and self._fetch_worker.isRunning()) or self._active_task is not None:
+            self._print_error("another job (fetch or analysis) is already running -- wait for it to finish or press Cancel.")
             return
 
         if site == "chesscom":
@@ -1079,6 +1104,7 @@ class CommandPanel(QWidget):
         # a blocking fetch here would freeze every tab, not just this one.
         self._fetch_desc = f"{site_label} · {username}"
         self._fetch_started_at = time.monotonic()
+        self._active_task = "fetch"
         self._fetch_last_progress = (0, 0, 0, "starting")
         self.fetch_cancel_btn.setEnabled(True)
         self.fetch_progress_box.show()
@@ -1098,6 +1124,9 @@ class CommandPanel(QWidget):
         self._update_fetch_status()
 
     def _update_fetch_status(self) -> None:
+        if self._active_task == "analyze":
+            self._update_analyze_status()
+            return
         done, total, added, label = self._fetch_last_progress
         elapsed = int(time.monotonic() - self._fetch_started_at)
         clock = f"{elapsed // 60}:{elapsed % 60:02d}"
@@ -1115,8 +1144,14 @@ class CommandPanel(QWidget):
     def _finish_fetch_ui(self) -> None:
         self._fetch_tick.stop()
         self.fetch_progress_box.hide()
+        self._active_task = None
 
     def _on_fetch_cancel_clicked(self) -> None:
+        if self._active_task == "analyze" and self._analyze_worker is not None and self._analyze_worker.isRunning():
+            self.fetch_cancel_btn.setEnabled(False)
+            self.fetch_status_label.setText(f'<span style="color:{MUTED_COLOR}">Cancelling...</span>')
+            self._analyze_worker.request_cancel()
+            return
         if self._fetch_worker is not None and self._fetch_worker.isRunning():
             self.fetch_cancel_btn.setEnabled(False)
             self.fetch_status_label.setText(f'<span style="color:{MUTED_COLOR}">Cancelling...</span>')
@@ -1127,6 +1162,98 @@ class CommandPanel(QWidget):
         if self._fetch_worker is not None and self._fetch_worker.isRunning():
             self._fetch_worker.request_cancel()
             self._fetch_worker.wait(3000)
+
+    # --- /analyze (background analysis) ----------------------------------
+
+    def current_ai_tier(self) -> llm_settings.AiTier:
+        return llm_settings.AI_TIERS.get(self.ai_tier_combo.currentData(), llm_settings.AI_TIERS[llm_settings.DEFAULT_TIER])
+
+    def _dispatch_analyze(self, args: list[str]) -> None:
+        usage = "usage: /analyze [n] [white|black]   e.g. /analyze 20 white"
+        count, color = 10, None
+        for arg in args:
+            if arg.isdigit():
+                count = max(1, min(int(arg), 50))
+            elif arg.lower() in ("white", "black"):
+                color = arg.lower()
+            elif arg.lower() != "all":
+                self._print_error(usage)
+                return
+        if not engine_is_available():
+            self._print_error("Stockfish isn't installed -- use \"Download Stockfish\" under the board first.")
+            return
+        if self._active_task is not None or (self._fetch_worker is not None and self._fetch_worker.isRunning()):
+            self._print_error("another job (fetch or analysis) is already running -- wait for it to finish or press Cancel.")
+            return
+        if self._llm_worker is not None and self._llm_worker.isRunning():
+            self._print_error("the AI assistant is working -- wait for its answer first.")
+            return
+
+        rows, _total = search_games(self.db, GameSearchFilter(color=color, limit=count * 2), self.notes)
+        game_ids = [r.id for r in [r for r in rows if r.your_color in ("white", "black")][:count]]
+        if not game_ids:
+            self._print_error("no games to analyze.")
+            return
+
+        tier = self.current_ai_tier()
+        self._analyze_desc = f"Analyzing {len(game_ids)} {color + ' ' if color else ''}game{'s' if len(game_ids) != 1 else ''} (depth {tier.depth})"
+        self._print(f'<span style="color:{MUTED_COLOR}">{_esc(self._analyze_desc)} in the background -- '
+                    f'you can keep using the app. Results are saved, so AI questions about these games will be fast.</span>')
+
+        worker = BulkAnalysisWorker(self.db, self.cache, self.engine, game_ids, tier.depth, current_engine_version() or "")
+        worker.progress.connect(self._on_analyze_progress)
+        worker.succeeded.connect(self._on_analyze_done)
+        worker.cancelled.connect(self._on_analyze_cancelled)
+        worker.failed.connect(self._on_analyze_failed)
+        self._analyze_worker = worker
+        self._analyze_progress = (0, 0, 0, len(game_ids))
+        self._active_task = "analyze"
+        self._fetch_started_at = time.monotonic()
+        self.fetch_cancel_btn.setEnabled(True)
+        self.fetch_progress_box.show()
+        self._update_analyze_status()
+        self._fetch_tick.start()
+        worker.start()
+
+    def _on_analyze_progress(self, done: int, total: int, game_number: int, game_count: int) -> None:
+        self._analyze_progress = (done, total, game_number, game_count)
+        self._update_analyze_status()
+
+    def _update_analyze_status(self) -> None:
+        done, total, game_number, game_count = self._analyze_progress
+        elapsed = int(time.monotonic() - self._fetch_started_at)
+        clock = f"{elapsed // 60}:{elapsed % 60:02d}"
+        if total > 0:
+            self.fetch_progress_bar.setRange(0, total)
+            self.fetch_progress_bar.setValue(done)
+            self.fetch_progress_bar.setFormat(f"{done} / {total} positions")
+            detail = f"game {game_number}/{game_count}"
+        else:
+            self.fetch_progress_bar.setRange(0, 0)
+            detail = "checking what is already analyzed"
+        self.fetch_status_label.setText(
+            f'<span style="color:{MUTED_COLOR}">{_esc(self._analyze_desc)} &middot; {_esc(detail)} &middot; {clock}</span>')
+
+    def _on_analyze_done(self, summary: dict) -> None:
+        self._finish_fetch_ui()
+        self._print(
+            f'<span style="color:{MUTED_COLOR}">Analysis finished: <b>{summary["games_analyzed"]}</b> game(s) analyzed '
+            f'({summary["positions"]} positions), {summary["games_cached"]} already saved. '
+            f'Ask the AI about your weaknesses -- it will use these results instantly.</span>')
+
+    def _on_analyze_cancelled(self, summary: dict) -> None:
+        self._finish_fetch_ui()
+        self._print(f'<span style="color:{MUTED_COLOR}">Analysis cancelled -- {summary["games_analyzed"]} game(s) were '
+                    f'finished and saved; the partly analyzed one keeps its finished positions.</span>')
+
+    def _on_analyze_failed(self, message: str) -> None:
+        self._finish_fetch_ui()
+        self._print_error(f"analysis failed: {message}")
+
+    def cancel_analysis(self) -> None:
+        if self._analyze_worker is not None and self._analyze_worker.isRunning():
+            self._analyze_worker.request_cancel()
+            self._analyze_worker.wait(5000)
 
     # --- /scout ---------------------------------------------------------
 
@@ -1582,10 +1709,15 @@ class CommandPanel(QWidget):
         if s["avg_seconds_per_move"] >= 0 or rated_categories:
             parts.append(_section("Time management"))
             no_data = f'<span style="color:{MUTED_COLOR}">n/a</span>'
+            # Overall rating = plain average of the current rating in each game
+            # type (not weighted by games played -- a bullet-heavy archive would
+            # otherwise just mirror its bullet rating).
+            overall_rating = (round(sum(t["current_rating"] for t in rated_categories) / len(rated_categories))
+                              if rated_categories else None)
             overall_time_row = [["Overall", str(total),
                                   f'{s["avg_seconds_per_move"]:.1f}' if s["avg_seconds_per_move"] >= 0 else no_data,
                                   str(s["time_trouble_moves"]) if s["avg_seconds_per_move"] >= 0 else no_data,
-                                  no_data]]
+                                  str(overall_rating) if overall_rating is not None else no_data]]
             by_tc_rows = [
                 [t["category"], str(t["games"]),
                  f'{t["avg_seconds_per_move"]:.1f}' if t["avg_seconds_per_move"] >= 0 else no_data,
@@ -1595,6 +1727,9 @@ class CommandPanel(QWidget):
             ]
             parts.append(_table(["Time control", "Games", "Avg. sec/move", "Moves under 10s", "Rating"],
                                  overall_time_row + by_tc_rows))
+            if overall_rating is not None:
+                parts.append(f'<div style="color:{MUTED_COLOR}; font-size:small;">Overall rating = average of your '
+                             f'current ratings across the {len(rated_categories)} game types above.</div>')
 
         if s["top_openings_white"]:
             parts.append(_section("Openings you play (White)"))

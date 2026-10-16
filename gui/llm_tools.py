@@ -24,7 +24,7 @@ import llm_settings
 from analysis_cache import AnalysisCache
 from bookmarks import Bookmarks
 import engine as engine_module
-from engine import BATCH_DEPTH, BATCH_SETTING_KEY, ENGINE_ID, EngineManager, batch_worker_count
+from engine import ENGINE_ID, EngineManager, batch_worker_count, setting_key_for
 from engine_analysis_core import analyze_missing_plies
 from db_reader import DbReader
 from game_search import GameSearchFilter, game_row_to_compact_dict, search_games as _filter_games
@@ -32,49 +32,29 @@ from notes import Notes
 from profiles import ProfileRecord
 from review_data import build_stockfish_review_payload
 from tempo_cli import TempoCli, TempoCliError
+from weakness_summary import phase_for_ply, summarize_weaknesses
 
-SYSTEM_PROMPT = """You are the chat-panel assistant inside Tempo, a personal \
-chess game archive app. You can answer general chess knowledge questions \
-(openings theory, endgame technique, tactics, strategy) directly from what \
-you know -- those need no tools at all.
+SYSTEM_PROMPT = """You are the assistant inside Tempo, a personal chess game archive app. \
+Answer general chess knowledge (theory, endgames, tactics, strategy) directly. For anything \
+about the user's own games, stats or playstyle, use tools -- never guess.
 
-For anything about the user's own games, stats, or playstyle, use the \
-tools rather than guessing. Follow this discipline, in order:
+Weaknesses / playstyle / "what should I improve" questions: call analyze_weaknesses ONCE \
+(set color; add time_category/opening/date filters only if the user named them). It picks the \
+recent games, runs Stockfish on any not analyzed yet, and returns aggregated findings. Reply \
+with 2-4 concrete takeaways, name the games/moves that illustrate them, and say how many games \
+it covered. Don't re-run it for the same question.
 
-1. Narrow first. Use get_archive_stats, search_games, and/or lookup_opening \
-to find the small set of games actually relevant to the question (usually \
-fewer than 10) before touching movetext or engine analysis. If a question \
-is too broad to narrow cheaply (e.g. "find every mistake I've ever made"), \
-ask a clarifying question instead (time control? a date range? a specific \
-opening or opponent?) rather than trying to scan the whole archive.
-2. Before running any Stockfish analysis, call check_analysis_coverage on \
-your narrowed game list -- most of the archive has never been analyzed, \
-and re-analyzing already-cached games wastes time for no benefit.
-3. Only call run_batch_analysis on games that check_analysis_coverage \
-showed are missing data, and only for games you've already established \
-matter to the question. It's capped at 6 games per call by design -- pick \
-the most relevant ones, don't try to analyze broadly.
-4. Use summarize_cached_analysis to turn cached per-game analysis into \
-blunder/mistake/inaccuracy patterns -- never ask for or reconstruct raw \
-per-ply evaluation data yourself.
-5. get_game_moves returns one game's full move list -- use it only for a \
-specific game you already know matters (e.g. to quote a concrete line), \
-never in a loop over many games.
+Specific questions: get_archive_stats, search_games, lookup_opening, get_game_summary, \
+get_repertoire_stats, list_bookmarks, get_game_notes. get_game_moves is for one specific game \
+only. Use check_analysis_coverage -> run_batch_analysis -> summarize_cached_analysis only for \
+analysis of particular games you already identified (cached results are free to reuse).
 
-Other profiles: the user can have other players' archives open as separate \
-profiles (e.g. an opponent they are about to face). When they ask how to \
-prepare for, beat, or understand another player, call list_profiles, then \
-scout_profile for that player -- it returns their most common lines, \
-opening results and head-to-head against the user in one cheap call. Use \
-get_repertoire_stats with its `profile` argument to look deeper at what \
-that player plays after a specific move sequence. These tools are \
-read-only; never claim to have changed another profile.
+Other profiles: the user can have other players' archives open (e.g. an opponent). To prepare \
+for or beat someone, call list_profiles then scout_profile; use get_repertoire_stats with its \
+`profile` argument to see what that player plays after a given sequence. These are read-only.
 
-Keep answers concise: light markdown (bold, short bullet lists) is fine, \
-but summarize rather than dumping tables of raw numbers. If your analysis \
-only covers some of the user's relevant games (because deeper coverage \
-would need analyzing more than is practical), say so plainly rather than \
-implying the answer is exhaustive."""
+Be concise: light markdown, summarize rather than dump numbers, and say plainly when coverage \
+is partial."""
 
 
 @dataclass
@@ -90,17 +70,15 @@ class ToolContext:
     # Snapshot of the other profiles taken when the question was asked (read-only use
     # from this worker thread; the live list belongs to the GUI thread).
     other_profiles: list[ProfileRecord] = field(default_factory=list)
+    # Speed/detail preset: Stockfish depth, games per weakness question, etc.
+    tier: llm_settings.AiTier = field(default_factory=lambda: llm_settings.AI_TIERS[llm_settings.DEFAULT_TIER])
+    # True once the user pressed Cancel -- long analysis checks it between positions.
+    is_cancelled: Callable[[], bool] = field(default=lambda: False)
 
 
-def _phase_for_ply(ply: int) -> str:
-    # Simple ply-based bucketing (not material-based) -- good enough for a
-    # "where do your mistakes cluster" summary without replaying every game
-    # to count material at each position.
-    if ply < 20:
-        return "opening"
-    if ply < 60:
-        return "middlegame"
-    return "endgame"
+# How many recent matching games (as a multiple of the tier's game budget) a weakness question may
+# choose from when preferring ones whose analysis is already saved.
+RECENT_WINDOW_FACTOR = 3
 
 
 def _range_token(range_days: int | None) -> str:
@@ -177,8 +155,23 @@ _BASE_TOOLS: list[dict] = [
         },
     },
     {
+        "name": "analyze_weaknesses",
+        "description": "One-call weakness report: picks the user's most recent games (optionally filtered), runs Stockfish on any not analyzed yet (can take a while the first time; cached afterward), and returns aggregated findings: error rates, errors by game phase, by result and by opening, accuracy, and the costliest moves with better alternatives.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "color": {"type": "string", "enum": ["white", "black", "either"], "description": "Which side's games to study."},
+                "time_category": {"type": "string", "enum": ["Bullet", "Blitz", "Rapid", "Classical", "Daily"]},
+                "opening": {"type": "string", "description": "Substring match on opening name."},
+                "date_from": {"type": "string", "description": "YYYY.MM.DD, inclusive."},
+                "max_games": {"type": "integer", "description": "Games to study; capped by the user's speed setting. Omit to use the cap."},
+            },
+            "required": ["color"],
+        },
+    },
+    {
         "name": "check_analysis_coverage",
-        "description": f"Checks which of up to {llm_settings.MAX_COVERAGE_CHECK_GAMES} given game ids already have full Stockfish analysis cached -- no engine calls, just a cache lookup. Always call this before run_batch_analysis.",
+        "description": f"Which of up to {llm_settings.MAX_COVERAGE_CHECK_GAMES} game ids already have Stockfish analysis cached (cache lookup only). Call before run_batch_analysis.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -189,7 +182,7 @@ _BASE_TOOLS: list[dict] = [
     },
     {
         "name": "run_batch_analysis",
-        "description": f"Runs real Stockfish analysis on specific games not yet cached, storing per-ply results. Capped at {llm_settings.MAX_BATCH_ANALYSIS_GAMES} game ids per call -- rejected if exceeded. This spends real time/CPU, so only call it for games you've already narrowed to and confirmed (via check_analysis_coverage) are missing. Returns only per-game status, not eval numbers -- call summarize_cached_analysis afterward for the actual findings.",
+        "description": f"Runs Stockfish on specific games not yet cached (max {llm_settings.MAX_BATCH_ANALYSIS_GAMES} per call; slow). Returns status only -- call summarize_cached_analysis for findings.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -200,7 +193,7 @@ _BASE_TOOLS: list[dict] = [
     },
     {
         "name": "summarize_cached_analysis",
-        "description": f"Aggregates already-cached Stockfish analysis across up to {llm_settings.MAX_SUMMARIZE_GAMES} games into blunder/mistake/inaccuracy counts by game phase, per-game and average accuracy percentages (lichess-style, for the user's own color), plus a handful of concrete example moves. Only reads what's already cached -- never returns raw per-ply data.",
+        "description": f"Blunder/mistake/inaccuracy counts by phase, accuracy and example moves for up to {llm_settings.MAX_SUMMARIZE_GAMES} already-analyzed games (cache only).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -339,6 +332,7 @@ class ToolExecutor:
         if len(game_ids) > llm_settings.MAX_COVERAGE_CHECK_GAMES:
             return _error(f"too many game_ids ({len(game_ids)}) -- max {llm_settings.MAX_COVERAGE_CHECK_GAMES} per call")
         version = engine_module.engine_version()
+        key = setting_key_for(self.ctx.tier.depth)
         if version is None:
             return {"games": [], "note": "Stockfish has no recorded version -- nothing has been analyzed yet."}
         results = []
@@ -348,7 +342,7 @@ class ToolExecutor:
                 results.append({"game_id": game_id, "error": "not found"})
                 continue
             total_plies = len(detail.moves)
-            missing = self.ctx.cache.get_missing_plies(game_id, total_plies, ENGINE_ID, version, BATCH_SETTING_KEY)
+            missing = self.ctx.cache.get_missing_plies(game_id, total_plies, ENGINE_ID, version, key)
             results.append({
                 "game_id": game_id, "total_plies": total_plies,
                 "cached_plies": total_plies - len(missing), "fully_cached": len(missing) == 0,
@@ -365,6 +359,8 @@ class ToolExecutor:
         version = engine_module.engine_version()
         if version is None:
             return _error("Stockfish is not installed")
+        depth = self.ctx.tier.depth
+        key = setting_key_for(depth)
 
         results = []
         for i, game_id in enumerate(game_ids, start=1):
@@ -373,7 +369,7 @@ class ToolExecutor:
                 results.append({"game_id": game_id, "status": "error", "error": "not found"})
                 continue
             total_plies = len(detail.moves)
-            missing = self.ctx.cache.get_missing_plies(game_id, total_plies, ENGINE_ID, version, BATCH_SETTING_KEY)
+            missing = self.ctx.cache.get_missing_plies(game_id, total_plies, ENGINE_ID, version, key)
             if not missing:
                 results.append({"game_id": game_id, "analyzed_plies": 0, "already_cached_plies": total_plies, "status": "ok"})
                 continue
@@ -385,14 +381,84 @@ class ToolExecutor:
 
             analyze_missing_plies(
                 self.ctx.engine.spawn_batch_engine, batch_worker_count(),
-                sans, missing, self.ctx.cache, game_id, version, BATCH_SETTING_KEY, BATCH_DEPTH,
-                on_progress=on_progress,
+                sans, missing, self.ctx.cache, game_id, version, key, depth,
+                on_progress=on_progress, should_cancel=self.ctx.is_cancelled,
             )
             results.append({
                 "game_id": game_id, "analyzed_plies": len(missing),
                 "already_cached_plies": total_plies - len(missing), "status": "ok",
             })
         return {"games": results}
+
+    def _tool_analyze_weaknesses(self, inp: dict) -> dict:
+        tier = self.ctx.tier
+        version = engine_module.engine_version()
+        if version is None:
+            return _error("Stockfish is not installed -- click Download Stockfish under the board first")
+        color = inp.get("color") or "either"
+        limit = min(int(inp.get("max_games") or tier.max_games), tier.max_games)
+        filt = GameSearchFilter(
+            color=color if color in ("white", "black") else None, opening=inp.get("opening"),
+            date_from=inp.get("date_from"), time_category=inp.get("time_category"), limit=limit * RECENT_WINDOW_FACTOR,
+        )
+        rows, total_matches = _filter_games(self.ctx.db, filt)
+        rows = [r for r in rows if r.your_color in ("white", "black")]  # untagged games have no "your side"
+        if not rows:
+            return _error("no games match those filters")
+
+        # Look at a window of the user's recent games (newest first), then spend the game budget on the ones
+        # whose analysis is ALREADY saved before paying to analyze new ones -- so earlier /analyze runs and
+        # earlier questions are reused instead of being ignored in favor of the very newest games. Games
+        # still missing analysis fill whatever budget is left, newest first.
+        key = setting_key_for(tier.depth)
+        candidates = []
+        for row in rows:
+            detail = self.ctx.db.load_game(row.id)
+            if detail is None or not detail.moves:
+                continue
+            missing = self.ctx.cache.get_missing_plies(row.id, len(detail.moves), ENGINE_ID, version, key)
+            candidates.append((detail, missing))
+        window_size = len(candidates)
+        cached = [c for c in candidates if not c[1]]
+        fresh = [c for c in candidates if c[1]]
+        plan = (cached + fresh)[:limit]
+        total_new = sum(len(m) for _d, m in plan)
+
+        done_before = 0
+        for index, (detail, missing) in enumerate(plan, start=1):
+            if not missing:
+                continue
+            if self.ctx.is_cancelled():
+                return _error("cancelled")
+            sans = [m.san for m in detail.moves]
+
+            def on_progress(done: int, _total: int, base=done_before, idx=index) -> None:
+                self.ctx.on_status(f"Analyzing game {idx}/{len(plan)} (depth {tier.depth}) -- {base + done}/{total_new} positions")
+
+            analyze_missing_plies(
+                self.ctx.engine.spawn_batch_engine, batch_worker_count(), sans, missing, self.ctx.cache,
+                detail.id, version, key, tier.depth, on_progress=on_progress, should_cancel=self.ctx.is_cancelled,
+            )
+            done_before += len(missing)
+        if self.ctx.is_cancelled():
+            return _error("cancelled")
+
+        analyzed = []
+        for detail, _missing in plan:
+            cache_rows = self.ctx.cache.get_full(detail.id, len(detail.moves), ENGINE_ID, version, key)
+            if cache_rows is None:
+                continue
+            analyzed.append((detail, build_stockfish_review_payload(detail, cache_rows, version, tier.depth)))
+
+        summary = summarize_weaknesses(analyzed, color)
+        summary.update({
+            "color": color, "depth": tier.depth,
+            "games_newly_analyzed": sum(1 for _d, m in plan if m),
+            "games_already_cached": sum(1 for _d, m in plan if not m),
+            "matching_games_in_archive": total_matches,
+            "chosen_from_most_recent": window_size,
+        })
+        return summary
 
     def _tool_summarize_cached_analysis(self, inp: dict) -> dict:
         game_ids = inp.get("game_ids") or []
@@ -406,6 +472,8 @@ class ToolExecutor:
                 "accuracy_by_game": {}, "examples": [], "skipped_uncached_game_ids": list(game_ids),
             }
 
+        depth = self.ctx.tier.depth
+        key = setting_key_for(depth)
         counts = {"blunders": 0, "mistakes": 0, "inaccuracies": 0}
         by_phase = {"opening": 0, "middlegame": 0, "endgame": 0}
         examples: list[dict] = []
@@ -420,14 +488,14 @@ class ToolExecutor:
                 skipped.append(game_id)
                 continue
             total_plies = len(detail.moves)
-            rows = self.ctx.cache.get_full(game_id, total_plies, ENGINE_ID, version, BATCH_SETTING_KEY)
+            rows = self.ctx.cache.get_full(game_id, total_plies, ENGINE_ID, version, key)
             if rows is None:
                 skipped.append(game_id)
                 continue
-            payload = build_stockfish_review_payload(detail, rows, version, BATCH_DEPTH)
+            payload = build_stockfish_review_payload(detail, rows, version, depth)
             for ply, severity in payload["severities"].items():
                 counts[plural[severity]] += 1
-                by_phase[_phase_for_ply(ply)] += 1
+                by_phase[phase_for_ply(ply)] += 1
                 if len(examples) < 5:
                     examples.append({"game_id": game_id, "ply": ply, "san": detail.moves[ply].san, "severity": severity})
 
@@ -541,7 +609,7 @@ class ToolExecutor:
         engine = self.ctx.engine.spawn_batch_engine()
         try:
             board = chess.Board(fen)
-            info = engine.analyse(board, chess.engine.Limit(depth=BATCH_DEPTH))
+            info = engine.analyse(board, chess.engine.Limit(depth=self.ctx.tier.depth))
             score = info["score"].white()
             pv = info.get("pv", [])
             best_move_san = board.san(pv[0]) if pv else None

@@ -7,8 +7,8 @@ The tool-use loop itself: send the conversation + tool schemas, stream the
 response; if the model asks for tool calls (stop_reason == "tool_use"),
 run them via ToolExecutor and feed the results back as a new user turn;
 repeat until the model returns a plain text answer or the iteration cap is
-hit. Bounded by llm_settings.MAX_TOOL_ITERATIONS so a confused loop can't
-run forever.
+hit. Bounded by the speed tier's max_tool_iterations so a confused loop
+can't run forever.
 """
 from __future__ import annotations
 
@@ -40,6 +40,7 @@ _STATUS_TEXT = {
     "list_bookmarks": "Checking bookmarks...",
     "get_best_move_in_current_position": "Analyzing the current position...",
     "get_game_notes": "Checking notes...",
+    "analyze_weaknesses": "Finding your weaknesses...",
     "list_profiles": "Checking available profiles...",
     "scout_profile": "Scouting the opponent...",
 }
@@ -57,12 +58,16 @@ class LlmWorker(QThread):
         db: DbReader, cli: TempoCli, cache: AnalysisCache, engine: EngineManager,
         bookmarks: Bookmarks, notes: Notes, get_current_fen: Callable[[], str],
         history: list[dict], user_message: str, parent=None,
-        other_profiles: list[ProfileRecord] | None = None,
+        other_profiles: list[ProfileRecord] | None = None, tier: llm_settings.AiTier | None = None,
     ) -> None:
         super().__init__(parent)
         self._api_key = api_key
         self._tools = tools
-        self._history = list(history)
+        self._tier = tier or llm_settings.AI_TIERS[llm_settings.DEFAULT_TIER]
+        # Only the most recent messages are re-sent with every question: history is a big part of
+        # the tokens each turn costs. Kept in whole question/answer pairs, starting on a user turn.
+        keep = max(0, self._tier.history_messages)
+        self._history = list(history[-keep:]) if keep else []
         self._user_message = user_message
         self._cancel_requested = False
         # ToolContext.on_status is wired to self.status.emit here (not
@@ -75,7 +80,8 @@ class LlmWorker(QThread):
         ctx = ToolContext(
             db=db, cli=cli, cache=cache, engine=engine, bookmarks=bookmarks, notes=notes,
             get_current_fen=get_current_fen, on_status=self.status.emit,
-            other_profiles=list(other_profiles or []),
+            other_profiles=list(other_profiles or []), tier=self._tier,
+            is_cancelled=lambda: self._cancel_requested,
         )
         self._executor = ToolExecutor(ctx)
 
@@ -92,21 +98,23 @@ class LlmWorker(QThread):
         client = anthropic.Anthropic(api_key=self._api_key)
         messages: list[dict] = self._history + [{"role": "user", "content": self._user_message}]
 
-        for _ in range(llm_settings.MAX_TOOL_ITERATIONS):
+        for _ in range(self._tier.max_tool_iterations):
             if self._cancel_requested:
                 self.cancelled.emit()
                 return
 
             try:
-                with client.messages.stream(
-                    model=llm_settings.MODEL_ID,
-                    max_tokens=llm_settings.MAX_OUTPUT_TOKENS,
+                request = dict(
+                    model=self._tier.model,
+                    max_tokens=self._tier.max_output_tokens,
                     system=SYSTEM_PROMPT,
                     tools=self._tools,
                     messages=messages,
                     cache_control={"type": "ephemeral"},
-                    output_config={"effort": "medium"},
-                ) as stream:
+                )
+                if self._tier.effort:
+                    request["output_config"] = {"effort": self._tier.effort}
+                with client.messages.stream(**request) as stream:
                     buffer = ""
                     last_emit_len = 0
                     for text in stream.text_stream:
@@ -147,7 +155,7 @@ class LlmWorker(QThread):
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
-                    "content": json.dumps(result),
+                    "content": json.dumps(result, separators=(",", ":")),  # no padding spaces: fewer tokens
                     "is_error": is_error,
                 })
             messages.append({"role": "user", "content": tool_results})

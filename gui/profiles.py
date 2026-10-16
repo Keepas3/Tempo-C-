@@ -62,6 +62,12 @@ class ProfileRecord:
         if not self.is_db_path_safe():
             return []
         db = self.resolved_db_path().resolve()
+        # A hand-edited (or synced/shared) profiles.json must never be able to
+        # point a profile at some other file in the project and have "delete
+        # profile" erase it: the db must be a .db file, and if it exists it
+        # must really be a SQLite database.
+        if db.suffix != ".db" or (db.exists() and not _is_sqlite_file(db)):
+            return []
         folder = db.parent
         profiles_root = (PROJECT_ROOT / "profiles").resolve()
         if folder != profiles_root and folder.is_relative_to(profiles_root):
@@ -157,6 +163,14 @@ def group_ordered(profiles: list[ProfileRecord]) -> list[ProfileRecord]:
             placed_groups.add(p.group)
             ordered.extend(q for q in profiles if q.group == p.group)
     return ordered
+
+
+def _is_sqlite_file(path: Path) -> bool:
+    try:
+        with open(path, "rb") as f:
+            return f.read(16) == b"SQLite format 3\x00"
+    except OSError:
+        return False
 
 
 def _remove_path(path: Path) -> None:

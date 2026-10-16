@@ -32,14 +32,14 @@ from PySide6.QtWidgets import (
 from analysis_cache import AnalysisCache
 from board_widget import BOARD_SIZE, BoardWidget
 from bookmarks import Bookmark, Bookmarks
-from colors import HEADER_COLOR, LOSS_COLOR, MUTED_COLOR, TEXT_COLOR, WIN_COLOR
+from colors import DRAW_COLOR, HEADER_COLOR, LOSS_COLOR, MUTED_COLOR, TEXT_COLOR, WIN_COLOR
 from command_panel import CommandPanel
 from db_reader import DbReader, game_summary_to_row
 import engine as engine_module
 from engine import EngineManager, LIVE_EVAL_TIERS
 from engine_download import start_engine_download_flow
 from eval_bar import EvalBar
-from explorer_panel import ExplorerPanel
+from explorer_panel import EXPLORER_MAX_PLIES, ExplorerPanel
 from fetch_worker import FetchWorker
 from game_browser import GameBrowser
 from favorites import Favorites
@@ -557,12 +557,27 @@ class ProfileView(QWidget):
         self._sync_eval_bar_orientation()
         if not self.explorer_panel.selected_source():  # when exploring an opponent, the radios mean THEIR color
             self.explorer_panel.set_color(detail.your_color)
-        self.status_label.setText(
-            f"#{game_id}  {detail.white} vs {detail.black}  ({detail.date}, {detail.result})  [{detail.site}]"
-        )
+        self.status_label.setText(self._game_header_html(game_id, detail))
         self._update_nav_buttons()
         self._refresh_favorite_btn()
         self.browser.select_game(game_id)  # keep the browser's selection in sync regardless of how the game was loaded
+
+    @staticmethod
+    def _game_header_html(game_id: int, detail) -> str:
+        """"#id White vs Black (date) [site]" with the winner's name green and
+        the loser's red (both gray for a draw, plain for an unfinished/unknown
+        game) -- instead of printing the raw 1-0 / 0-1 score."""
+        colors = {
+            "1-0": (WIN_COLOR, LOSS_COLOR),
+            "0-1": (LOSS_COLOR, WIN_COLOR),
+            "1/2-1/2": (DRAW_COLOR, DRAW_COLOR),
+        }.get(detail.result, (TEXT_COLOR, TEXT_COLOR))
+
+        def name(text: str, color: str) -> str:
+            return f'<b style="color:{color}">{html.escape(text)}</b>'
+
+        return (f"#{game_id}  {name(detail.white, colors[0])} vs {name(detail.black, colors[1])}  "
+                f"({html.escape(detail.date)})  [{html.escape(detail.site)}]")
 
     def _on_browser_game_selected(self, game_id: int) -> None:
         # Only for clicks in the archive panel -- game links clicked in the
@@ -723,6 +738,10 @@ class ProfileView(QWidget):
         self._live_explorer_generation += 1
         generation = self._live_explorer_generation
         sequence = self.board.current_san_sequence()
+        if len(sequence) > EXPLORER_MAX_PLIES:
+            self.explorer_panel.render_placeholder(
+                f"The explorer covers the first {EXPLORER_MAX_PLIES // 2} moves of a game.")
+            return
         color = self.explorer_panel.selected_color()
 
         source = self.explorer_panel.selected_source()

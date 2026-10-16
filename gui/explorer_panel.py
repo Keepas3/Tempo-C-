@@ -61,6 +61,11 @@ def _table(headers: list[str], rows: list[list[str]]) -> str:
     return f'<table cellspacing="0" style="width:100%; margin-top:4px;"><tr>{head}</tr>{body}</table>'
 
 
+# Archive::opponent_replies (C++) refuses sequences longer than this (SQLite's join limit); past it
+# there are no meaningful opening statistics anyway, so the panel just says so instead of erroring.
+EXPLORER_MAX_PLIES = 40
+
+
 class ExplorerPanel(QWidget):
     # Whether the "Show opening explorer" checkbox is checked.
     enabled_changed = Signal(bool)

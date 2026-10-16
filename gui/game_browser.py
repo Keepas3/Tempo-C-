@@ -18,9 +18,9 @@ from favorites import Favorites
 from notes import Notes
 
 GAME_ID_ROLE = 1000
-COLUMNS = ["Game", "★", "Color", "Time", "Type", "Site", "Result", "Elo", "Opening", "Notes"]
+COLUMNS = ["Game", "★", "Color", "Time", "Type", "Site", "Elo", "Opening", "Notes"]
 (GAME_COLUMN, FAV_COLUMN, COLOR_COLUMN, TIME_COLUMN, TYPE_COLUMN, SITE_COLUMN,
- RESULT_COLUMN, ELO_COLUMN, OPENING_COLUMN, NOTES_COLUMN) = range(len(COLUMNS))
+ ELO_COLUMN, OPENING_COLUMN, NOTES_COLUMN) = range(len(COLUMNS))
 STAR_ON, STAR_OFF = "★", "☆"
 STAR_COLOR = "#f5c518"
 NOTE_TRUNCATE_CHARS = 28  # keeps the column narrow -- the full text is always in the tooltip
@@ -29,7 +29,6 @@ _RESULT_COLOR = {"Win": WIN_COLOR, "Loss": LOSS_COLOR, "Draw": DRAW_COLOR}
 
 COLOR_ORDER = {"white": 0, "black": 1}
 TYPE_ORDER = {"Bullet": 0, "Blitz": 1, "Rapid": 2, "Classical": 3, "Daily": 4, "Unknown": 5}
-RESULT_ORDER = {"Win": 0, "Draw": 1, "Loss": 2, "?": 3}
 
 # Which direction each column starts in the first time it's clicked (i.e.
 # when switching to it from a different column). Game defaults to
@@ -38,7 +37,7 @@ RESULT_ORDER = {"Win": 0, "Draw": 1, "Loss": 2, "?": 3}
 # category / A-Z / best result first). Elo defaults descending (highest
 # rating first), matching how chess sites usually show it.
 DEFAULT_ASCENDING = {GAME_COLUMN: False, FAV_COLUMN: True, COLOR_COLUMN: True, TIME_COLUMN: True, TYPE_COLUMN: True,
-                     SITE_COLUMN: True, RESULT_COLUMN: True, ELO_COLUMN: False, OPENING_COLUMN: True, NOTES_COLUMN: True}
+                     SITE_COLUMN: True, ELO_COLUMN: False, OPENING_COLUMN: True, NOTES_COLUMN: True}
 
 
 def _truncate_note(note: str) -> str:
@@ -69,8 +68,6 @@ def _sort_key(column: int, game, notes_by_id: dict[int, str], favorite_ids: set[
         return TYPE_ORDER.get(game.time_category, len(TYPE_ORDER))
     if column == SITE_COLUMN:
         return game.site
-    if column == RESULT_COLUMN:
-        return RESULT_ORDER.get(game.result, len(RESULT_ORDER))
     if column == ELO_COLUMN:
         return game.your_elo if game.your_elo is not None else 0
     if column == OPENING_COLUMN:
@@ -121,8 +118,8 @@ class GameBrowser(QTreeWidget):
         self.header().setStretchLastSection(False)
         self.header().setMinimumSectionSize(24)
         for column, width in {
-            GAME_COLUMN: 190, FAV_COLUMN: 28, COLOR_COLUMN: 48, TIME_COLUMN: 62, TYPE_COLUMN: 56,
-            SITE_COLUMN: 72, RESULT_COLUMN: 48, ELO_COLUMN: 40, OPENING_COLUMN: 125, NOTES_COLUMN: 90,
+            GAME_COLUMN: 210, FAV_COLUMN: 28, COLOR_COLUMN: 48, TIME_COLUMN: 62, TYPE_COLUMN: 56,
+            SITE_COLUMN: 72, ELO_COLUMN: 40, OPENING_COLUMN: 145, NOTES_COLUMN: 90,
         }.items():
             self.header().setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
             self.setColumnWidth(column, width)
@@ -227,13 +224,14 @@ class GameBrowser(QTreeWidget):
                     is_fav = game.id in favorite_ids
                     label = f"{_day_only(game.date)}  vs {game.opponent}"
                     time_part = f" {game.utc_time[:5]} UTC" if game.utc_time else ""
-                    full_label = f"{game.date}{time_part}  vs {game.opponent}"
+                    result_word = game.result if game.result in _RESULT_COLOR else "No result"
+                    full_label = f"{game.date}{time_part}  vs {game.opponent}  — {result_word}"
                     color_display = game.your_color.capitalize()
                     elo_display = str(game.your_elo) if game.your_elo is not None else ""
                     note = notes_by_id.get(game.id, "")
                     notes_display = _truncate_note(note)
                     game_item = QTreeWidgetItem(
-                        [label, STAR_ON if is_fav else STAR_OFF, color_display, game.time_label, game.time_category, game.site, game.result,
+                        [label, STAR_ON if is_fav else STAR_OFF, color_display, game.time_label, game.time_category, game.site,
                          elo_display, game.opening, notes_display])
                     game_item.setData(0, GAME_ID_ROLE, game.id)
                     game_item.setToolTip(0, full_label)  # full date on hover
@@ -245,16 +243,17 @@ class GameBrowser(QTreeWidget):
                     # palette is set; the app just inherits Windows' dark
                     # mode), which is unreadable against the dark background
                     # -- give every column an explicit, visible color instead
-                    # of leaving it to that default. Result keeps its own
-                    # win/loss/draw color instead of the plain default.
+                    # of leaving it to that default. The Game column is
+                    # colored by the result (green win / red loss / gray
+                    # draw or unknown) instead of a separate Result column.
                     for col in range(len(COLUMNS)):
-                        if col not in (RESULT_COLUMN, FAV_COLUMN):
+                        if col not in (GAME_COLUMN, FAV_COLUMN):
                             game_item.setForeground(col, QBrush(QColor(TEXT_COLOR)))
                     game_item.setForeground(FAV_COLUMN, QBrush(QColor(STAR_COLOR if is_fav else MUTED_COLOR)))
                     game_item.setTextAlignment(FAV_COLUMN, Qt.AlignmentFlag.AlignCenter)
                     game_item.setToolTip(FAV_COLUMN, "Click to toggle favorite")
                     result_color = _RESULT_COLOR.get(game.result, MUTED_COLOR)
-                    game_item.setForeground(RESULT_COLUMN, QBrush(QColor(result_color)))
+                    game_item.setForeground(GAME_COLUMN, QBrush(QColor(result_color)))
                     month_item.addChild(game_item)
                     self._items_by_id[game.id] = game_item
 

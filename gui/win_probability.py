@@ -42,6 +42,10 @@ def win_percent(cp: int) -> float:
     return 50 + 50 * (2 / (1 + math.exp(_WIN_PERCENT_K * cp)) - 1)
 
 
+# A game that has just ended in checkmate, in centipawns: what a "mate in 0" is worth.
+MATE_NOW_CP = 1000
+
+
 def mate_to_cp_equivalent(mate_n: int) -> int:
     """Approximates a forced-mate score as an extreme centipawn value so it
     can still be fed through win_percent() -- the true win% at a forced
@@ -50,7 +54,7 @@ def mate_to_cp_equivalent(mate_n: int) -> int:
     blowing up. Not a reproduction of lichess's own internal mate handling,
     just a reasonable approximation for this app's purposes."""
     sign = 1 if mate_n > 0 else -1
-    return sign * (1000 - min(abs(mate_n), 10) * 50)
+    return sign * (MATE_NOW_CP - min(abs(mate_n), 10) * 50)
 
 
 def _effective_cp(score_cp: int | None, score_mate: int | None) -> int | None:

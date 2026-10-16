@@ -8,10 +8,13 @@ C++-owned games/moves tables.
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
+from win_probability import MATE_NOW_CP
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS engine_analysis (
@@ -28,6 +31,11 @@ CREATE TABLE IF NOT EXISTS engine_analysis (
     PRIMARY KEY (game_id, ply, engine_id, setting_key)
 );
 """
+
+
+def _depth_of(setting_key: str) -> int | None:
+    match = re.fullmatch(r"depth(\d+)", setting_key)
+    return int(match.group(1)) if match else None
 
 
 @dataclass
@@ -72,39 +80,54 @@ class AnalysisCache:
         finally:
             conn.close()
 
+    def _best_rows(
+        self, game_id: int, engine_id: str, engine_version: str, setting_key: str,
+    ) -> dict[int, AnalysisRow]:
+        """Per ply, the stored row to use for a request at `setting_key`
+        ("depthN"): the DEEPEST row whose depth is >= N. A deeper analysis is
+        always good enough for a shallower request, so analyzing at Detailed
+        (depth 18) once also satisfies every Fast/Balanced question -- nothing
+        is analyzed twice. A key that isn't "depthN" only matches exactly."""
+        wanted = _depth_of(setting_key)
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT ply, score_cp, score_mate, best_move_uci, pv, setting_key FROM engine_analysis "
+                "WHERE game_id = ? AND engine_id = ? AND engine_version = ?;",
+                (game_id, engine_id, engine_version),
+            ).fetchall()
+        finally:
+            conn.close()
+        best: dict[int, tuple[int, AnalysisRow]] = {}
+        for ply, cp, mate, best_move, pv, key in rows:
+            if mate == 0:
+                # Old rows from a game that ended in checkmate: "mate 0" carries no sign. The side to
+                # move is the one mated, and ply parity says which that is (see engine_analysis_core).
+                cp, mate = (MATE_NOW_CP if ply % 2 == 0 else -MATE_NOW_CP), None
+            depth = _depth_of(key)
+            if wanted is None or depth is None:
+                if key != setting_key:
+                    continue
+                depth = wanted if wanted is not None else 0
+            elif depth < wanted:
+                continue
+            if ply not in best or depth > best[ply][0]:
+                best[ply] = (depth, AnalysisRow(ply, cp, mate, best_move, pv))
+        return {ply: row for ply, (_depth, row) in best.items()}
+
     def get_full(
         self, game_id: int, total_plies: int, engine_id: str, engine_version: str, setting_key: str,
     ) -> list[AnalysisRow] | None:
         """Returns all `total_plies` rows in ply order, or None if any ply
-        is missing (a partial/no cache -- caller should run analysis)."""
-        conn = self._connect()
-        try:
-            rows = conn.execute(
-                "SELECT ply, score_cp, score_mate, best_move_uci, pv FROM engine_analysis "
-                "WHERE game_id = ? AND engine_id = ? AND engine_version = ? AND setting_key = ? "
-                "ORDER BY ply;",
-                (game_id, engine_id, engine_version, setting_key),
-            ).fetchall()
-        finally:
-            conn.close()
-        if len(rows) != total_plies:
+        is missing (a partial/no cache -- caller should run analysis).
+        Deeper-than-requested rows count (see _best_rows)."""
+        rows = self._best_rows(game_id, engine_id, engine_version, setting_key)
+        if any(ply not in rows for ply in range(total_plies)):
             return None
-        result = [AnalysisRow(*row) for row in rows]
-        if [r.ply for r in result] != list(range(total_plies)):
-            return None
-        return result
+        return [rows[ply] for ply in range(total_plies)]
 
     def get_missing_plies(
         self, game_id: int, total_plies: int, engine_id: str, engine_version: str, setting_key: str,
     ) -> list[int]:
-        conn = self._connect()
-        try:
-            rows = conn.execute(
-                "SELECT ply FROM engine_analysis "
-                "WHERE game_id = ? AND engine_id = ? AND engine_version = ? AND setting_key = ?;",
-                (game_id, engine_id, engine_version, setting_key),
-            ).fetchall()
-        finally:
-            conn.close()
-        have = {row[0] for row in rows}
+        have = self._best_rows(game_id, engine_id, engine_version, setting_key)
         return [ply for ply in range(total_plies) if ply not in have]

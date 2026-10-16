@@ -14,6 +14,7 @@ COMMANDS = [
     ("/opening", "<query>", "Record for an opening (name or ECO code)"),
     ("/moves", "<sequence>", "Replies after a SAN sequence, e.g. e4 e5 Nf3"),
     ("/scout", "<profile>", "Study another profile: openings, habits, weak spots"),
+    ("/analyze", "[n] [white|black]", "Pre-analyze recent games so AI answers are instant"),
     ("/fetch chesscom", "<user> [full]", "Fetch from chess.com ('full' = all history)"),
     ("/fetch lichess", "<user> [full]", "Fetch from lichess ('full' = all history)"),
     ("/clear", "", "Clear the chat history"),
