@@ -223,11 +223,13 @@ class ProfileView(QWidget):
         self.board.position_changed.connect(self._on_position_changed_for_live_explorer)
         self.board.position_changed.connect(self._on_position_changed_for_review_highlight)
         self.board.position_changed.connect(self._update_move_counter)
+        self.board.position_changed.connect(self._sync_move_note_box)
         self.explorer_panel.enabled_changed.connect(self._on_live_explorer_toggled)
         self.explorer_panel.color_changed.connect(lambda _c: self._live_explorer_timer.start())
         self.explorer_panel.move_clicked.connect(self._on_explorer_move_clicked)
         self.explorer_panel.source_changed.connect(lambda _s: self._live_explorer_timer.start())
         self.command_panel.scout_line_requested.connect(self.load_scout_line)
+        self.command_panel.move_note_requested.connect(self.show_move_note)
         self.command_panel.archive_updated.connect(self._explorer_cache.clear)
 
         # Live board-query filter: debounced so rapid navigation doesn't fire
@@ -457,6 +459,19 @@ class ProfileView(QWidget):
         self.multipv_lines_label.setOpenExternalLinks(False)
         self.multipv_lines_label.linkActivated.connect(self._on_multipv_move_clicked)
 
+        # A move note opened from the review table's "note" link is read here, in the center column
+        # under the engine lines, instead of being appended to the chat.
+        self.move_note_box = QLabel("")
+        self.move_note_box.setWordWrap(True)
+        self.move_note_box.setTextFormat(Qt.TextFormat.RichText)
+        self.move_note_box.setTextInteractionFlags(
+            Qt.TextInteractionFlag.LinksAccessibleByMouse | Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.move_note_box.setStyleSheet(
+            f"background-color:#2d2d2d; border-left:3px solid {HEADER_COLOR}; padding:6px 8px;")
+        self.move_note_box.linkActivated.connect(self._on_move_note_box_link)
+        self.move_note_box.hide()
+        self._move_note_shown: tuple[int, int] | None = None  # (game_id, ply) currently displayed
+
         # Visual white/black advantage bar next to the board, with the
         # score drawn inside it (see eval_bar.py) rather than in a separate
         # label above it -- a sibling label would make the bar's *column*
@@ -481,6 +496,7 @@ class ProfileView(QWidget):
         multipv_column = QVBoxLayout()
         multipv_column.addLayout(multipv_row)
         multipv_column.addWidget(self.multipv_lines_label)
+        multipv_column.addWidget(self.move_note_box)
 
         self._refresh_engine_status_row()
 
@@ -542,6 +558,7 @@ class ProfileView(QWidget):
             self.status_label.setText(f"No game with id {game_id}")
             return
         self.current_game_id = game_id
+        self._hide_move_note_box()
         # Clear any review left over from a previous game -- if this load is
         # about to be followed by a fresh review (e.g. the archive's "show
         # review on select" checkbox), CommandPanel repopulates its review
@@ -976,6 +993,7 @@ class ProfileView(QWidget):
             self.status_label.setText("That profile no longer exists.")
             return
         self.current_game_id = None
+        self._hide_move_note_box()
         self.command_panel.clear_review_state()
         self.board.load_game(sans)
         self.board.set_ply(len(sans))
@@ -1068,7 +1086,9 @@ class ProfileView(QWidget):
         if not self.board.on_mainline or self.board.mainline_ply < 1:
             self.status_label.setText("Step to a move in the game's mainline first (not the start or a side line).")
             return
-        game_id, ply = self.current_game_id, self.board.mainline_ply
+        self._edit_move_note(self.current_game_id, self.board.mainline_ply)
+
+    def _edit_move_note(self, game_id: int, ply: int) -> None:
         existing = self.notes.get_move_notes(game_id).get(ply, "")
         text, ok = QInputDialog.getMultiLineText(
             self, "Move note", f"Note for game #{game_id}, ply {ply} (leave empty to clear):", existing)
@@ -1077,6 +1097,47 @@ class ProfileView(QWidget):
         self.notes.set_move_note(game_id, ply, text)
         self.status_label.setText(f"Move note {'cleared' if not text.strip() else 'saved'} for game #{game_id}, ply {ply}.")
         self.command_panel.refresh_notes_in_current_review(game_id)
+        if self.current_game_id == game_id and self.board.on_mainline and self.board.mainline_ply == ply:
+            self._sync_move_note_box()  # the move on the board: show the saved note, or hide it if cleared
+        else:
+            self.show_move_note(game_id, ply)  # edited from the box for a different move; hides if cleared
+
+    def show_move_note(self, game_id: int, ply: int) -> None:
+        """Shows the note on the move at 1-based `ply` of the loaded game in the board area."""
+        note = self.notes.get_move_notes(game_id).get(ply)
+        detail = self.db.load_game(game_id) if note else None
+        if not note or detail is None or not (1 <= ply <= len(detail.moves)):
+            self._hide_move_note_box()
+            return
+        index = ply - 1
+        move = f"{index // 2 + 1}{'.' if index % 2 == 0 else '...'}{detail.moves[index].san}"
+        self._move_note_shown = (game_id, ply)
+        self.move_note_box.setText(
+            f'<div><b style="color:{HEADER_COLOR}">Note on {html.escape(move)}</b> '
+            f'&nbsp;<a href="edit" style="color:{MUTED_COLOR}; text-decoration:none;">Edit</a> '
+            f'&nbsp;<a href="close" style="color:{MUTED_COLOR}; text-decoration:none;">&times;</a></div>'
+            f'<div style="margin-top:3px;">{html.escape(note).replace(chr(10), "<br>")}</div>')
+        self.move_note_box.show()
+
+    def _sync_move_note_box(self) -> None:
+        """Whenever the board lands on a mainline move of the loaded game that has a note, show it in the
+        board area automatically (no need to hunt for the small "note" link in the review table); on any
+        other position the box hides. A note opened from the table's link for a different move stays until
+        the board next moves."""
+        if self.current_game_id is None or not self.board.on_mainline or self.board.mainline_ply < 1:
+            self._hide_move_note_box()
+            return
+        self.show_move_note(self.current_game_id, self.board.mainline_ply)  # hides itself if this move has no note
+
+    def _hide_move_note_box(self) -> None:
+        self._move_note_shown = None
+        self.move_note_box.hide()
+
+    def _on_move_note_box_link(self, link: str) -> None:
+        if link == "close":
+            self._hide_move_note_box()
+        elif link == "edit" and self._move_note_shown is not None:
+            self._edit_move_note(*self._move_note_shown)
 
     def _load_bookmark(self, bookmark: Bookmark) -> None:
         if bookmark.source_game_id is not None and bookmark.source_ply is not None:
@@ -1091,6 +1152,7 @@ class ProfileView(QWidget):
             self.board.selected_square = None
             self.board._render()
             self.current_game_id = None
+            self._hide_move_note_box()
             self._refresh_favorite_btn()
             self.status_label.setText(f"Loaded bookmark: {bookmark.note or '(no note)'}")
         self._update_nav_buttons()

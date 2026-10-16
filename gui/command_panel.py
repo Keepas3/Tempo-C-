@@ -125,6 +125,9 @@ class CommandPanel(QWidget):
     move_requested = Signal(int, int)  # game_id, ply
     # A "load this line" link in a /scout report was clicked: (profile_id, color the scouted player had, SANs).
     scout_line_requested = Signal(str, str, list)
+    # The "note" link next to a move in a review table was clicked: (game_id, 1-based ply). The note is
+    # shown in the board area (under the engine lines), not printed into the chat.
+    move_note_requested = Signal(int, int)
 
     def __init__(
         self, db: DbReader, cli: TempoCli, cache: AnalysisCache, engine: EngineManager,
@@ -419,9 +422,7 @@ class CommandPanel(QWidget):
                 game_id, ply = int(game_id_str), int(ply_str)
             except ValueError:
                 return
-            note_text = self.notes.get_move_notes(game_id).get(ply)
-            if note_text:
-                self._print(f'<span style="color:{MUTED_COLOR}">Note on game #{game_id}, ply {ply}:</span> {_esc(note_text)}')
+            self.move_note_requested.emit(game_id, ply)
         elif text.startswith("showmore:"):
             color_key = text[len("showmore:"):]
             self._show_all_openings[color_key] = not self._show_all_openings.get(color_key, False)
